@@ -88,8 +88,8 @@ class HuggingFaceDataset(Dataset):
                     "wikitext", "wikitext-2-raw-v1", split=self.split
                 )
                 text_column = "text"
-            elif self.dataset_name == "openwebtext":
-                dataset = load_dataset("Skylion007/openwebtext", split=self.split)
+            elif self.dataset_name.lower() == "openwebtext":
+                dataset = load_dataset("Skylion007/openwebtext", name="plain_text", split=self.split, trust_remote_code=True)
                 text_column = "text"
             elif self.dataset_name == "bookcorpus":
                 dataset = load_dataset("bookcorpus", split=self.split, trust_remote_code=True)
@@ -118,7 +118,7 @@ class HuggingFaceDataset(Dataset):
         processed_texts = []
 
         print("Tokenizing texts...")
-        for i, sample in enumerate(tqdm(dataset)):
+        for sample in tqdm(dataset):
             text = sample[text_column]
 
             # Skip only empty texts
@@ -154,7 +154,7 @@ class HuggingFaceDataset(Dataset):
         print("Generating synthetic fallback data...")
 
         texts = []
-        for i in range(num_samples):
+        for _ in range(num_samples):
             # Create more realistic token sequences
             text = []
 

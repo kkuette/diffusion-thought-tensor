@@ -71,6 +71,7 @@ def compute_masked_loss(
     epoch: int = 0,
     config: Optional[Dict] = None,
     masking_ratio: float = 0.7,
+    pad_token_id: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor]:
     """Compute loss for masked Fast-dLLM training with thought evolution"""
 
@@ -84,13 +85,27 @@ def compute_masked_loss(
 
     # Create masking pattern - mask a percentage of tokens
     # For training, we randomly mask tokens (not just at the end)
-    mask_count = int(seq_length * masking_ratio)
     token_mask = torch.zeros(batch_size, seq_length, dtype=torch.bool, device=device)
 
     for b in range(batch_size):
-        # Randomly select positions to mask
-        mask_positions = torch.randperm(seq_length)[:mask_count]
-        token_mask[b, mask_positions] = True
+        # Find non-padding positions
+        if pad_token_id is not None:
+            # Only consider non-padding tokens for masking
+            non_pad_positions = (tokens[b] != pad_token_id).nonzero(as_tuple=True)[0]
+            if len(non_pad_positions) > 0:
+                # Calculate how many non-padding tokens to mask
+                non_pad_count = len(non_pad_positions)
+                mask_count = int(non_pad_count * masking_ratio)
+                if mask_count > 0:
+                    # Randomly select from non-padding positions only
+                    selected_indices = torch.randperm(non_pad_count, device=device)[:mask_count]
+                    mask_positions = non_pad_positions[selected_indices]
+                    token_mask[b, mask_positions] = True
+        else:
+            # Fallback to original logic if no pad_token_id provided
+            mask_count = int(seq_length * masking_ratio)
+            mask_positions = torch.randperm(seq_length, device=device)[:mask_count]
+            token_mask[b, mask_positions] = True
 
     # Forward pass with masking
     pred_logits, new_thought = model(tokens, thought_stacks, timesteps, token_mask)
@@ -135,7 +150,7 @@ def compute_masked_loss(
         thought_consistency_loss = 0.01 * thought_norm
 
     # Combine losses
-    total_loss = token_loss + 0.1 * confidence_loss + thought_consistency_loss
+    total_loss = token_loss + 0.1 * confidence_loss
 
     # Compute metrics with comprehensive thought analysis
     with torch.no_grad():
@@ -144,14 +159,36 @@ def compute_masked_loss(
 
         if masked_logits.numel() > 0:
             masked_preds = masked_logits.argmax(dim=-1)
-            masked_accuracy = (masked_preds == masked_targets).float().mean().item()
+            # Exclude padding tokens from masked accuracy calculation
+            if pad_token_id is not None:
+                non_padding_mask = masked_targets != pad_token_id
+                if non_padding_mask.sum() > 0:
+                    masked_accuracy = (
+                        (masked_preds[non_padding_mask] == masked_targets[non_padding_mask])
+                        .float().mean().item()
+                    )
+                else:
+                    masked_accuracy = 0.0
+            else:
+                masked_accuracy = (masked_preds == masked_targets).float().mean().item()
 
         if unmasked_logits.numel() > 0:
             unmasked_targets = tokens[~token_mask]
             unmasked_preds = unmasked_logits.argmax(dim=-1)
-            unmasked_accuracy = (
-                (unmasked_preds == unmasked_targets).float().mean().item()
-            )
+            # Exclude padding tokens from unmasked accuracy calculation
+            if pad_token_id is not None:
+                non_padding_mask = unmasked_targets != pad_token_id
+                if non_padding_mask.sum() > 0:
+                    unmasked_accuracy = (
+                        (unmasked_preds[non_padding_mask] == unmasked_targets[non_padding_mask])
+                        .float().mean().item()
+                    )
+                else:
+                    unmasked_accuracy = 0.0
+            else:
+                unmasked_accuracy = (
+                    (unmasked_preds == unmasked_targets).float().mean().item()
+                )
 
         perplexity = (
             torch.exp(token_loss).item() if torch.isfinite(token_loss) else 999.0
@@ -209,8 +246,20 @@ def compute_masked_loss(
         thought_std = new_thought.std().item()
         thought_norm = torch.norm(new_thought, dim=1).mean().item()
 
-        # Masking statistics
-        mask_ratio_actual = token_mask.float().mean().item()
+        # Masking statistics - exclude padding tokens from ratio calculation
+        if pad_token_id is not None:
+            # Calculate mask ratio only for non-padding tokens
+            non_pad_mask = tokens != pad_token_id
+            if non_pad_mask.sum() > 0:
+                # Count masked non-padding tokens / total non-padding tokens
+                masked_non_pad = (token_mask & non_pad_mask).sum().float()
+                total_non_pad = non_pad_mask.sum().float()
+                mask_ratio_actual = (masked_non_pad / total_non_pad).item()
+            else:
+                mask_ratio_actual = 0.0
+        else:
+            # Fallback to original calculation if no pad_token_id
+            mask_ratio_actual = token_mask.float().mean().item()
         
         # Store thought statistics for TensorBoard histograms
         # (This will be accessed by the logger for detailed visualizations)
@@ -254,6 +303,7 @@ def compute_masked_loss(
         "mask_ratio": mask_ratio_actual,
         "masked_tokens": token_mask.sum().item(),
         "unmasked_tokens": (~token_mask).sum().item(),
+        "total_non_pad_tokens": non_pad_mask.sum().item() if pad_token_id is not None else tokens.numel(),
     }
 
     return total_loss, metrics, evolved_thought_stacks
@@ -545,6 +595,10 @@ def main():
     device = torch.device(config["hardware"]["device"])
     print(f"Using device: {device}")
 
+    # Get pad_token_id from tokenizer (GPT2 uses eos_token as pad_token)
+    # For GPT2, the eos_token_id is 50256
+    pad_token_id = 50256  # GPT2's eos_token_id used as pad_token
+
     # Create masking strategy
     masking_strategy = MaskingStrategy(
         mask_ratio=args.mask_ratio,
@@ -632,14 +686,26 @@ def main():
         eps=float(config["optimizer"]["eps"]),
     )
 
-    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-
-    lr_scheduler = CosineAnnealingWarmRestarts(
+    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+    
+    # Primary scheduler with warm restarts
+    cosine_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
         T_0=int(config["training"]["warmup_steps"]),
         T_mult=2,
         eta_min=float(config["training"]["learning_rate"]) * 0.01,
     )
+    
+    # Plateau detection scheduler for adaptive reduction
+    plateau_scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        min_lr=float(config["training"]["learning_rate"]) * 0.001
+    )
+    
+    lr_scheduler = cosine_scheduler
 
     # Checkpoint loading
     start_epoch = 0
@@ -666,6 +732,11 @@ def main():
     gradient_accumulation_steps = config["training"]["gradient_accumulation_steps"]
     max_grad_norm = float(config["training"]["max_grad_norm"])
     early_stopping_patience = config["training"].get("early_stopping_patience", 3)
+    
+    # Progressive masking configuration
+    initial_mask_ratio = args.mask_ratio
+    final_mask_ratio = args.mask_ratio * 0.3  # Reduce to 30% of initial by end
+    mask_decay_start_epoch = max(1, num_epochs // 3)  # Start decay after 1/3 of training
 
     # Initialize mixed precision
     scaler = (
@@ -716,6 +787,19 @@ def main():
 
         train_pbar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
 
+        # Calculate dynamic masking ratio for this epoch
+        if epoch >= mask_decay_start_epoch:
+            progress = (epoch - mask_decay_start_epoch) / max(1, num_epochs - mask_decay_start_epoch)
+            current_mask_ratio = initial_mask_ratio - (initial_mask_ratio - final_mask_ratio) * progress
+        else:
+            current_mask_ratio = initial_mask_ratio
+        
+        # Dynamic confidence threshold - increase as training progresses
+        progress_ratio = epoch / max(1, num_epochs - 1)
+        current_confidence_threshold = args.confidence_threshold + (0.9 - args.confidence_threshold) * progress_ratio
+        
+        print(f"Using masking ratio: {current_mask_ratio:.3f}, confidence threshold: {current_confidence_threshold:.3f}")
+
         for batch_idx, batch in enumerate(train_pbar):
             tokens = batch.to(device, non_blocking=True)
             batch_size = tokens.shape[0]
@@ -736,6 +820,9 @@ def main():
                 # Use persistent stacks from previous batch
                 current_thought_stacks = persistent_thought_stacks
 
+            # Update masking strategy for this batch
+            model.masking_strategy.confidence_threshold = current_confidence_threshold
+
             # Compute loss with mixed precision
             if use_amp:
                 with autocast("cuda"):
@@ -747,7 +834,8 @@ def main():
                         device,
                         epoch,
                         config,
-                        args.mask_ratio,
+                        current_mask_ratio,
+                        pad_token_id,
                     )
                     loss = loss / gradient_accumulation_steps
 
@@ -762,6 +850,7 @@ def main():
                     epoch,
                     config,
                     args.mask_ratio,
+                    pad_token_id,
                 )
                 loss = loss / gradient_accumulation_steps
                 loss.backward()
@@ -777,12 +866,30 @@ def main():
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm
                     )
+                    
+                    # Add gradient noise for regularization when plateauing
+                    if no_improvement_count > 2:
+                        noise_scale = 0.01 * (no_improvement_count - 2)
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                noise = torch.randn_like(param.grad) * noise_scale
+                                param.grad.add_(noise)
+                    
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm
                     )
+                    
+                    # Add gradient noise for regularization when plateauing
+                    if no_improvement_count > 2:
+                        noise_scale = 0.01 * (no_improvement_count - 2)
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                noise = torch.randn_like(param.grad) * noise_scale
+                                param.grad.add_(noise)
+                    
                     optimizer.step()
 
                 optimizer.zero_grad(set_to_none=True)
@@ -846,6 +953,7 @@ def main():
                             epoch,
                             config,
                             args.mask_ratio,
+                            pad_token_id,
                         )
                 else:
                     loss, metrics, _ = compute_masked_loss(
@@ -856,7 +964,8 @@ def main():
                         device,
                         epoch,
                         config,
-                        args.mask_ratio,
+                        args.mask_ratio,  # Use original ratio for evaluation consistency
+                        pad_token_id,
                     )
                 eval_losses.append(metrics)
 
@@ -891,6 +1000,9 @@ def main():
         print(f"    - Diversity Loss: {epoch_metrics.get('avg_thought_diversity_loss', 0):.3f}")
         print(f"  Learning Rate: {lr_scheduler.get_last_lr()[0]:.2e}")
 
+        # Update plateau scheduler
+        plateau_scheduler.step(eval_metrics["total_loss"])
+        
         # Save best model and check early stopping
         if eval_metrics["total_loss"] < best_eval_loss:
             best_eval_loss = eval_metrics["total_loss"]

@@ -142,12 +142,12 @@ class ThoughtStack:
         self.thought_dims = thought_dims
         self.device = device
         
-    def initialize_stack(self, batch_size):
-        """Initialize empty stack with zeros"""
-        return torch.zeros(
+    def initialize_stack(self, batch_size, noise_std=0.1):
+        """Initialize stack with small noise (better for diffusion process)"""
+        return torch.randn(
             batch_size, self.stack_size, *self.thought_dims, 
             device=self.device
-        )
+        ) * noise_std
     
     def push_thought(self, stack, new_thought):
         """
