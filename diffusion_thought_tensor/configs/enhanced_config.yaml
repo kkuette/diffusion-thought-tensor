@@ -1,0 +1,96 @@
+# Enhanced Model Configuration - Bigger Scale
+# Optimized for RTX 3090 with enhanced thought stacking
+
+model:
+  name: "EnhancedDiffusionThoughtModel"
+  embed_dim: 384            # Further reduced for memory efficiency
+  num_layers: 6             # Reduced layers for smaller memory footprint
+  num_heads: 6              # Match smaller embed_dim
+  vocab_size: 50257         # GPT-2 vocabulary
+  max_seq_length: 2048      # Expanded context window for better coherence
+  max_new_tokens: 1024      # Maximum tokens to generate in response
+  dropout: 0.2              # Increased dropout for regularization
+  
+thought_tensor:
+  input_dims: [16, 16, 8]       # Reduced dimensions to prevent overfitting
+  stack_size: 8                 # Reduced for stability
+  hidden_dim: 512               # Match embed_dim
+  dropout: 0.15                 # Add thought-specific dropout
+  noise_injection_std: 0.01     # Add noise during training
+  diversity_loss_weight: 0.1    # Encourage thought diversity
+  
+diffusion:
+  num_steps: 1000               # More steps for quality
+  noise_schedule: "cosine"      # Best performing schedule
+  schedule_type: "cosine"       
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: "epsilon"
+  
+training:
+  batch_size: 1                 # Further reduced for 2048 context window
+  gradient_accumulation_steps: 32  # Maintain effective batch size of 32
+  learning_rate: 1e-4           # Higher LR for smaller model
+  warmup_steps: 2000            # Reduced warmup
+  num_epochs: 15                # More epochs for smaller model
+  eval_every: 1                 # Evaluate every epoch
+  save_every: 1                 # Save every epoch
+  max_grad_norm: 0.5            # Tighter gradient clipping
+  stack_reset_frequency: 8      # More frequent resets to save memory
+  label_smoothing: 0.1          # Add label smoothing
+  early_stopping_patience: 3    # Stop if no improvement
+  
+optimizer:
+  type: "AdamW"
+  weight_decay: 0.1             # Increased weight decay for regularization
+  betas: [0.9, 0.95]
+  eps: 1e-6
+  
+hardware:
+  device: "cuda"
+  mixed_precision: true         # Enable for 2-3x speedup
+  gradient_checkpointing: true  # Essential for memory
+  num_workers: 0                # No multiprocessing to save memory
+  dataloader_pin_memory: false  # Disable to save memory
+  
+# Memory optimization for bigger model
+memory:
+  offload_to_cpu: false
+  cpu_offload_params: false
+  activation_checkpointing: true
+  
+# Enhanced data configuration
+data_config:
+  cache_dir: "data/cache"
+  data_source: "tinystories"    # Start with working source
+  train_samples: 50000          # Much larger dataset for better generalization
+  eval_samples: 5000            # Larger eval set
+  
+# Advanced features for enhanced model
+advanced:
+  use_flash_attention: false
+  compile_model: false
+  deepspeed_config: null
+  thought_stack_features: true  # Enable enhanced features
+  
+# Logging and monitoring
+logging:
+  log_every: 50                 # More frequent logging
+  use_wandb: false              # Set to true if you want wandb logging
+  use_tensorboard: true         # TensorBoard logging
+  use_advanced_thought_metrics: true  # Enable advanced thought analysis
+  wandb_project: "diffusion-thought-tensor-enhanced"
+  wandb_tags: ["enhanced", "real-data", "big-model"]
+  save_samples: true
+  save_thought_visualizations: true
+  
+# Checkpointing
+checkpointing:
+  checkpoint_dir: "outputs/enhanced_checkpoints"
+  log_dir: "outputs/enhanced_logs"
+  keep_best: true
+  keep_latest: 3
+
+# Model size estimation
+estimated_params: "~150M"  # Reduced to prevent overfitting
+estimated_vram: "~12GB"    # More conservative memory usage

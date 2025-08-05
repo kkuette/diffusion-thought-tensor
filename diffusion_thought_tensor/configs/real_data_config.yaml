@@ -1,0 +1,81 @@
+# Real Data Training Configuration
+# Optimized for training with real text data on RTX 3090
+
+model:
+  name: "RealDataDiffusionThoughtModel"
+  embed_dim: 768         # Slightly reduced for real data efficiency
+  num_layers: 16         # Reduced for faster training
+  num_heads: 12          # Good balance
+  vocab_size: 50257      # GPT-2 vocabulary
+  max_seq_length: 512    # Standard sequence length
+  dropout: 0.1
+  
+thought_tensor:
+  input_dims: [32, 32, 16]   # Proven dimensions from testing
+  output_dims: [32, 32, 16]  # No compression for better learning
+  stack_size: 16             # Full stack for complex patterns
+  hidden_dim: 768            # Match embed_dim
+  
+diffusion:
+  num_steps: 500             # Reduced for faster training
+  noise_schedule: "cosine"   # Best performing schedule
+  schedule_type: "cosine"    # Explicit schedule type
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: "epsilon" # Standard epsilon prediction
+  
+training:
+  batch_size: 4              # Memory-efficient for RTX 3090
+  gradient_accumulation_steps: 8  # Effective batch size of 32
+  learning_rate: 3e-5        # Conservative for real data
+  warmup_steps: 2000         # Adequate warmup
+  num_epochs: 20             # Sufficient for real data learning
+  eval_every: 1              # Evaluate every epoch
+  save_every: 1              # Save every epoch for real data
+  max_grad_norm: 1.0
+  
+optimizer:
+  type: "AdamW"
+  weight_decay: 0.01
+  betas: [0.9, 0.95]    # Stable for real data
+  eps: 1e-6
+  
+hardware:
+  device: "cuda"
+  mixed_precision: false     # Disabled to avoid dtype issues
+  gradient_checkpointing: true
+  num_workers: 2
+  dataloader_pin_memory: true
+  
+# Memory optimization
+memory:
+  offload_to_cpu: false
+  cpu_offload_params: false
+  activation_checkpointing: true
+  
+# Data configuration
+data_config:
+  cache_dir: "data/cache"
+  data_source: "tinystories"  # Default to TinyStories for testing
+  train_samples: 15000       # Reasonable size for real data
+  eval_samples: 1500         # 10% for evaluation
+  
+# Advanced features
+advanced:
+  use_flash_attention: false
+  compile_model: false
+  deepspeed_config: null
+  
+# Logging and monitoring
+logging:
+  log_every: 100            # Log every 100 steps
+  wandb_project: "diffusion-thought-tensor"
+  wandb_tags: ["real-data", "phase2"]
+  save_samples: true        # Save generation samples
+  
+# Checkpointing
+checkpointing:
+  checkpoint_dir: "outputs/real_data_checkpoints"
+  log_dir: "outputs/real_data_logs"
+  keep_best: true
+  keep_latest: 3            # Keep 3 most recent checkpoints
