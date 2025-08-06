@@ -7,7 +7,12 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional
-from scipy.stats import pearsonr
+
+# Temporary scipy replacement to avoid binary incompatibility
+def pearsonr(x, y):
+    """Simple Pearson correlation coefficient implementation"""
+    x, y = np.array(x), np.array(y)
+    return np.corrcoef(x, y)[0, 1], 0.0  # Return (correlation, p_value)
 
 
 class ThoughtAnalyzer:

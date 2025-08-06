@@ -1,21 +1,19 @@
 """
-Interactive Multi-Turn Chat with Diffusion Thought Tensor Model
-Load a trained checkpoint and conduct conversations with thought evolution tracking
+Interactive Multi-Turn Chat with DREAM-Enhanced Diffusion Thought Tensor Model
+Load a trained DREAM checkpoint and conduct conversations with 3D thought evolution tracking
 """
 
 import torch
-import torch.nn.functional as F
 import os
 import sys
 import json
 import yaml
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from datetime import datetime
 import argparse
 
 # Import model and utilities
-from model.masked_fast_model import MaskedFastDiffusionModel, MaskingStrategy
-from data.huggingface_data_loader import HuggingFaceDataset
+from model.stacked_3d_model import StackedDiffusionModel3D, MaskingStrategy
 
 try:
     from transformers import AutoTokenizer
@@ -92,45 +90,63 @@ class InteractiveDiffusionChat:
         return {
             "model": {
                 "vocab_size": 50257,
-                "embed_dim": 384,  # Match enhanced config
-                "num_layers": 6,  # Match enhanced config
-                "num_heads": 6,  # Match enhanced config
-                "max_seq_length": 2048,  # Match enhanced config
-                "max_new_tokens": 1024,
-                "thought_dims": [16, 16, 8],  # Match enhanced config
-                "thought_stack_size": 8,
-                "dropout": 0.2,  # Match enhanced config
-                "masking": {
-                    "mask_ratio": 0.8,
-                    "confidence_threshold": 0.7,
-                    "progressive_unmasking": True,
-                },
-            }
+                "embed_dim": 256,  # Match DREAM config
+                "num_layers": 6,  # Match DREAM config
+                "num_heads": 8,  # Match DREAM config
+                "max_seq_length": 512,  # Match DREAM config
+                "max_new_tokens": 256,
+                "dropout": 0.1,  # Match DREAM config
+            },
+            "thought_tensor": {
+                "input_dims": [16, 16, 128],  # DREAM 3D format: [H, W, channels]
+                "stack_size": 8,  # Depth of 3D thought stack
+                "hidden_dim": 256,  # Match embed_dim
+                "dropout": 0.15,
+            },
+            "masking": {
+                "mask_ratio": 0.7,
+                "confidence_threshold": 0.75,
+                "progressive_unmasking": True,
+                "block_size": 4,
+                "adaptive_masking": True,
+            },
+            "dream": {
+                "bidirectional_attention": True,
+                "pad_token_id": 50256,
+            },
         }
 
-    def _load_model(self) -> MaskedFastDiffusionModel:
+    def _load_model(self) -> StackedDiffusionModel3D:
         """Load model from checkpoint"""
 
         # Create model with configuration
         model_config = self.config["model"]
+        thought_config = self.config["thought_tensor"]
+        masking_config = self.config.get("masking", {})
 
         # Create masking strategy
-        masking_config = model_config.get("masking", {})
         masking_strategy = MaskingStrategy(
-            mask_ratio=masking_config.get("mask_ratio", 0.8),
-            confidence_threshold=masking_config.get("confidence_threshold", 0.7),
+            mask_ratio=masking_config.get("mask_ratio", 0.7),
+            confidence_threshold=masking_config.get("confidence_threshold", 0.75),
             progressive_unmasking=masking_config.get("progressive_unmasking", True),
+            block_size=masking_config.get("block_size", 4),
         )
 
-        model = MaskedFastDiffusionModel(
+        # Map 3D config to 2D spatial dimensions (H, W) and separate depth
+        original_dims = thought_config["input_dims"]  # e.g., [16, 16, 128]
+        thought_dims = (original_dims[0], original_dims[1])  # (H, W)
+        stack_depth = thought_config["stack_size"]
+        thought_hidden_dim = original_dims[2] if len(original_dims) > 2 else 256
+
+        model = StackedDiffusionModel3D(
             vocab_size=model_config["vocab_size"],
             embed_dim=model_config["embed_dim"],
             num_layers=model_config["num_layers"],
             num_heads=model_config["num_heads"],
+            thought_dims=thought_dims,  # (H, W) for each 2D thought
+            stack_depth=stack_depth,  # Number of thoughts in the 3D stack
+            thought_hidden_dim=thought_hidden_dim,  # Channel dimension for thoughts
             max_seq_length=model_config["max_seq_length"],
-            max_new_tokens=model_config.get("max_new_tokens", 1024),
-            thought_dims=tuple(model_config["thought_dims"]),
-            thought_stack_size=model_config["thought_stack_size"],
             dropout=model_config["dropout"],
             masking_strategy=masking_strategy,
         )
@@ -194,40 +210,102 @@ class InteractiveDiffusionChat:
 
         # Initialize or reuse thought stack
         if self.thought_stack is None:
-            self.thought_stack = self.model.initialize_thought_stack(
-                batch_size, self.device
-            )
+            self.thought_stack = self.model.initialize_stack(batch_size, self.device)
 
-        # Generate using masked approach
+        # Generate using diffusion process
         print(f"   Prompt tokens shape: {prompt_tokens.shape}")
-        print(f"   Generating with {self.num_diffusion_steps} steps, temp={self.temperature}")
-        
-        tokens, final_thought_stack, stats = self.model.masked_generate(
-            initial_stack=self.thought_stack,
-            prompt_tokens=prompt_tokens,
-            num_steps=self.num_diffusion_steps,
-            temperature=self.temperature,
+        print(
+            f"   Generating with {self.num_diffusion_steps} diffusion steps, temp={self.temperature}"
         )
-        
-        print(f"   Generated tokens shape: {tokens.shape}")
-        
-        # Debug: Check token values
-        print(f"   Sample tokens: {tokens[0, :20].tolist()}")  # First 20 tokens
-        print(f"   Max token value: {tokens.max().item()}, Min: {tokens.min().item()}")
 
-        # Update thought stack
-        self.thought_stack = final_thought_stack
+        # Prepare sequence for diffusion generation
+        max_new_tokens = min(self.max_length, 100)
+        total_seq_len = prompt_tokens.shape[1] + max_new_tokens
+
+        # Create full sequence: known prompt + random noise for generation
+        full_sequence = torch.cat(
+            [
+                prompt_tokens,
+                torch.randint(
+                    0,
+                    self.model.vocab_size,
+                    (batch_size, max_new_tokens),
+                    device=self.device,
+                ),
+            ],
+            dim=1,
+        )
+
+        # Create mask: True for positions to generate (after prompt)
+        generation_mask = torch.zeros(
+            batch_size, total_seq_len, dtype=torch.bool, device=self.device
+        )
+        generation_mask[:, prompt_tokens.shape[1] :] = True
+
+        # Diffusion denoising process
+        current_stack = self.thought_stack
+
+        stats = {
+            "total_unmasked": 0,
+            "steps_taken": 0,
+            "generation_method": "diffusion_denoising",
+        }
+
+        # Progressive denoising over multiple diffusion steps
+        for step in range(self.num_diffusion_steps):
+            # Create timestep for this diffusion step
+            t = torch.full((batch_size,), step, device=self.device, dtype=torch.long)
+
+            # Forward pass through model
+            with torch.no_grad():
+                logits, _, updated_stack = self.model(
+                    full_sequence,
+                    current_stack,
+                    timestep=t,
+                    token_mask=generation_mask,
+                    return_all_thoughts=True,
+                )
+
+            # Update stack
+            current_stack = updated_stack
+
+            # Apply denoising to generation positions only
+            if step < self.num_diffusion_steps - 1:  # Not the final step
+                # Sample with noise for intermediate steps
+                next_token_logits = logits / (
+                    self.temperature * (1 + step * 0.01)
+                )  # Reduce temp over time
+                probs = torch.softmax(next_token_logits, dim=-1)
+
+                # Update only the generation positions
+                for pos in range(prompt_tokens.shape[1], total_seq_len):
+                    if torch.rand(1).item() < 0.7:  # Progressive refinement
+                        new_token = torch.multinomial(probs[:, pos, :], num_samples=1)
+                        full_sequence[:, pos] = new_token.squeeze(1)
+                        stats["total_unmasked"] += 1
+            else:
+                # Final step - deterministic or low-temperature sampling
+                next_token_logits = logits / self.temperature
+                probs = torch.softmax(next_token_logits, dim=-1)
+
+                for pos in range(prompt_tokens.shape[1], total_seq_len):
+                    new_token = torch.multinomial(probs[:, pos, :], num_samples=1)
+                    full_sequence[:, pos] = new_token.squeeze(1)
+
+            stats["steps_taken"] = step + 1
+
+        # Update final thought stack
+        self.thought_stack = current_stack
+
+        print(f"   Completed {stats['steps_taken']} diffusion steps")
+        print(f"   Total token updates: {stats['total_unmasked']}")
 
         # Extract generated portion (after prompt)
-        prompt_length = prompt_tokens.shape[1]
-        if prompt_length < tokens.shape[1]:
-            generated_tokens = tokens[:, prompt_length:]
-        else:
-            generated_tokens = tokens
+        generated_tokens = full_sequence[:, prompt_tokens.shape[1] :]
 
         # Find EOS token and truncate
         eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None:
+        if eos_token_id is not None and generated_tokens.shape[1] > 0:
             # Find first occurrence of EOS token
             eos_positions = (generated_tokens == eos_token_id).nonzero(as_tuple=True)
             if len(eos_positions[1]) > 0:
@@ -239,11 +317,12 @@ class InteractiveDiffusionChat:
         response = self._detokenize(generated_tokens)
 
         # Get the last thought from the stack for metrics
-        last_thought = final_thought_stack[:, -1, :].flatten(
+        # For 3D model: stack shape is (B, C, H, W, D)
+        last_thought = current_stack[:, :, :, :, 0].flatten(
             1
-        )  # Flatten thought dimensions
+        )  # Most recent thought, flatten spatial dims
 
-        return response, last_thought, final_thought_stack, stats
+        return response, last_thought, current_stack, stats
 
     def chat_turn(self, user_input: str) -> Dict:
         """Process one turn of conversation"""
@@ -340,7 +419,7 @@ class InteractiveDiffusionChat:
             return
 
         print("\n📊 Thought Evolution Statistics:")
-        for i, turn in enumerate(self.thought_history[-5:], 1):  # Last 5 turns
+        for turn in self.thought_history[-5:]:  # Last 5 turns
             gen_stats = turn.get("generation_stats", {})
             stats_str = f"Turn {turn['turn']}: thought_norm={turn['thought_norm']:.3f}, stack_norm={turn['stack_norm']:.3f}"
             if gen_stats:
@@ -384,15 +463,22 @@ class InteractiveDiffusionChat:
                         print("👋 Goodbye!")
                         break
                     elif user_input == "/settings":
-                        masking_config = self.config["model"].get("masking", {})
+                        masking_config = self.config.get("masking", {})
+                        thought_config = self.config.get("thought_tensor", {})
+                        dream_config = self.config.get("dream", {})
                         print(f"Settings:")
                         print(
                             f"  Generation: max_length={self.max_length}, temperature={self.temperature}"
                         )
                         print(
-                            f"  Masking: mask_ratio={masking_config.get('mask_ratio', 0.8)}, confidence_threshold={masking_config.get('confidence_threshold', 0.7)}"
+                            f"  Masking: mask_ratio={masking_config.get('mask_ratio', 0.7)}, confidence_threshold={masking_config.get('confidence_threshold', 0.75)}"
                         )
-                        print(f"  Diffusion: steps={self.num_diffusion_steps}")
+                        print(
+                            f"  Thought Stack: dims={thought_config.get('input_dims', [16, 16, 128])}, depth={thought_config.get('stack_size', 8)}"
+                        )
+                        print(
+                            f"  DREAM: bidirectional={dream_config.get('bidirectional_attention', True)}"
+                        )
                     else:
                         print("Unknown command. Type /help for available commands.")
                     continue
@@ -442,6 +528,17 @@ def main():
         action="store_true",
         help="Use reverse diffusion process instead of fixed timestep",
     )
+    parser.add_argument(
+        "--mask-ratio",
+        type=float,
+        default=0.3,
+        help="Token masking ratio for DREAM generation",
+    )
+    parser.add_argument(
+        "--use-dream-config",
+        action="store_true",
+        help="Use dream_config.yaml as default config",
+    )
 
     args = parser.parse_args()
 
@@ -452,6 +549,7 @@ def main():
 
         # Look for checkpoints in common locations
         checkpoint_dirs = [
+            "outputs/dream_checkpoints",  # New DREAM checkpoint location
             "outputs/enhanced_checkpoints",
             "outputs/simple_real_training",
             "outputs/real_data_checkpoints",
@@ -473,11 +571,16 @@ def main():
 
         sys.exit(1)
 
+    # Handle config path defaults
+    config_path = args.config
+    if args.use_dream_config and not config_path:
+        config_path = "configs/dream_config.yaml"
+
     # Create chat interface
     try:
         chat = InteractiveDiffusionChat(
             model_path=args.model,
-            config_path=args.config,
+            config_path=config_path,
             tokenizer_name=args.tokenizer,
             max_length=args.max_length,
             temperature=args.temperature,

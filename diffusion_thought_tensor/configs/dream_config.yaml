@@ -1,0 +1,149 @@
+# DREAM Model Configuration - Enhanced Bidirectional Diffusion
+# Optimized for DREAM architecture with enhanced thought system
+
+model:
+  name: "StackedDiffusionModel3D"
+  embed_dim: 256              # Balanced for DREAM architecture
+  num_layers: 6               # Optimal for bidirectional processing
+  num_heads: 8                # Multi-head attention for DREAM
+  vocab_size: 50257           # GPT-2 vocabulary
+  max_seq_length: 512         # Reduced for DREAM optimization
+  max_new_tokens: 256         # Focused generation length
+  dropout: 0.1                # Standard dropout
+  
+# DREAM-specific configurations (integrated into StackedDiffusionModel3D)
+dream:
+  bidirectional_attention: true     # Built into 3D model
+  adaptive_noise_scheduling: false  # Not supported by 3D model
+  enhanced_confidence: false        # Not supported by 3D model
+  block_wise_unmasking: true        # Supported via masking strategy
+  generation_order_embedding: false # Not needed for 3D model
+  pad_token_id: 50256               # GPT2's eos_token_id used as pad_token
+  
+# Enhanced thought system for StackedDiffusionModel3D
+thought_tensor:
+  input_dims: [16, 16, 128]        # 3D model format: [H, W, channels] - optimized for memory
+  stack_size: 8                    # Depth of 3D thought stack
+  hidden_dim: 256                  # Match embed_dim
+  dropout: 0.15                    # Thought-specific dropout
+  noise_injection_std: 0.03       # Reduced noise for stability
+  diversity_loss_weight: 0.1      # Encourage diversity
+  self_supervised_learning: true   # Enable self-learning
+  temporal_dynamics: true          # Velocity/acceleration tracking
+  importance_based_retention: true # Smart thought retention
+  
+# Masking strategy for DREAM
+masking:
+  mask_ratio: 0.7                  # Initial masking ratio
+  confidence_threshold: 0.75       # Unmasking threshold
+  progressive_unmasking: true      # Enable progressive strategy
+  block_size: 4                    # Block-wise unmasking size
+  adaptive_masking: true           # Context-aware masking
+  final_mask_ratio: 0.35           # Final masking ratio (mask_ratio * 0.5)
+  final_confidence_threshold: 0.9  # Final confidence threshold (min(0.9, threshold + 0.15))
+  
+# Diffusion configuration optimized for DREAM
+diffusion:
+  num_steps: 500                   # Reduced steps for efficiency
+  noise_schedule: "cosine"         # Optimal schedule
+  schedule_type: "cosine"          
+  beta_start: 0.0001
+  beta_end: 0.015                  # Reduced for stability
+  prediction_type: "epsilon"
+  adaptive_timesteps: true         # Per-token timesteps
+  
+# Training optimized for DREAM
+training:
+  batch_size: 1                    # Balanced batch size
+  gradient_accumulation_steps: 4   # Effective batch = 16
+  learning_rate: 3e-5              # Conservative for DREAM
+  warmup_steps: 1000               # Reduced warmup
+  num_epochs: 10                   # Focused training
+  eval_every: 1                    # Regular evaluation
+  save_every: 1                    # Save each epoch
+  max_grad_norm: 0.5               # Strict gradient clipping
+  stack_reset_frequency: 500       # Match training script default
+  label_smoothing: 0.05            # Light smoothing
+  early_stopping_patience: 3      # Match training script default
+  
+# Optimizer for DREAM
+optimizer:
+  type: "AdamW"
+  weight_decay: 0.005              # Reduced weight decay
+  betas: [0.9, 0.95]               # Match training script
+  eps: 1e-8                        # Match training script
+  
+# Hardware optimization for DREAM
+hardware:
+  device: "cuda"
+  mixed_precision: true            # Essential for performance
+  gradient_checkpointing: true     # Memory efficiency
+  num_workers: 0                   # Single worker for stability
+  dataloader_pin_memory: true      # CUDA optimization
+  compile_model: false             # Disable for debugging
+  target_memory_gb: 20             # Memory monitor target
+  
+# Memory management for DREAM
+memory:
+  offload_to_cpu: false
+  cpu_offload_params: false
+  activation_checkpointing: true
+  thought_stack_checkpointing: true # New: checkpoint thought computations
+  
+# Data configuration
+data_config:
+  cache_dir: "data/cache"
+  data_source: "tinystories"       # Proven working dataset
+  train_samples: 25000             # Moderate size for DREAM
+  eval_samples: 2500               # Balanced evaluation
+  
+# DREAM-specific advanced features
+advanced:
+  use_flash_attention: false       # Disable for compatibility
+  compile_model: false             # Keep disabled
+  deepspeed_config: null
+  dream_features: true             # Enable all DREAM features
+  enhanced_thought_system: true    # Enable enhanced thoughts
+  temporal_attention: true         # Multi-scale temporal processing
+  
+# Enhanced logging for DREAM
+logging:
+  log_every: 25                    # Frequent logging for DREAM
+  use_wandb: false                 # Disabled by default
+  use_tensorboard: true            # TensorBoard enabled
+  use_dream_metrics: true          # DREAM-specific metrics
+  use_advanced_thought_metrics: true
+  wandb_project: "dream-diffusion-thought-tensor"
+  wandb_tags: ["dream", "bidirectional", "enhanced-thoughts"]
+  save_samples: true
+  save_thought_visualizations: true
+  save_attention_maps: true        # New: save attention patterns
+  log_train_every: 50              # Training metrics logging frequency
+  thought_histogram_every: 200     # Thought activation histogram frequency
+  
+# Checkpointing for DREAM
+checkpointing:
+  checkpoint_dir: "outputs/dream_checkpoints"
+  log_dir: "outputs/dream_logs"
+  keep_best: true
+  keep_latest: 5                   # Keep more checkpoints
+  save_optimizer_state: true      # Full state saving
+  
+# Performance benchmarking
+benchmarking:
+  enable_benchmarks: true          # Enable performance tracking
+  benchmark_every: 5               # Benchmark every 5 epochs
+  save_benchmark_results: true     # Save performance data
+  
+# Model specifications
+estimated_params: "~50M"          # StackedDiffusionModel3D size (with optimized dimensions)
+estimated_vram: "~8GB"            # Memory estimate with optimized 3D convolutions
+model_type: "stacked_3d_dream"     # Model identifier
+
+# Loss configuration for StackedDiffusionModel3D
+loss:
+  main_loss_weight: 1.0           # Standard diffusion loss
+  thought_loss_weight: 0.0        # No direct thought losses (self-supervised)
+  confidence_loss_weight: 0.0     # Not supported by 3D model
+  masking_loss_weight: 0.02       # Masking strategy loss
+  temporal_loss_weight: 0.03      # Temporal consistency loss
