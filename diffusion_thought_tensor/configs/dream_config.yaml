@@ -3,12 +3,12 @@
 
 model:
   name: "StackedDiffusionModel3D"
-  embed_dim: 256              # Balanced for DREAM architecture
-  num_layers: 6               # Optimal for bidirectional processing
-  num_heads: 8                # Multi-head attention for DREAM
+  embed_dim: 720              # Optimized for ~1B total parameters
+  num_layers: 16              # Reduced layers to control param count
+  num_heads: 16               # 12 heads, 60 dim each (720/12=60)
   vocab_size: 50257           # GPT-2 vocabulary
-  max_seq_length: 512         # Reduced for DREAM optimization
-  max_new_tokens: 256         # Focused generation length
+  max_seq_length: 2048        # Increased context length
+  max_new_tokens: 1024         # Longer generation capability
   dropout: 0.1                # Standard dropout
   
 # DREAM-specific configurations (integrated into StackedDiffusionModel3D)
@@ -22,9 +22,9 @@ dream:
   
 # Enhanced thought system for StackedDiffusionModel3D
 thought_tensor:
-  input_dims: [16, 16, 128]        # 3D model format: [H, W, channels] - optimized for memory
-  stack_size: 8                    # Depth of 3D thought stack
-  hidden_dim: 256                  # Match embed_dim
+  input_dims: [16, 16, 64]         # Reduced 3D format: [H, W, channels] for fair comparison
+  stack_size: 8                    # Reduced thought stack depth
+  hidden_dim: 720                  # Match embed_dim for consistency
   dropout: 0.15                    # Thought-specific dropout
   noise_injection_std: 0.03       # Reduced noise for stability
   diversity_loss_weight: 0.1      # Encourage diversity
@@ -54,17 +54,17 @@ diffusion:
   
 # Training optimized for DREAM
 training:
-  batch_size: 1                    # Balanced batch size
-  gradient_accumulation_steps: 4   # Effective batch = 16
-  learning_rate: 3e-5              # Conservative for DREAM
-  warmup_steps: 1000               # Reduced warmup
-  num_epochs: 10                   # Focused training
+  batch_size: 1                    # Small batch for 1B model memory constraints
+  gradient_accumulation_steps: 16  # Larger accumulation for effective batch = 16
+  learning_rate: 1e-5              # Lower LR for large model stability
+  warmup_steps: 2000               # Longer warmup for 1B model
+  num_epochs: 5                    # Fewer epochs for large model
   eval_every: 1                    # Regular evaluation
   save_every: 1                    # Save each epoch
-  max_grad_norm: 0.5               # Strict gradient clipping
-  stack_reset_frequency: 500       # Match training script default
-  label_smoothing: 0.05            # Light smoothing
-  early_stopping_patience: 3      # Match training script default
+  max_grad_norm: 1.0               # Higher gradient clipping for large model
+  stack_reset_frequency: 0         # Reset once per epoch
+  label_smoothing: 0.1             # More smoothing for large model
+  early_stopping_patience: 3      # Keep patience setting
   
 # Optimizer for DREAM
 optimizer:
@@ -76,12 +76,12 @@ optimizer:
 # Hardware optimization for DREAM
 hardware:
   device: "cuda"
-  mixed_precision: true            # Essential for performance
-  gradient_checkpointing: true     # Memory efficiency
+  mixed_precision: true            # Essential for 1B model
+  gradient_checkpointing: true     # Critical memory efficiency for 1B
   num_workers: 0                   # Single worker for stability
-  dataloader_pin_memory: true      # CUDA optimization
-  compile_model: false             # Disable for debugging
-  target_memory_gb: 20             # Memory monitor target
+  dataloader_pin_memory: false     # Disable to save memory
+  compile_model: false             # Keep disabled for 1B model
+  target_memory_gb: 40             # Higher memory target for 1B model
   
 # Memory management for DREAM
 memory:
@@ -94,8 +94,8 @@ memory:
 data_config:
   cache_dir: "data/cache"
   data_source: "tinystories"       # Proven working dataset
-  train_samples: 25000             # Moderate size for DREAM
-  eval_samples: 2500               # Balanced evaluation
+  train_samples: 100000            # Larger dataset for 1B model
+  eval_samples: 10000              # Larger evaluation set
   
 # DREAM-specific advanced features
 advanced:
@@ -136,9 +136,9 @@ benchmarking:
   save_benchmark_results: true     # Save performance data
   
 # Model specifications
-estimated_params: "~50M"          # StackedDiffusionModel3D size (with optimized dimensions)
-estimated_vram: "~8GB"            # Memory estimate with optimized 3D convolutions
-model_type: "stacked_3d_dream"     # Model identifier
+estimated_params: "~1B"           # StackedDiffusionModel3D scaled to 1B parameters
+estimated_vram: "~24GB"           # Memory estimate for 1B model with 3D convolutions
+model_type: "stacked_3d_dream_1b" # Model identifier for 1B scale
 
 # Loss configuration for StackedDiffusionModel3D
 loss:

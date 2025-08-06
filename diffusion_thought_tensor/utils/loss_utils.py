@@ -5,7 +5,7 @@ Loss computation utilities for DREAM-Enhanced Model Training
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
-from model.stacked_3d_model import StackedDiffusionModel3D
+from ..model.stacked_3d_model import StackedDiffusionModel3D
 
 
 def compute_dream_enhanced_loss(
@@ -51,18 +51,24 @@ def compute_dream_enhanced_loss(
             mask_positions = torch.randperm(seq_length, device=device)[:mask_count]
             token_mask[b, mask_positions] = True
 
-    # Forward pass - StackedDiffusionModel3D doesn't return thought losses
-    forward_outputs = model(tokens, thought_stacks, timesteps, token_mask, 
-                           return_all_thoughts=False)
-    
-    # Unpack the outputs from StackedDiffusionModel3D
-    pred_logits, new_thought, _ = forward_outputs
-    thought_losses = {}  # 3D model doesn't use self-supervised thought losses
-
-    # Evolve thought stack using 3D model's push method
-    evolved_thought_stacks = model.thought_stack.push_with_importance(
-        thought_stacks, new_thought
-    )
+    # Detect model type and call appropriately
+    if hasattr(model, 'thought_stack'):
+        # StackedDiffusionModel3D (thought model)
+        forward_outputs = model(tokens, thought_stacks, timesteps, token_mask, 
+                               return_all_thoughts=False)
+        pred_logits, new_thought, _ = forward_outputs
+        thought_losses = {}  # 3D model doesn't use self-supervised thought losses
+        
+        # Evolve thought stack using 3D model's push method
+        evolved_thought_stacks = model.thought_stack.push_with_importance(
+            thought_stacks, new_thought
+        )
+    else:
+        # BaselineDreamModel (no thoughts)
+        pred_logits = model(tokens, timesteps, token_mask)
+        new_thought = torch.zeros_like(thought_stacks[:, :, :, :, 0])  # Dummy thought
+        thought_losses = {}
+        evolved_thought_stacks = thought_stacks  # No evolution for baseline
 
     # === LOSS COMPONENTS ===
     

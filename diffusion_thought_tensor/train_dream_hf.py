@@ -34,8 +34,6 @@ from data.huggingface_data_loader import (
 )
 
 
-
-
 def main():
     """Main function for DREAM-enhanced model training"""
 
@@ -103,13 +101,13 @@ def main():
 
     # Initialize DREAM-enhanced 3D model
     print("Initializing DREAM-Enhanced 3D Model...")
-    
+
     # Map 3D config to 2D spatial dimensions (H, W) and separate depth
     original_dims = config["thought_tensor"]["input_dims"]  # e.g., [32, 32, 16]
     thought_dims = (original_dims[0], original_dims[1])  # (H, W)
     stack_depth = config["thought_tensor"]["stack_size"]
     thought_hidden_dim = original_dims[2] if len(original_dims) > 2 else 256
-    
+
     model = StackedDiffusionModel3D(
         vocab_size=config["model"].get("vocab_size", 50257),
         embed_dim=config["model"]["embed_dim"],
@@ -169,19 +167,19 @@ def main():
     )
 
     from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
-    
+
     cosine_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
         T_0=int(config["training"]["warmup_steps"]),
         T_mult=2,
         eta_min=float(config["training"]["learning_rate"]) * 0.01,
     )
-    
+
     plateau_scheduler = ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5,
         min_lr=float(config["training"]["learning_rate"]) * 0.001
     )
-    
+
     lr_scheduler = cosine_scheduler
 
     # Checkpoint loading
@@ -209,7 +207,7 @@ def main():
     gradient_accumulation_steps = config["training"]["gradient_accumulation_steps"]
     max_grad_norm = float(config["training"]["max_grad_norm"])
     early_stopping_patience = config["training"].get("early_stopping_patience", 3)
-    
+
     # Progressive masking and confidence scheduling
     initial_mask_ratio = args.mask_ratio
     final_mask_ratio = args.mask_ratio * 0.5
@@ -220,7 +218,7 @@ def main():
     scaler = GradScaler("cuda") if config.get("hardware", {}).get("mixed_precision", True) else None
     use_amp = scaler is not None
     memory_monitor = MemoryMonitor(target_memory_gb=20)
-    
+
     # Initialize DREAM logger
     use_wandb = config.get("logging", {}).get("use_wandb", False)
     use_tensorboard = config.get("logging", {}).get("use_tensorboard", True)
@@ -241,6 +239,13 @@ def main():
     stack_reset_frequency = config.get("training", {}).get("stack_reset_frequency", 10)
     persistent_thought_stacks = None
     batch_count = 0
+    reset_stack_this_epoch = False
+
+    print(f"  Thought stack reset strategy: ", end="")
+    if stack_reset_frequency == 0:
+        print("once per epoch")
+    else:
+        print(f"every {stack_reset_frequency} batches")
 
     # Training loop
     for epoch in range(start_epoch, num_epochs):
@@ -254,12 +259,16 @@ def main():
         progress = epoch / max(1, num_epochs - 1)
         current_mask_ratio = initial_mask_ratio + (final_mask_ratio - initial_mask_ratio) * progress
         current_confidence = initial_confidence + (final_confidence - initial_confidence) * progress
-        
-        print(f"Using mask ratio: {current_mask_ratio:.3f}, confidence: {current_confidence:.3f}")
+
+        # print(f"Using mask ratio: {current_mask_ratio:.3f}, confidence: {current_confidence:.3f}")
 
         # Training phase
         model.train()
         epoch_losses = []
+
+        # Reset stack flag for this epoch if frequency is 0
+        if stack_reset_frequency == 0:
+            reset_stack_this_epoch = True
 
         train_pbar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
 
@@ -268,12 +277,30 @@ def main():
             batch_size = tokens.shape[0]
 
             # Handle persistent thought stacks
+            reset_stack = False
+
+            if stack_reset_frequency == 0:
+                # Reset once per epoch when frequency is 0
+                if reset_stack_this_epoch or persistent_thought_stacks is None:
+                    reset_stack = True
+                    reset_stack_this_epoch = False  # Only reset once per epoch
+            else:
+                # Normal frequency-based reset
+                if batch_count % stack_reset_frequency == 0:
+                    reset_stack = True
+
+            # Always reset if batch size changes or no existing stacks
             if (
-                batch_count % stack_reset_frequency == 0
-                or persistent_thought_stacks is None
+                persistent_thought_stacks is None
                 or persistent_thought_stacks.shape[0] != batch_size
             ):
+                reset_stack = True
+
+            if reset_stack:
                 current_thought_stacks = model.initialize_stack(batch_size, device)
+                # print(
+                #     f"   🧠 Reset thought stacks at batch {batch_idx} (epoch {epoch + 1})"
+                # )
             else:
                 current_thought_stacks = persistent_thought_stacks
 
@@ -332,13 +359,13 @@ def main():
                 "mask": f"{metrics['mask_ratio_actual']:.2f}",
                 "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
             }
-            
+
             # Add DREAM-specific metrics to progress
             if "bidirectional_effectiveness" in metrics:
                 progress_info["bi_eff"] = f"{metrics['bidirectional_effectiveness']:.2f}"
             if "confidence_threshold_effectiveness" in metrics:
                 progress_info["conf_eff"] = f"{metrics['confidence_threshold_effectiveness']:.2f}"
-                
+
             train_pbar.set_postfix(progress_info)
 
             # Memory cleanup
@@ -365,24 +392,52 @@ def main():
         print("\n📊 Evaluating DREAM model...")
         model.eval()
         eval_losses = []
+        eval_thought_stacks = None
 
         with torch.no_grad():
-            for batch in tqdm(eval_loader, desc="Evaluating"):
+            for batch_idx, batch in enumerate(tqdm(eval_loader, desc="Evaluating")):
                 tokens = batch.to(device, non_blocking=True)
                 batch_size = tokens.shape[0]
-                eval_thought_stacks = model.initialize_stack(batch_size, device)
+
+                # Initialize or reuse evaluation thought stacks
+                if (
+                    eval_thought_stacks is None
+                    or eval_thought_stacks.shape[0] != batch_size
+                ):
+                    eval_thought_stacks = model.initialize_stack(batch_size, device)
 
                 if use_amp:
                     with autocast("cuda"):
-                        loss, metrics, _ = compute_dream_enhanced_loss(
-                            model, tokens, eval_thought_stacks, noise_scheduler,
-                            device, epoch, config, args.mask_ratio, args.confidence_threshold, pad_token_id
+                        loss, metrics, evolved_eval_stacks = (
+                            compute_dream_enhanced_loss(
+                                model,
+                                tokens,
+                                eval_thought_stacks,
+                                noise_scheduler,
+                                device,
+                                epoch,
+                                config,
+                                args.mask_ratio,
+                                args.confidence_threshold,
+                                pad_token_id,
+                            )
                         )
                 else:
-                    loss, metrics, _ = compute_dream_enhanced_loss(
-                        model, tokens, eval_thought_stacks, noise_scheduler,
-                        device, epoch, config, args.mask_ratio, args.confidence_threshold, pad_token_id
+                    loss, metrics, evolved_eval_stacks = compute_dream_enhanced_loss(
+                        model,
+                        tokens,
+                        eval_thought_stacks,
+                        noise_scheduler,
+                        device,
+                        epoch,
+                        config,
+                        args.mask_ratio,
+                        args.confidence_threshold,
+                        pad_token_id,
                     )
+
+                # Update evaluation thought stacks for next batch
+                eval_thought_stacks = evolved_eval_stacks.detach()
                 eval_losses.append(metrics)
 
         # Average evaluation metrics
@@ -404,7 +459,7 @@ def main():
 
         # Epoch summary
         epoch_time = time.time() - epoch_start_time
-        
+
         print(f"\n📈 Epoch {epoch + 1} Results:")
         print(f"  Time: {epoch_time:.1f}s")
         print(f"  Train Loss: {epoch_metrics['avg_total_loss']:.4f}")
@@ -420,7 +475,7 @@ def main():
 
         # Update plateau scheduler
         plateau_scheduler.step(eval_metrics["total_loss"])
-        
+
         # Save best model and check early stopping
         if eval_metrics["total_loss"] < best_eval_loss:
             best_eval_loss = eval_metrics["total_loss"]
