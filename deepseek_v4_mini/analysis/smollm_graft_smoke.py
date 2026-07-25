@@ -17,7 +17,7 @@ import sys
 import torch
 
 sys.path.insert(0, ".")
-from deepseek_v4_mini.smollm_graft import GraftConfig, SmolBankLM
+from deepseek_v4_mini.legacy.smollm_graft import GraftConfig, SmolBankLM
 
 torch.manual_seed(0)
 

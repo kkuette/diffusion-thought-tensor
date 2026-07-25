@@ -20,8 +20,8 @@ import torch
 sys.path.insert(0, ".")
 from transformers import AutoTokenizer
 
-from deepseek_v4_mini.smollm_graft import GraftConfig, SmolBankLM
-from deepseek_v4_mini.verbal_tasks import VerbalRuleGen, VerbalTaskConfig
+from deepseek_v4_mini.legacy.smollm_graft import GraftConfig, SmolBankLM
+from deepseek_v4_mini.legacy.verbal_tasks import VerbalRuleGen, VerbalTaskConfig
 
 torch.manual_seed(0)
 USE_HF = "--hf" in sys.argv

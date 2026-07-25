@@ -7,6 +7,40 @@ RNG either way); the older diagnostics are CPU-only.
 Run from the repo root with `PYTHONPATH=.`; each script takes an optional
 checkpoint path as first argument.
 
+## État de repro (audit 2026-07-25)
+
+Deux choses à savoir avant d'en lancer une.
+
+**Ce sont des scripts, pas des modules.** Config et checkpoint sont des
+constantes de niveau module, chargées dès la première ligne : importer une
+sonde *la lance*, et échoue si le checkpoint manque.
+
+**La plupart des checkpoints jouets n'existent plus** — purgés au fil des
+campagnes. La voie de repro n'est donc pas « recharger le ckpt » mais
+« relancer la config », qui est intacte et versionnée sous
+`configs/archive/` :
+
+```bash
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/<config>.yaml
+python -m deepseek_v4_mini.analysis.<sonde> <chemin/du/ckpt/produit.pt>
+```
+
+Ce qui survit encore sur le NAS (`/mnt/tb/checkpoints/`) :
+
+| sonde | checkpoint |
+|---|---|
+| `gate_probe`, `reflection_probe` | `archive/multiturn_rule_k2_inter_s128_dsv4w_s43` |
+| `reflection_probe` (2ᵉ bras) | `archive/multiturn_rule_k2_inter_s128structmerge_dsv5b` |
+| `code_defer_bank_probes` | `archive/code_defer_native_v2b_mix` |
+| `doc2code_probe` | `code_defer_native_v2c_varlen` |
+
+Tous les autres (`multiturn_rule`, `_switch`, `_joint`, `_horizon`,
+`_dsv4m`, `_dsv4w`, `_s256L`, `_affineL_wr`, `_hop_dsv5c`) sont à
+reproduire depuis leur config. `freq_vs_surp*` ne dépendent d'aucun
+checkpoint (mesures sur la data). `smollm_graft_smoke` et
+`verbal_tasks_smoke` visent l'arc greffe, passé sous
+`deepseek_v4_mini/legacy/`.
+
 | Script | Question | Key result |
 |---|---|---|
 | `code_geometry.py` | Are the written rule codes a structured manifold or a lookup table? | The write head builds a **circular manifold** mirroring the modular rule structure (cos-sim monotone in circular distance, erank 3.4/32); **held-out shifts are written ON-manifold at the correct position** — the READ, not the write, is the generalization blocker. |

@@ -1618,10 +1618,10 @@ here; the co-adaptation is the expensive, necessary part.)
 ### Reproduce
 
 The graft harness is committed for the record:
-`deepseek_v4_mini/smollm_graft.py` (the graft module — write head and
+`deepseek_v4_mini/legacy/smollm_graft.py` (the graft module — write head and
 fast-weight read bolted onto a HF causal LM, zero-initialised so the grafted
 model starts bit-identical to the host) driven by
-`deepseek_v4_mini/code_train.py` (dual-optimizer trainer) with
+`deepseek_v4_mini/legacy/code_train.py` (dual-optimizer trainer) with
 `deepseek_v4_mini/configs/archive/mechanism/code_defer_v1.yaml`; the v1→v10 variants are LR /
 optimizer / cap settings documented above. The from-scratch control is
 `deepseek_v4_mini/code_defer_native.py` with
