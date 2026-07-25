@@ -83,8 +83,8 @@ documented with exact reproduction commands in **[FINDINGS.md](FINDINGS.md)**
    critical path; the cascade remains a free deployment flag.
 3. **Scale point: a 350M phase-1 run on 10B tokens**, released as
    **[Fractale-350M-base](https://huggingface.co/fractale-lm/Fractale-350M-base)**
-   (usage repo: [fractale-lm/fractale](https://github.com/fractale-lm/fractale),
-   card: [MODEL_CARD.md](MODEL_CARD.md)).
+   (usage repo: [fractale-lm/fractale](https://github.com/fractale-lm/fractale);
+   the model card lives on the Hub).
 
 The current phase is **phase 2**: instruction-following through a ChatML chat
 template (no address tokens), SFT on reassembled state-of-the-art instruction
@@ -137,7 +137,7 @@ both configs of that same trainer; the `chat:` block is what switches a run
 from pretraining to SFT.
 
 ```bash
-# phase 1 — pretraining (the 350M lineage; see vast/ for the pod scripts)
+# phase 1 — pretraining (the 350M lineage)
 python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_phase1_10b.yaml
 
 # phase 2 — chat SFT on reassembled SOTA instruction data
@@ -396,7 +396,6 @@ deepseek_v4_mini/        ← active project (fast-weight thought bank)
                            synth_recall, gist, multiturn_rule family
     archive/mechanism/   ← closed native v2/v3 arc (+ farm/ sweeps)
 scripts/                 ← selftest.sh (hermetic CPU tests), farm/ (rig queue)
-vast/                    ← pod bring-up + HF checkpoint sync
 legacy/thought_lm_minimal/  ← the 2025 ancestor, kept for the record
 checkpoints/, runs/      ← training outputs
 ```
