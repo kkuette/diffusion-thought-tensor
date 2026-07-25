@@ -30,7 +30,7 @@ from transformers import AutoTokenizer
 
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
-from .train import Muon, _split_muon_params
+from .muon import Muon, _split_muon_params
 from .code_data import CodeChunkStream
 from .cascade import CascadeMemory
 

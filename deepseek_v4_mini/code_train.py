@@ -135,7 +135,7 @@ def main(cfg_path: str) -> None:
         print(f"graft optimizer: AdamW lr {graft_lr} ({sum(p.numel() for p in graft_params):,}) "
               f"| host AdamW lr {lr_host}", flush=True)
     else:
-        from .train import Muon
+        from .muon import Muon
         mats = [p for p in graft_params if p.ndim == 2]; rest = [p for p in graft_params if p.ndim != 2]
         opt_graft = Muon(mats, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
                          rms_match=True, adam_params=rest, adam_lr=lr_bank, adam_wd=wd)
