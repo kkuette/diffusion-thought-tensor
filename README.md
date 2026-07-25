@@ -129,7 +129,37 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 Target hardware: a single 24 GB GPU (RTX 3090).
 
-### Train
+### Train — current program
+
+The live entry point is `code_defer_native` (native from-scratch, deferred
+continuation, cascade memory). Phase 1 pretraining and phase 2 chat SFT are
+both configs of that same trainer; the `chat:` block is what switches a run
+from pretraining to SFT.
+
+```bash
+# phase 1 — pretraining (the 350M lineage; see vast/ for the pod scripts)
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_phase1_10b.yaml
+
+# phase 2 — chat SFT on reassembled SOTA instruction data
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/sft_sota_350m.yaml
+
+# GRPO, disaggregated workers/learner
+python -m deepseek_v4_mini.rl_disagg deepseek_v4_mini/configs/rl_disagg_350m.yaml
+
+# before any pod bring-up: the hermetic CPU self-tests
+scripts/selftest.sh
+```
+
+The `chat.stream` key of an SFT config picks the conversation stream from the
+registry in [`deepseek_v4_mini/streams.py`](deepseek_v4_mini/streams.py)
+(`sota_session`, `tool_session`, `code_exec`, `persona`, `math_school`, or
+`chat_mix` to weight several of them).
+
+### Train — reproducing the paper (closed arc)
+
+`train.py` is the trainer of the dsv4mini toy arc. It is kept working for
+repro; it is not where the current program runs.
+
 ```bash
 # language modelling
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml      # ~19M, TinyStories
@@ -165,11 +195,15 @@ out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank to the next segmen
 
 To probe a paper checkpoint instead:
 ```python
-cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml")
+cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml")
 model = ThoughtBankLM(cfg)
-model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt",
+model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt",
                                  map_location="cpu")["model"])
 ```
+> Most toy-arc checkpoints were purged across campaigns: the repro path is to
+> re-run the archived config, not to reload a checkpoint. See
+> [`deepseek_v4_mini/analysis/README.md`](deepseek_v4_mini/analysis/README.md)
+> for which ones still exist and what to re-run for the rest.
 
 ---
 
@@ -335,15 +369,26 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 paper/                   ← the paper (paper.pdf, draft.md, figures/)
 repro/                   ← end-to-end reproduction of the paper (run_all.sh)
 deepseek_v4_mini/        ← active project (fast-weight thought bank)
-  model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
+  model.py  memory.py  attention.py  moe.py  mhc.py  cascade.py  config.py
+  muon.py                ← Muon + the param split (shared by every trainer)
+  code_defer_native.py   ← THE trainer of the current program (phase 1 + SFT)
+  streams.py             ← name→class registry for conversation streams
+  *_data.py              ← the streams: sota_session, tool_env, code_exec,
+                           persona, math_school, chat_mix
+  rl_disagg.py  rl_lives.py  rl_rewards.py  exec_sandbox.py   ← GRPO + envs
+  train.py               ← trainer of the closed dsv4mini arc (repro only)
   eval_memory.py         ← offline PPL with/without the bank
   analysis/              ← mechanistic diagnostics + campaign results
+                           (see its README for repro status per probe)
+  legacy/                ← closed arc: the SmolLM2 graft
   configs/               ← active program: phase-1 SIF (v350_*), SFT (sft_*),
                            RL (rl_*), 350M ablations (farm/)
     archive/dsv4mini/    ← closed toy arc: tiny, small, code, code_persist,
                            synth_recall, gist, multiturn_rule family
     archive/mechanism/   ← closed native v2/v3 arc (+ farm/ sweeps)
-thought_lm_minimal/      ← minimal thought-LM baseline
+scripts/                 ← selftest.sh (hermetic CPU tests), farm/ (rig queue)
+vast/                    ← pod bring-up + HF checkpoint sync
+legacy/thought_lm_minimal/  ← the 2025 ancestor, kept for the record
 checkpoints/, runs/      ← training outputs
 ```
 
@@ -352,7 +397,7 @@ checkpoints/, runs/      ← training outputs
 ## 📚 References
 - DeepSeek-V4 (architecture base), DeepSeekMoE (Dai et al., 2024)
 - Hyper-Connections (Zhu et al., 2024), Muon optimizer (Jordan et al., 2024)
-- Thought-memory baseline: [`thought_lm_minimal/`](thought_lm_minimal/)
+- Thought-memory ancestor: [`legacy/thought_lm_minimal/`](legacy/thought_lm_minimal/)
 
 ## License
 

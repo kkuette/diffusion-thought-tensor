@@ -316,7 +316,7 @@ sess.load_bank("novel.bank")       # ...restore tomorrow
 print(sess.bank_stats())           # slot norms + similarities
 ```
 
-Two runnable demos ship with the repo: `scripts/read_document.py` (feed a
+Two runnable demos ship with the `fractale` repo: `scripts/read_document.py` (feed a
 file, compare with-memory vs amnesic vs the true continuation) and
 `scripts/swap_banks.py` (the memory transplant: same blank prompt, two
 banks — predictions follow the bank, not the prompt).
