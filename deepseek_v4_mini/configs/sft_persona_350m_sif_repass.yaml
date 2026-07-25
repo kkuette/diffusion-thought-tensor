@@ -1,0 +1,209 @@
+# sft_persona_350m_sif_repass — SFT persona depuis le ckpt REPASS SIF (step 2500).
+# LE JUGE RÉEL de la repass (2026-07-23) : la base a désormais été pré-entraînée
+# avec le teacher SIF a=1e-4 (codes contenu-porteurs dès le write, defer
+# 6.21→5.03 à travers l'anneal, éval 3090 verte sur les 2 domaines, decode =
+# la banque injecte le contenu du doc source). Hypothèse : le SFT-chaud SIF
+# (recette sif_hot, inchangée) part d'un canal DÉJÀ aligné teacher↔write ⇒
+# l'adressage sélectif (grade recall), resté à 0 sur la base release
+# (sif_hot@400 : point fixe cassé, Δnll +0.160 à β=0, mais grade 0), doit
+# décoller. Verdict au juge @600-800.
+#
+# DIFFS vs sft_persona_350m_sif_hot.yaml :
+#   - init_from = /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+#     (ckpt WARM : WSD interrompu à lr 1.71e-4/2.4e-4 — le SFT-chaud à
+#     muon 2.4e-4 est en continuité de LR, pas un choc)
+#   - eval_every 200→50 (décision mémoire post-sif_hot : suivre Δnll/grade
+#     à grain fin autour de l'anneal et après retrait)
+# Leviers EN RÉSERVE (ne pas payer d'avance) : pools ×5 si l'adressage
+# plafonne ; WSD post-anneal si Δnll recule après β=0.
+#
+# LANCEMENT :
+#   python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_persona_350m_sif_repass.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /mnt/tb/data_cache
+  # --- identique au bloc sft_school (cache hit garanti sur le cache local)
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 4
+  amp: true
+  # Base = repass SIF stoppée à 2500/3750 (budget), poids seuls, schedule/optim
+  # frais, step→0 (ré-arme β). Banque fraîche : re-remplissage FIFO.
+  init_from: /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0                          # LR plein dès step 1 (recette sif_hot)
+  no_reset_files: 0                        # une seule vie de banque pour tout le run
+  cascade_depth: 4                         # banque complète V3 (recette sif_hot)
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 50                           # 200→50 : suivi fin anneal + post-retrait
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths: [2, 8]
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 50
+  save_dir: /mnt/tb/checkpoints/v350_sft_persona_sif_repass
+  metrics_file: /mnt/tb/runs/v350_sft_persona_sif_repass/metrics.jsonl
+
+chat:
+  stream: persona
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 24
+  gen:
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cache_dir: /mnt/tb/data_cache
+    surprisal_mode: sif                    # SIF a/(a+p) — MÊME famille de codes
+    sif_a: 1.0e-04                         # que le pretrain repass : continuité
+    value_weight: 4.0                      # pression native routage read→valeur
+
+# TEACHER OFF (décision user 2026-07-23) : la base repass a DÉJÀ été entraînée
+# sur la cible SIF en phase 1 — le canal write↔code est natif, pas besoin de
+# ré-échafauder. Pression restante = CE chat + value_weight ×4 (native, survit
+# par construction : pas de retrait). Si le canal ne s'ouvre pas sans β,
+# ré-armer le teacher redevient le levier.
+teacher:
+  enabled: false

@@ -1,0 +1,208 @@
+# sft_sota_fromsif_reg — ÉTAGE 1/2 : registre ChatML sur data SOTA depuis
+# la base phase 1 SIF (repass final_step2500), teacher OFF.
+#
+# Décision user 2026-07-24 : le canal read transféré du persona (step_550
+# rearm) ne s'approfondit pas sur data réelle (Δnll plat +0.05 sur 5 évals,
+# run coupé @259) ⇒ on REPAYE l'ouverture du canal depuis la base propre,
+# séquence validée « registre d'abord, fenêtre β ensuite » :
+#   - étage 1 (CE run) : 150 steps teacher-off = le registre se paye seul ;
+#   - étage 2 (sft_sota_fromsif_rearm) : warm restart step_150, teacher
+#     surprisal β=1 [0,150] + rampe [150,300] + WSD 300→650.
+# requote_weight 4.0 aux deux étages (analogue value_weight ×4 persona =
+# l'ingrédient de rétention post-retrait).
+#
+# LANCEMENT (chaîné avec l'étage 2) :
+#   python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_sota_fromsif_reg.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /mnt/tb/data_cache
+  # --- identique au bloc sft_school (cache hit garanti, ancres GAP code/web)
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 150
+  grad_accum: 4
+  amp: true
+  # Base = phase 1 SIF repass (canal WRITE natif, zéro registre,
+  # zéro persona). Poids seuls, optim frais, step→0. Banque fraîche.
+  init_from: /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0                          # LR plein dès step 1 (recette validée)
+  no_reset_files: 0                        # une seule vie de banque pour tout le run
+  cascade_depth: 4                         # banque complète V3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false                         # LR plat (le WSD vit à l'étage 2)
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 50
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths: [2, 8]
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 50
+  save_dir: /mnt/tb/checkpoints/v350_sft_sota_fromsif_reg
+  metrics_file: /mnt/tb/runs/v350_sft_sota_fromsif_reg/metrics.jsonl
+
+chat:
+  stream: sota_session
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 64                              # réponses réelles > valeurs persona
+  gen:
+    real_cache_dir: /mnt/tb/data_cache
+    conv_cap: 8000
+    max_turn_tok: 192
+    max_conv_msgs: 10
+    convs_per_session: [2, 6]
+    p_requote: 0.5
+    n_requote: [1, 2]
+    requote_weight: 4.0                    # run 1 (w=1.0) coupé @259 : Δnll
+                                           # plat +0.05 sur 5 évals, chat 3.3→2.6,
+                                           # abl grade 0.04→0.11 = registre appris
+                                           # sans payer la banque ⇒ pression native
+                                           # (mask = 1+(w-1)·sif, réponses requote)
+    surprisal_mode: sif                    # poids SIF posés sur les segs
+    sif_a: 1.0e-04                         # (teacher OFF : inertes, prêts
+                                           # pour un ré-armement éventuel)
+
+teacher:
+  enabled: false
