@@ -5,7 +5,7 @@ against the ground truth and the no-bank reset. Shows whether the bank keeps
 producing sensible continuations deep into the conversation.
 
     python -m deepseek_v4_mini.code_defer_sample_deep \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml \
         checkpoints/code_defer_native_ragged/final.pt
 """
 import sys, yaml, torch
@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .code_data import CodeChunkStream
+from .paths import load_yaml
 
 
 def _fill(x, tok, w):
@@ -35,7 +36,7 @@ def _greedy(model, ref, blank_id, bank, dl):
 @torch.no_grad()
 def main(cfg_path, ckpt_path, depths=(1, 2, 4, 6, 8, 10)):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw = yaml.safe_load(open(cfg_path)); d = raw["data"]
+    raw = load_yaml(cfg_path); d = raw["data"]
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     for tkn in ("<think>", "<blank>"):
         if tkn not in tok.get_vocab():

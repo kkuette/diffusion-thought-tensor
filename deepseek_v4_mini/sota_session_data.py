@@ -38,6 +38,7 @@ import torch
 
 from .math_school_data import U_OPEN, A_OPEN, CLOSE
 from .persona_chat_data import PersonaChatStream
+from .paths import load_yaml
 
 _WORD = re.compile(r"[a-z0-9']+")
 
@@ -206,9 +207,8 @@ class SotaSessionStream(PersonaChatStream):
 # ── smoke ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) > 1:                    # real tokenizer + real dataset
-        import yaml
         from transformers import AutoTokenizer
-        raw = yaml.safe_load(open(sys.argv[1]))
+        raw = load_yaml(sys.argv[1])
         tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
         gen = (raw.get("chat", {}) or {}).get("gen", {}) or {}
         gen = {k: v for k, v in gen.items()

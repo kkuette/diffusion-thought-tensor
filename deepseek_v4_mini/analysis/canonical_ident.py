@@ -21,14 +21,15 @@ import sys, yaml, torch, torch.nn.functional as F
 sys.path.insert(0, ".")
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
+from ..paths import load_yaml
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_switch/step_1100.pt"
-CFG  = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_mini/configs/multiturn_rule_switch.yaml"
+CFG  = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_switch.yaml"
 S, m, SYM_OFF, N = 32, 6, 3, 64
 
 cfg = ThoughtBankConfig.from_yaml(CFG)
-_d    = yaml.safe_load(open(CFG)).get("data", {})
+_d    = load_yaml(CFG).get("data", {})
 SW    = int(_d.get("switch_at", 12))
 TURNS = int(_d.get("turns_per_conv", 24))
 model = ThoughtBankLM(cfg)

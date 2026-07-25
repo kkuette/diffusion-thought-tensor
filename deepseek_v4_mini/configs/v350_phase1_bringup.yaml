@@ -48,7 +48,7 @@ model:                                     # = v350_bringup / 350m_mix (386M)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /workspace/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:                                 # ancres seules (mesure) ; le mix officiel
   - name: codeparrot                       # attend le verdict divmix (job 107)
     dataset: codeparrot/codeparrot-clean
@@ -89,8 +89,8 @@ training:
   eval_depths: [2, 4, 6, 8]
   eval_depth_convs: 8
   save_every: 1000
-  save_dir: /workspace/checkpoints/v350_phase1_bringup
-  metrics_file: /workspace/runs/v350_phase1_bringup/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_phase1_bringup
+  metrics_file: ${TB_ROOT}/runs/v350_phase1_bringup/metrics.jsonl
   # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
   # pas de reach, pas de cascade — c'est la définition de la phase 1.
 

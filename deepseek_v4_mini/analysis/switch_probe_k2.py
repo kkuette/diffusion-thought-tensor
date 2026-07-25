@@ -35,15 +35,14 @@ torch.manual_seed(0)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
         "checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt")
-CFG  = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml"
+CFG  = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml"
 if "--cfg" in sys.argv:
     CFG = sys.argv[sys.argv.index("--cfg") + 1]
 S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N = 128                                  # conversations (batched lanes)
-
-import yaml
-raw = yaml.safe_load(open(CFG))
+from ..paths import load_yaml
+raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")

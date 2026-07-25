@@ -45,7 +45,6 @@ import time
 
 import torch
 import torch.nn.functional as F
-import yaml
 from transformers import AutoTokenizer
 
 from .config import ThoughtBankConfig
@@ -54,6 +53,7 @@ from .code_data import CodeChunkStream
 from .cascade import CascadeMemory
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_defer_grpo import pos_write_corr
+from .paths import load_yaml
 
 
 # ── policy primitives (cascade-aware variants of v1) ────────────────────────
@@ -155,7 +155,7 @@ def grpo_backward(model, ref, group, advs, temp, clip_lo, clip_hi, kl_coef,
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main(cfg_path: str) -> None:
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     r, d = raw["rl"], raw["data"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(r.get("seed", 0)))

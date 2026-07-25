@@ -19,7 +19,7 @@ identification dies at the write and no read recipe can work.
 
 Usage (CPU, safe to run alongside a GPU training):
   python -m deepseek_v4_mini.analysis.write_code_probe \
-      deepseek_v4_mini/configs/multiturn_rule_k2_inter_s256L.yaml \
+      deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s256L.yaml \
       checkpoints/multiturn_rule_k2_inter_s256L/step_2000.pt
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ import yaml
 from deepseek_v4_mini import train as T
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
+from ..paths import expand
 
 
 def main() -> None:
@@ -42,7 +43,7 @@ def main() -> None:
     n_rep = 8
 
     with open(cfg_path) as f:
-        raw = yaml.safe_load(f)
+        raw = expand(yaml.safe_load(f))
     d = raw["data"]
     model_cfg = ThoughtBankConfig.from_yaml(cfg_path)
     device = torch.device("cpu")

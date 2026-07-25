@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from .paths import expand
 
 
 @dataclass
@@ -207,7 +208,7 @@ class ThoughtBankConfig:
     @classmethod
     def from_yaml(cls, path: Path) -> "ThoughtBankConfig":
         with open(path) as f:
-            data = yaml.safe_load(f) or {}
+            data = expand(yaml.safe_load(f)) or {}
         fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**fields)
 

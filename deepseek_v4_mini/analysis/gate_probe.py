@@ -36,12 +36,13 @@ sys.path.insert(0, ".")
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
+from ..paths import load_yaml
 
 torch.manual_seed(0)
 DEV  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
         "checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt")
-CFG  = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml"
+CFG  = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml"
 if "--cfg" in sys.argv:
     CFG = sys.argv[sys.argv.index("--cfg") + 1]
 
@@ -49,7 +50,7 @@ S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N_CONV, TURNS, TURNS_POST = 64, 16, 8
 
-raw = yaml.safe_load(open(CFG))
+raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")

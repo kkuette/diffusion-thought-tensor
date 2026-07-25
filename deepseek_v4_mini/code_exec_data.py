@@ -36,6 +36,7 @@ import sys
 from .exec_sandbox import pass_frac, run_tests
 from .persona_chat_data import PersonaChatStream
 from .rl_rewards import extract_code
+from .paths import load_yaml
 
 _ASK = ("Now implement {label}. Reply with a single ```python``` code block "
         "containing the full solution.")
@@ -197,9 +198,8 @@ class CodeExecStream(PersonaChatStream):
 # ── smoke ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) > 1:                      # real tokenizer + real dataset
-        import yaml
         from transformers import AutoTokenizer
-        raw = yaml.safe_load(open(sys.argv[1]))
+        raw = load_yaml(sys.argv[1])
         tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
         gen = ((raw.get("exec", {}) or {}).get("gen", {}) or {})
         st = CodeExecStream(tok, **gen)

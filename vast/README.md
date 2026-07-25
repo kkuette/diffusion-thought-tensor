@@ -29,7 +29,7 @@ vastai create instance <OFFER_ID> \
   --image pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime \
   --disk 60 \
   --onstart-cmd 'bash -lc "apt-get update -qq && apt-get install -y -qq git && \
-    curl -fsSL https://raw.githubusercontent.com/kkuette/thought-bank/claude/status-check-2fa903/vast/bringup_350m.sh \
+    curl -fsSL https://raw.githubusercontent.com/kkuette/thought-bank/sft-persona-350m/vast/bringup_350m.sh \
     -o /workspace/bringup_350m.sh && bash /workspace/bringup_350m.sh"'
 ```
 

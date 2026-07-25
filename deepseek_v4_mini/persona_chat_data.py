@@ -44,7 +44,7 @@ code_defer_native (.next_conv() + .rng + module grade_conv).
 Hermetic self-test (stub tokenizer, no downloads):
   python -m deepseek_v4_mini.persona_chat_data
 Real-tokenizer smoke (decode one conv per kind + stats):
-  python -m deepseek_v4_mini.persona_chat_data deepseek_v4_mini/configs/farm/v3_reach.yaml
+  python -m deepseek_v4_mini.persona_chat_data deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml
 """
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ import sys
 import torch
 
 from .math_school_data import U_OPEN, A_OPEN, CLOSE
+from .paths import load_yaml
 
 # ── fact slots ───────────────────────────────────────────────────────────────
 # Each slot: statement templates, question templates, answer templates, value
@@ -674,14 +675,14 @@ def main() -> None:
     if len(sys.argv) < 2:
         _self_test()
         return
-    import yaml
     from transformers import AutoTokenizer
-    raw = yaml.safe_load(open(sys.argv[1]))
+    raw = load_yaml(sys.argv[1])
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     kw = {}
     if "--real" in sys.argv:
+        from .paths import expand_str
         kw = dict(real_filler="HuggingFaceTB/smol-smoltalk",
-                  real_cache_dir="/mnt/tb/data_cache")
+                  real_cache_dir=expand_str("${TB_ROOT}/data_cache"))
     ps = PersonaChatStream(tok, seed=0, **kw)
     for want in ("smalltalk", "recall"):
         for _ in range(100):

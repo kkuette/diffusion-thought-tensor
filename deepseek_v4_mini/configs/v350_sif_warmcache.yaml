@@ -2,7 +2,7 @@
 # repass SIF, pod 1x A100 ($1.49/h). Les graphes ne dépendent que des shapes
 # (B32, L512, dims 386M) : ni la data ni les poids n'entrent dans la clé —
 # une seule petite source streamée (real data) suffit, pas de data_cache 9G
-# ni de ckpt. Puis : tar /workspace/compile_cache -> HF, resservi aux nodes
+# ni de ckpt. Puis : tar ${TB_ROOT}/compile_cache -> HF, resservi aux nodes
 # 4x/8x (clé = arch GPU sm_80 + torch 2.6.0+cu124 = image identique).
 #
 # v2 (user 2026-07-23) : « bien faire la compilation ENTIÈRE » — le warmup
@@ -45,7 +45,7 @@ model:                                     # = v350_sif_repass (386M), inchangé
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /workspace/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   surprisal_mode: sif                      # requis par teacher target surprisal
   sif_a: 1.0e-04
   sources:
@@ -82,15 +82,15 @@ training:
   grad_checkpoint: true
   gc_save_topk: false
   compile: true
-  compile_cache_dir: /workspace/compile_cache
+  compile_cache_dir: ${TB_ROOT}/compile_cache
   prefetch: true
   skip_final_eval: true
   log_every: 5
   eval_every: 999999
   eval_convs: 8
   save_every: 999999
-  save_dir: /workspace/checkpoints/v350_sif_warmcache
-  metrics_file: /workspace/runs/v350_sif_warmcache/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sif_warmcache
+  metrics_file: ${TB_ROOT}/runs/v350_sif_warmcache/metrics.jsonl
 
 teacher:                                   # traversée d'anneal pour compiler
   enabled: true                            #   les 3 régimes du chemin teacher

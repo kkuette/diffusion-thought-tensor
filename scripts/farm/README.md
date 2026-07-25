@@ -38,7 +38,7 @@ Exemple — une seed du 97M v2c :
 cat > /mnt/tb/queue/10_v2c_97m_seed44.job <<'EOF'
 cd deepseek_v4_mini
 python code_defer_native.py \
-  --config configs/v2c_varlen.yaml \
+  --config configs/archive/mechanism/code_defer_native_v2c_varlen.yaml \
   --seed 44 \
   --out $TB_MNT/checkpoints/v2c_97m_s44 \
   --log $TB_MNT/runs/v2c_97m_s44
@@ -73,17 +73,17 @@ pointe l'import `deepseek_v4_mini`.) L'alternative Docker-sur-Unraid
 
 `prebuild_data.py` rejoue la construction de données du trainer (mêmes clés de
 cache md5, y compris les tokens spéciaux `<think>`/`<blank>`) et remplit le
-cache partagé `/mnt/tb/data_cache/`. Validé : 4/4 cache hits sur la config v2c.
+cache partagé `${TB_ROOT}/data_cache/` (TB_ROOT = le montage, exporté par gpu_worker.sh). Validé : 4/4 cache hits sur la config v2c.
 
 Depuis le terminal Unraid :
 
 ```bash
 /mnt/user/llm_research/scripts/prebuild_data.sh \
-  deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml
+  deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml
 ```
 
 **Convention** : toute config destinée à la ferme déclare
-`data.cache_dir: /mnt/tb/data_cache` (le défaut du trainer est un `data_cache/`
+`data.cache_dir: ${TB_ROOT}/data_cache` (le défaut du trainer est un `data_cache/`
 local qui raterait le cache partagé). Le cache des corpus actuels est déjà
 semé (16 entrées, ~1 Go). Le HF cache partagé (`data/hf_cache`) évite aussi
 les re-téléchargements.

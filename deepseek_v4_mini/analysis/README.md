@@ -7,6 +7,45 @@ RNG either way); the older diagnostics are CPU-only.
 Run from the repo root with `PYTHONPATH=.`; each script takes an optional
 checkpoint path as first argument.
 
+## How to re-run a probe
+
+**No checkpoints are distributed.** Each probe reproduces in two steps: train
+the config it belongs to, then point the probe at the checkpoint that run
+produced. Every config is versioned under `configs/archive/`, so the claims
+are reproducible from source on a single 24 GB GPU — the toy-arc cells are
+hours, not days.
+
+```bash
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/<config>.yaml
+python -m deepseek_v4_mini.analysis.<probe> <checkpoint produced above>
+```
+
+The default checkpoint path hardcoded at the top of each probe is the one
+from the original campaign; pass yours as the first argument instead.
+
+| probe | config to train |
+|---|---|
+| `ttt_demo`, `switch_probe_k2` | `archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml` |
+| `ttt_demo_act2`, `superposition_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml` |
+| `gate_probe`, `reflection_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml` |
+| `switch_inspect`, `canonical_ident` | `archive/dsv4mini/multiturn_rule_switch.yaml` |
+| `joint_inspect` | `archive/dsv4mini/multiturn_rule_joint.yaml` |
+| `rehearsal_inspect` | `archive/dsv4mini/multiturn_rule_horizon.yaml` |
+| `hop_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128hop_dsv5c.yaml` |
+| `write_code_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s256L.yaml` |
+| `affine_per_unit` | `archive/dsv4mini/multiturn_rule_k2_inter_affineL_wr.yaml` |
+| `code_geometry` | `archive/dsv4mini/multiturn_rule_k2_heldout.yaml` |
+| `code_defer_bank_probes` | `archive/mechanism/code_defer_native_v2b_mix.yaml` |
+| `doc2code_probe` | `rl_defer_grpo_97m.yaml` |
+
+`freq_vs_surp` and `freq_vs_surp_mix` need no checkpoint (they measure the
+data). `smollm_graft_smoke` and `verbal_tasks_smoke` target the SmolLM2 graft
+arc, now under `deepseek_v4_mini/legacy/`.
+
+**These are scripts, not modules.** Config and checkpoint are module-level
+constants evaluated at import: importing a probe *runs* it, and fails if the
+checkpoint is missing.
+
 | Script | Question | Key result |
 |---|---|---|
 | `code_geometry.py` | Are the written rule codes a structured manifold or a lookup table? | The write head builds a **circular manifold** mirroring the modular rule structure (cos-sim monotone in circular distance, erank 3.4/32); **held-out shifts are written ON-manifold at the correct position** — the READ, not the write, is the generalization blocker. |

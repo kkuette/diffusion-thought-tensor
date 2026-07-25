@@ -21,7 +21,7 @@ Success = deferred GAP > 0 (carried beats init_mem=None), STABLE across the anne
 and WSD decay (not the graft's spike-then-crash), while in-context ppl stays sane.
 
     PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.code_defer_native \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml
 """
 import os, sys, math, time, yaml, json
 import torch
@@ -30,9 +30,10 @@ from transformers import AutoTokenizer
 
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
-from .train import Muon, _split_muon_params
+from .muon import Muon, _split_muon_params
 from .code_data import CodeChunkStream
 from .cascade import CascadeMemory
+from .paths import load_yaml
 
 
 def _fill(x_ref, tok_id, width):
@@ -306,7 +307,7 @@ def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
 
 
 def main(cfg_path: str, resume: bool = False) -> None:
-    raw = yaml.safe_load(open(cfg_path)); t = raw["training"]; d = raw["data"]
+    raw = load_yaml(cfg_path); t = raw["training"]; d = raw["data"]
 
     # DDP (opt-in via torchrun): data parallelism WITHOUT the DDP wrapper — the
     # conv loop runs many forwards (in-context + defer + addr + reach) per single
@@ -571,19 +572,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
     chat_eval_convs = int(chat_cfg.get("eval_convs", 24))
     chat_max_new = int(chat_cfg.get("max_new", 24))
     if chat_cfg:
+        from .streams import chat_stream_class
         sname = chat_cfg.get("stream", "math_school")
-        if sname == "math_school":
-            from .math_school_data import MathSchoolStream as _ChatStream
-        elif sname == "persona":
-            from .persona_chat_data import PersonaChatStream as _ChatStream
-        elif sname == "sota_session":
-            from .sota_session_data import SotaSessionStream as _ChatStream
-        elif sname == "chat_mix":
-            from .chat_mix import ChatMixStream as _ChatStream
-        else:
-            raise ValueError(f"chat.stream: unknown stream {sname!r} "
-                             "(math_school | persona | sota_session | "
-                             "chat_mix)")
+        _ChatStream = chat_stream_class(sname)
         gen_kw = dict(chat_cfg.get("gen", {}) or {})
         chat_stream = _ChatStream(tok, seed=train_seed + 1, **gen_kw)
         chat_eval = _ChatStream(tok, seed=1234, **gen_kw)

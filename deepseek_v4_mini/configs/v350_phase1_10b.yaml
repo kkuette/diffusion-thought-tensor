@@ -13,7 +13,7 @@
 # DONNÉES : pool ~2.4B tokens uniques (≈4 époques sur 10B — le tirage est avec
 # remise, les poids du mix restent exacts quelle que soit la taille des pools).
 # PRÉBUILD OBLIGATOIRE avant le pod (scripts/farm/prebuild_data.py sur server0,
-# cache uint16 ≈ 5 GB) puis tar → HF privé → untar dans /workspace/data_cache
+# cache uint16 ≈ 5 GB) puis tar → HF privé → untar dans ${TB_ROOT}/data_cache
 # au boot. the-stack (full, PAS smol) est GATED : token HF requis au prébuild.
 #
 # DIMENSIONNEMENT (validé pod 8xA100 2026-07-17, contrats 45123153+45132091) :
@@ -62,7 +62,7 @@ model:                                     # = v350_bringup / v350_curr (386M)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /workspace/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # Mix divmix officiel (poids IDENTIQUES au job 107 / v350_curr_p1) ; seuls
   # changent les pools (n_files par source ~ poids x 2.4B / tokens-par-fichier)
   # et les stack_* qui passent de the-stack-smol (10k fichiers/langue, trop
@@ -219,8 +219,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 500                          # ~45 min entre checkpoints (5.4 s/step)
-  save_dir: /workspace/checkpoints/v350_phase1_10b
-  metrics_file: /workspace/runs/v350_phase1_10b/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_phase1_10b
+  metrics_file: ${TB_ROOT}/runs/v350_phase1_10b/metrics.jsonl
   # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
   # pas de reach, pas de cascade — c'est la définition de la phase 1.
 

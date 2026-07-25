@@ -142,9 +142,8 @@ boutons (p_chat, poids stages, partial credit d'éval) restent en réserve —
 une variable à la fois.
 
 ```
-# ckpt: /mnt/tb/checkpoints/farm/sft_school/final.pt (step 800)
-# logs: /mnt/tb/runs/GPUrig0-gpu1__117_sft_school.workerlog (0→400, tué),
-#       GPUrig0-gpu2__118 (tué, sans biais), GPUrig0-gpu1__119 (400→800+probes)
+# ckpt: checkpoints/sft_school/final.pt (step 800)
+# run mené en 3 tranches (deux workers tués sans biais, reprise 400→800)
 # diag décodes : scratchpad diag_math_decode.py (rejouable sur tout ckpt)
 ```
 
@@ -211,8 +210,8 @@ document is chunked but specific to *which* document.
 
 ### Reproduce
 
-Farm configs live under `deepseek_v4_mini/configs/farm/` (branch
-`claude/status-check-2fa903`). Train: `python -m
+Farm configs live under `deepseek_v4_mini/configs/farm/` (the closed v2/v3
+arcs under `deepseek_v4_mini/configs/archive/mechanism/farm/`). Train: `python -m
 deepseek_v4_mini.code_defer_native
 deepseek_v4_mini/configs/farm/<cfg>.yaml [--resume]`. Probes: `PYTHONPATH=.
 python deepseek_v4_mini/analysis/code_defer_bank_probes.py
@@ -231,7 +230,7 @@ completion; not a crash.
 **Question.** Avant de payer la run 10B : l'anneal teacher [2850,4300] de
 `v350_phase1_10b.yaml` (proportion héritée du twin, ~730k convs de teacher) et
 le `wsd_decay_start` à 60% (convention DeepSeek) sont-ils bien réglés ? Deux
-ablations à une variable chacune sur GPUrig0, contre la baseline
+ablations à une variable chacune, contre la baseline
 `v350_curr_p1` (même seed, même data — trajectoires identiques hors points de
 schedule, ic 10.863 vs 10.862 @10).
 
@@ -260,8 +259,8 @@ bien plus avancé en loss qu'un step 100 du twin grâce au batch 256) et
 `grad_checkpoint: true` (B4×512×8 OOM sur 8GB — même gradient, recompute).
 
 Repro : `deepseek_v4_mini/configs/farm/v350_p1_annealfast.yaml`,
-`.../v350_p1_wsd85.yaml`, metrics `/mnt/tb/runs/farm_v350_p1_{annealfast,wsd85}/`
-vs `/mnt/tb/runs/farm_v350_curr_p1/`.
+`.../v350_p1_wsd85.yaml`, metrics `runs/v350_p1_{annealfast,wsd85}/`
+vs `runs/v350_curr_p1/`.
 
 ---
 
@@ -360,7 +359,7 @@ déjà validée). Pour le 350M : la profondeur de cascade est un multiplicateur 
 contribution page quasi gratuit (d3 = même coût, job 111), et aucun risque de falaise
 de capacité en vie longue.
 
-Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (jobs 113/114/115, logs `GPUrig0-gpu{3,2,4}__11{3,4,5}_capdeep_*.workerlog`).
+Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (3 runs, un par profondeur).
 
 ---
 
@@ -425,8 +424,8 @@ which is exactly the taper design.
 Repro:
 ```
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v3_deep.yaml \
-  /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt \
+  deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml \
+  checkpoints/v350_rehearsal/final.pt \
   --probes swap,distractor,cued,page,capacity_curve --n-files 48
 # d3: config farm/v350_d3_probes.yaml, ckpt farm/v350_rehearsal_d3/final.pt
 # md128: config farm/v2e_md128.yaml, ckpt farm/v2e_md128/final.pt, probes swap,distractor,cued,merge
@@ -491,11 +490,11 @@ question, revisited only if the 350M superposition register saturates.**
 
 Repro:
 ```
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_divmix.yaml --resume
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_delta.yaml --resume
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v3_reach.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_divmix.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_delta.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml --resume
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/<cfg>.yaml /mnt/tb/checkpoints/farm/<run>/final.pt \
+  deepseek_v4_mini/configs/farm/<cfg>.yaml checkpoints/<run>/final.pt \
   --probes invar|cued,xmodal|page,capacity_curve --n-files 48
 ```
 
@@ -534,11 +533,11 @@ loss. Side sanity: carried @800 6.597 ≈ v2e 6.575; swap battery replicates
 
 Repro:
 ```
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_resetcue.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_resetcue.yaml --resume
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v2e_resetcue.yaml \
-  /mnt/tb/checkpoints/farm/v2e_resetcue/final.pt --probes resetcue,swap,distractor --n-files 48
-# contrôle OOD : même probe sur /mnt/tb/checkpoints/farm/v2e_interleave/final.pt
+  deepseek_v4_mini/configs/archive/mechanism/farm/v2e_resetcue.yaml \
+  checkpoints/v2e_resetcue/final.pt --probes resetcue,swap,distractor --n-files 48
+# contrôle OOD : même probe sur checkpoints/v2e_interleave/final.pt
 ```
 
 ---
@@ -588,9 +587,8 @@ B ~free).
 Repro:
 ```
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v2h_stack.yaml \
-  /mnt/tb/checkpoints/farm/v2h_stack/final.pt --probes capacity_curve --n-files 48
-# logs: /mnt/tb/runs/GPUrig0-gpu{2,3}__10{1,2,9}_*.workerlog
+  deepseek_v4_mini/configs/archive/mechanism/farm/v2h_stack.yaml \
+  checkpoints/v2h_stack/final.pt --probes capacity_curve --n-files 48
 ```
 
 ---
@@ -623,10 +621,10 @@ enough); the web-side reach-back is much weaker than code (−0.09 vs −1.42) �
 domain asymmetry unexplained.
 
 Repro: `python -m deepseek_v4_mini.code_defer_native
-deepseek_v4_mini/configs/farm/v3_deep.yaml --resume` puis
+deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml --resume` puis
 `PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py
-deepseek_v4_mini/configs/farm/v3_deep.yaml
-/mnt/tb/checkpoints/farm/v3_deep/final.pt --probes page,swap,distractor,cued
+deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml
+checkpoints/v3_deep/final.pt --probes page,swap,distractor,cued
 --n-files 48`.
 
 ---
@@ -684,7 +682,7 @@ unseen languages) is in job 107's battery.
 
 Repro: `queue` jobs 97/099 (page), 105 (xmodal); probes `page`, `xmodal` in
 `deepseek_v4_mini/analysis/code_defer_bank_probes.py`; divmix config
-`deepseek_v4_mini/configs/farm/v2e_divmix.yaml` (commit ce4a755). Experiment
+`deepseek_v4_mini/configs/archive/mechanism/farm/v2e_divmix.yaml` (commit ce4a755). Experiment
 map: `EXPERIMENTS.md` (new — one row per test, the "not established" column
 is mandatory).
 
@@ -801,8 +799,8 @@ reward signal") is why SFT came first.
 
 ```bash
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v2f_addr.yaml \
-  /mnt/tb/checkpoints/farm/v2f_addr/final.pt \
+  deepseek_v4_mini/configs/archive/mechanism/farm/v2f_addr.yaml \
+  checkpoints/v2f_addr/final.pt \
   --probes cued,merge,cohab,invar --n-files 48
 ```
 
@@ -856,8 +854,8 @@ mem_dim grid's seed-4 pairs (the taper argument for small deep-block reads).
 
 ```bash
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v2e_interleave.yaml \
-  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  deepseek_v4_mini/configs/archive/mechanism/farm/v2e_interleave.yaml \
+  checkpoints/v2e_interleave/final.pt \
   --probes merge --n-files 48
 ```
 
@@ -1000,13 +998,13 @@ capability starts at zero, as designed).
 
 ```bash
 # v2e interleaved (seed 0; s2/s3 = configs v2e_s2/v2e_s3)
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_interleave.yaml
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_interleave.yaml
 # v2f addressed (G2; seed 2 = v2f_addr_s2)
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2f_addr.yaml
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2f_addr.yaml
 # probe battery incl. the cued probe (any checkpoint)
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/v2e_interleave.yaml \
-  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  deepseek_v4_mini/configs/archive/mechanism/farm/v2e_interleave.yaml \
+  checkpoints/v2e_interleave/final.pt \
   --probes swap,dup,distractor,order,eviction,cued --n-files 48
 ```
 
@@ -1245,7 +1243,7 @@ Muon LR scales. Regime change on top: chunks are re-cut at **variable lengths
 [128, 512]** instead of fixed 512 — this breaks the positional shortcut where
 `<think>` always lands at position 512, a prerequisite for RL over *when* to
 write. Config:
-[`deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`](deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml).
+[`deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml`](deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml).
 
 ### What happened
 
@@ -1271,7 +1269,7 @@ as-is. The GRPO phase can `init_from` a bootstrapped model and optimize the
 write *policy* without re-solving the credit-assignment problem that made
 bootstrap necessary in the first place.
 
-Repro: `python deepseek_v4_mini/code_defer_native.py deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`
+Repro: `python deepseek_v4_mini/code_defer_native.py deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml`
 (needs `checkpoints/code_defer_native_v2b_mix/final.pt`).
 
 ---
@@ -1298,7 +1296,7 @@ must not change the memory mechanism; `mem_dim` is a separate sweep). fp32,
 B=2 × grad-accum 4, 9 s/step, ~5h on the 3090, identical `v2b_mix`
 data/recipe (data held constant deliberately — the comparison is
 params-only). Config:
-[`deepseek_v4_mini/configs/code_defer_native_135m_mix.yaml`](deepseek_v4_mini/configs/code_defer_native_135m_mix.yaml).
+[`deepseek_v4_mini/configs/archive/mechanism/code_defer_native_135m_mix.yaml`](deepseek_v4_mini/configs/archive/mechanism/code_defer_native_135m_mix.yaml).
 
 ### Depth-stratified verdict (n=48 per depth per source)
 
@@ -1374,7 +1372,7 @@ difference is whether the written gists are present.
 
 97M-param DeepSeek-mini trunk (d=384, 6 layers, MoE) + bank (`mem_dim: 512`,
 8 slots, fast-weight read rank 16). Config:
-[`deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml`](deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml).
+[`deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml`](deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml).
 Two findings that anyone scaling this should know:
 
 - **The Muon √cols trap.** Our Muon variant scales updates by `√cols`, so the
@@ -1520,22 +1518,22 @@ pip install -r requirements.txt
 
 # 1. Train (2000 steps, ~2h40 on a 3090; checkpoints + logs under runs/)
 python -m deepseek_v4_mini.code_defer_native \
-    deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml
+    deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml
 
 # 2. Depth-stratified GAP curve (table in §4)
 python -m deepseek_v4_mini.code_defer_depthcurve \
-    deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml \
+    deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml \
     checkpoints/code_defer_native_v2b_mix/final.pt 48
 
 # 3. Bank probes (tables in §5; ~40 min for all five)
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-    deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml \
+    deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml \
     checkpoints/code_defer_native_v2b_mix/final.pt
 
 # 4. Qualitative: greedy-decode continuations from the bank alone, one long
 #    file per domain
 python -m deepseek_v4_mini.code_defer_sample_deep \
-    deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml \
+    deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml \
     checkpoints/code_defer_native_v2b_mix/final.pt
 ```
 
@@ -1618,14 +1616,14 @@ here; the co-adaptation is the expensive, necessary part.)
 ### Reproduce
 
 The graft harness is committed for the record:
-`deepseek_v4_mini/smollm_graft.py` (the graft module — write head and
+`deepseek_v4_mini/legacy/smollm_graft.py` (the graft module — write head and
 fast-weight read bolted onto a HF causal LM, zero-initialised so the grafted
 model starts bit-identical to the host) driven by
-`deepseek_v4_mini/code_train.py` (dual-optimizer trainer) with
-`deepseek_v4_mini/configs/code_defer_v1.yaml`; the v1→v10 variants are LR /
+`deepseek_v4_mini/legacy/code_train.py` (dual-optimizer trainer) with
+`deepseek_v4_mini/configs/archive/mechanism/code_defer_v1.yaml`; the v1→v10 variants are LR /
 optimizer / cap settings documented above. The from-scratch control is
 `deepseek_v4_mini/code_defer_native.py` with
-`configs/code_defer_native_v1.yaml` (47M). Fair warning: reproducing the
+`configs/archive/mechanism/code_defer_native_v1.yaml` (47M). Fair warning: reproducing the
 *failure* takes as long as reproducing the success (~hours per arm on a
 24GB GPU); the informative artifact is the trajectory shape (GAP crash at
 teacher-anneal / injection-norm blow-up / capped-read flatline), not a

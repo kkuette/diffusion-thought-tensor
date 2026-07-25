@@ -31,11 +31,12 @@ sys.path.insert(0, REPO)
 import yaml  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 from deepseek_v4_mini.code_data import CodeChunkStream  # noqa: E402
+from deepseek_v4_mini.paths import expand
 
 
 def prebuild(cfg_path: str, cache_dir: str, only: list[str] | None = None) -> None:
     with open(cfg_path) as f:
-        raw = yaml.safe_load(f)
+        raw = expand(yaml.safe_load(f))
     if only:
         # sous-ensemble de sources (parallélisation par processus : les clés de
         # cache md5 sont PAR source, donc N prebuilds --only disjoints puis un

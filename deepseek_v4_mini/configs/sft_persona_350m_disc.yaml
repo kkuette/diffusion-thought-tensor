@@ -65,7 +65,7 @@ model:                                     # = v350_phase1_10b (386M, release)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # --- identique au bloc sft_school (cache hit garanti sur le cache local)
   sources:
   - name: codeparrot
@@ -179,7 +179,7 @@ training:
   # repart avec le teacher DISCRIMINANT. Banque fraîche (pas de bank_init) :
   # elle se re-remplit par FIFO, évite de mélanger les slots écrits sous
   # l'ancien teacher chunk-gist.
-  init_from: /mnt/tb/checkpoints/v350_sft_persona/run7_resume_step_400.pt
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_persona/run7_resume_step_400.pt
   lr: 4.0e-05
   muon_lr: 1.0e-04
   muon_ref_mem_dim: 64
@@ -214,8 +214,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 50                           # 400->50 (décision user 2026-07-20 : coupure de courant, sauvegardes rapprochées)
-  save_dir: /mnt/tb/checkpoints/v350_sft_persona_disc
-  metrics_file: /mnt/tb/runs/v350_sft_persona_disc/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_persona_disc
+  metrics_file: ${TB_ROOT}/runs/v350_sft_persona_disc/metrics.jsonl
 
 chat:
   stream: persona
@@ -228,7 +228,7 @@ chat:
   # naturel supervisé ; faits/requêtes restent synthétiques et notables.
   gen:
     real_filler: HuggingFaceTB/smol-smoltalk
-    real_cache_dir: /mnt/tb/data_cache
+    real_cache_dir: ${TB_ROOT}/data_cache
     # RUN 7 : pondération du span VALEUR dans la réponse de rappel (×4). La
     # valeur ne peut venir que de la banque (fait hors contexte) ⇒ surpondérer
     # sa CE concentre le gradient sur le routage read→réponse et SURVIT au

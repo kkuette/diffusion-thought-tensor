@@ -23,17 +23,17 @@ import statistics
 import sys
 
 import torch
-import yaml
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
 import deepseek_v4_mini.rl_defer_grpo as rl
+from ..paths import load_yaml
 
 
 def main(cfg_path: str, ckpt_path: str, n_pairs: int = 96) -> None:
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     device = torch.device("cuda")
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     tok.add_special_tokens({"additional_special_tokens": ["<think>", "<blank>"]})

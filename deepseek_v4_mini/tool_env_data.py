@@ -38,6 +38,7 @@ import sys
 
 from .persona_chat_data import PersonaChatStream
 from .rl_rewards import _balanced_spans, extract_calls, grade_calls
+from .paths import load_yaml
 
 
 # ── glaive chat mining ───────────────────────────────────────────────────────
@@ -294,9 +295,8 @@ class ToolSessionStream(PersonaChatStream):
 # ── smoke ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) > 1:                      # real tokenizer + real datasets
-        import yaml
         from transformers import AutoTokenizer
-        raw = yaml.safe_load(open(sys.argv[1]))
+        raw = load_yaml(sys.argv[1])
         tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
         gen = ((raw.get("tools", {}) or {}).get("gen", {}) or {})
         st = ToolSessionStream(tok, **gen)

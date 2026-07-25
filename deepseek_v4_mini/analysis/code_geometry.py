@@ -31,7 +31,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule/final.pt"
-CFG  = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_mini/configs/multiturn_rule_k2_heldout.yaml"
+CFG  = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_heldout.yaml"
 S, m, SYM_OFF = 32, 6, 3
 KEY_OFF = SYM_OFF + S
 S_MAX = 24                      # trained pool = 1..24, held = 25..31

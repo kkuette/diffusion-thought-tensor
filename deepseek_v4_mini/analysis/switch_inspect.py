@@ -26,7 +26,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_switch/step_1100.pt"
-CFG  = "deepseek_v4_mini/configs/multiturn_rule_switch.yaml"
+CFG  = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_switch.yaml"
 S, m, SYM_OFF, SW, TURNS = 32, 6, 3, 12, 24
 N = 96                                   # conversations (batched lanes)
 

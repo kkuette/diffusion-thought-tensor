@@ -62,6 +62,7 @@ from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_rewards import make_exec_reward, make_tool_reward
+from .paths import load_yaml
 
 
 # ── shared-FS primitives ─────────────────────────────────────────────────────
@@ -237,28 +238,22 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                         seed=seed + 31 * i)
             stream = CodeChunkStream(tok, split="train", **sd_e)
             envs.append(EnvSpec(e["name"], stream, weight=w))
-        elif kind == "tool":
-            from .tool_env_data import ToolSessionStream
-            stream = ToolSessionStream(tok, seed=seed + 31 * i,
-                                       **(e.get("gen") or {}))
-            fn = make_tool_reward(int(r.get("think_nmax", 8)),
-                                  float(r.get("think_floor", 0.4)))
-            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
-        elif kind == "exec":
-            from .code_exec_data import CodeExecStream
-            stream = CodeExecStream(tok, seed=seed + 31 * i,
-                                    **(e.get("gen") or {}))
-            fn = make_exec_reward(int(r.get("think_nmax", 8)),
-                                  float(r.get("think_floor", 0.4)),
-                                  float(e.get("exec_timeout", 6.0)))
-            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
-        elif kind == "sota":
-            from .sota_session_data import SotaSessionStream
-            stream = SotaSessionStream(tok, seed=seed + 31 * i,
-                                       **(e.get("gen") or {}))
-            envs.append(EnvSpec(e["name"], stream, weight=w))
         else:
-            raise ValueError(f"unknown env kind {kind!r}")
+            # tool / exec / sota : même contrat de construction (registre
+            # streams.py), seul le reward diffère.
+            from .streams import rl_stream_class
+            stream = rl_stream_class(kind)(tok, seed=seed + 31 * i,
+                                           **(e.get("gen") or {}))
+            if kind == "tool":
+                fn = make_tool_reward(int(r.get("think_nmax", 8)),
+                                      float(r.get("think_floor", 0.4)))
+            elif kind == "exec":
+                fn = make_exec_reward(int(r.get("think_nmax", 8)),
+                                      float(r.get("think_floor", 0.4)),
+                                      float(e.get("exec_timeout", 6.0)))
+            else:
+                fn = None                      # sota : reward par défaut
+            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
     return envs
 
 
@@ -686,9 +681,8 @@ class Learner:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv):
-    import yaml
     role, cfg_path = argv[0], argv[1]
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     if role == "learner":
         Learner(raw).run()
     elif role == "worker":

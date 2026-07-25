@@ -12,18 +12,18 @@ import os, sys, random
 from collections import Counter
 
 import torch
-import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from deepseek_v4_mini.code_data import CodeChunkStream
+from ..paths import load_yaml
 
 CFG = sys.argv[1] if len(sys.argv) > 1 else "deepseek_v4_mini/configs/sft_persona_350m.yaml"
 N_PER_SRC = int(sys.argv[2]) if len(sys.argv) > 2 else 24
 T_MAX = 256          # tokens par chunk pour la passe ref (vitesse)
 REF = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
-raw = yaml.safe_load(open(CFG))
+raw = load_yaml(CFG)
 d = raw["data"]
 tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
 add = [x for x in ("<think>", "<blank>") if x not in tok.get_vocab()]

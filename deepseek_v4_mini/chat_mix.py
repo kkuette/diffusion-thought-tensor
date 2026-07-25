@@ -10,8 +10,8 @@ trainer only learns one new name ("chat_mix").
 
   gen:
     streams:
-    - stream: sota_session        # sota_session | tool_session | code_exec |
-      weight: 0.8                 #   persona | math_school
+    - stream: sota_session        # tout nom de streams.CHAT_STREAMS
+      weight: 0.8
       gen: {...}                  # kwargs of that stream
     - stream: tool_session
       weight: 0.2
@@ -61,22 +61,6 @@ class _MixRng:
         return self._pick.random()
 
 
-def _build(name: str, tok, seed: int, gen: dict):
-    if name == "sota_session":
-        from .sota_session_data import SotaSessionStream as C
-    elif name == "tool_session":
-        from .tool_env_data import ToolSessionStream as C
-    elif name == "code_exec":
-        from .code_exec_data import CodeExecStream as C
-    elif name == "persona":
-        from .persona_chat_data import PersonaChatStream as C
-    elif name == "math_school":
-        from .math_school_data import MathSchoolStream as C
-    else:
-        raise ValueError(f"chat_mix: unknown sub-stream {name!r}")
-    return C(tok, seed=seed, **(gen or {}))
-
-
 class ChatMixStream:
     def __init__(self, tok, *, seed: int = 0, streams: list = None, _subs=None):
         assert streams or _subs, "chat_mix needs a streams: list"
@@ -84,8 +68,10 @@ class ChatMixStream:
             self.subs = [s for s, _ in _subs]
             self._weights = [w for _, w in _subs]
         else:
-            self.subs = [_build(e["stream"], tok, seed + 101 * (i + 1),
-                                e.get("gen") or {})
+            from .streams import build_chat_stream
+            self.subs = [build_chat_stream(e["stream"], tok,
+                                           seed=seed + 101 * (i + 1),
+                                           gen=e.get("gen") or {})
                          for i, e in enumerate(streams)]
             self._weights = [float(e.get("weight", 1.0)) for e in streams]
         self.rng = _MixRng(random.Random(seed), self.subs)

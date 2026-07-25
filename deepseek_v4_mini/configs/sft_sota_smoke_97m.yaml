@@ -1,0 +1,99 @@
+# sft_sota_smoke_97m — smoke trainer bout-en-bout du stream sota_session
+# (twin 97M from scratch, 6 steps, eval @2 pour exercer evaluate_math avec
+# requote : truths longues, grade token-F1, Δnll par âge, decode 64).
+# Coexiste avec un run 386M sur la 3090 (~2-3 Go). Jetable.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v2b/v2c 97M, verbatim
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 1.0
+    stream_cap: 90000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 6
+  grad_accum: 2
+  amp: true
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  no_reset_files: 0
+  cascade_depth: 4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  grad_checkpoint: false
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 2
+  eval_convs: 1
+  eval_sources:
+  - codeparrot
+  eval_depths: [2]
+  eval_depth_convs: 1
+  eval_depth_sources:
+  - codeparrot
+  save_every: 1000
+  save_dir: ${TB_ROOT}/checkpoints/sft_sota_smoke_97m
+  metrics_file: ${TB_ROOT}/runs/sft_sota_smoke_97m/metrics.jsonl
+
+chat:
+  stream: sota_session
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 3
+  max_new: 64
+  gen:
+    real_cache_dir: ${TB_ROOT}/data_cache
+    conv_cap: 8000
+    max_turn_tok: 192
+    max_conv_msgs: 10
+    convs_per_session: [2, 6]
+    p_requote: 0.5
+    n_requote: [1, 2]
+    surprisal_mode: sif
+    sif_a: 1.0e-04
+
+teacher:
+  enabled: false

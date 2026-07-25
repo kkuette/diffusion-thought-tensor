@@ -64,15 +64,38 @@ The driving questions, in the order they were answered:
 > (hence the repo's former name). That line was abandoned for the autoregressive
 > fast-weight bank; the old code was removed and remains available in git history.
 
-## 🔬 After the paper: the bank on real data
+## 🔬 After the paper: the bank on real data, then at scale
 
-`main` has moved past the synthetic-rule benchmark: the current line trains
-from-scratch models (47M-97M) where the bank is the **only** channel carrying a
-real document (Python code / web text) across 512-token chunks, measured by a
-deferred-continuation loss. Latest results — +0.85 nats of bank advantage, flat
-to 10 chunks deep, shown by inference probes to be **file-specific content in a
-recency-weighted superposition** — are documented with exact reproduction
-commands in **[FINDINGS.md](FINDINGS.md)**.
+The work moved past the synthetic-rule benchmark in three steps, all
+documented with exact reproduction commands in **[FINDINGS.md](FINDINGS.md)**
+(newest-first journal) and mapped experiment-by-experiment in
+**[EXPERIMENTS.md](EXPERIMENTS.md)**:
+
+1. **Real data, from scratch (47M–97M).** The bank as the *only* channel
+   carrying a real document (Python code / web text) across 512-token chunks,
+   measured by a deferred-continuation loss: a positive bank advantage, flat
+   with depth, shown by inference probes to be file-specific content in a
+   recency-weighted superposition.
+2. **The mechanism arc closes (2026-07-16).** Addressing, eviction,
+   cross-modal transfer and warm-restart curriculum all validated at 97M on
+   real text — the stack composes, no staged curriculum needed. The `page`
+   (reach-back past eviction) stayed dead across four strikes and left the
+   critical path; the cascade remains a free deployment flag.
+3. **Scale point: a 350M phase-1 run on 10B tokens**, released as
+   **[Fractale-350M-base](https://huggingface.co/fractale-lm/Fractale-350M-base)**
+   (usage repo: [fractale-lm/fractale](https://github.com/fractale-lm/fractale),
+   card: [MODEL_CARD.md](MODEL_CARD.md)).
+
+The current phase is **phase 2**: instruction-following through a ChatML chat
+template (no address tokens), SFT on reassembled state-of-the-art instruction
+data stretched into long sessions, then a GRPO ratchet on verifiable
+environments. Active configs are the un-archived ones under
+[`deepseek_v4_mini/configs/`](deepseek_v4_mini/configs/); the closed arcs live
+in [`configs/archive/`](deepseek_v4_mini/configs/archive/README.md).
+
+> **Branches:** day-to-day work happens on the phase-2 branch
+> (`sft-persona-350m` at the time of writing); `main` is the last merged
+> checkpoint and lags behind it.
 
 ---
 
@@ -106,21 +129,60 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 Target hardware: a single 24 GB GPU (RTX 3090).
 
-### Train
+### Train — current program
+
+The live entry point is `code_defer_native` (native from-scratch, deferred
+continuation, cascade memory). Phase 1 pretraining and phase 2 chat SFT are
+both configs of that same trainer; the `chat:` block is what switches a run
+from pretraining to SFT.
+
+```bash
+# phase 1 — pretraining (the 350M lineage; see vast/ for the pod scripts)
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_phase1_10b.yaml
+
+# phase 2 — chat SFT on reassembled SOTA instruction data
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/sft_sota_350m.yaml
+
+# GRPO, disaggregated workers/learner
+python -m deepseek_v4_mini.rl_disagg deepseek_v4_mini/configs/rl_disagg_350m.yaml
+
+# before any pod bring-up: the hermetic CPU self-tests
+scripts/selftest.sh
+```
+
+Configs write relative to `${TB_ROOT}`, which defaults to `.` — out of the
+box a run puts its dataset cache, checkpoints and metrics inside the repo
+(`./data_cache`, `./checkpoints/<run>`, `./runs/<run>`). Point it elsewhere
+with one variable, no config edit:
+
+```bash
+TB_ROOT=/mnt/big_volume python -m deepseek_v4_mini.code_defer_native <config>
+```
+
+The `chat.stream` key of an SFT config picks the conversation stream from the
+registry in [`deepseek_v4_mini/streams.py`](deepseek_v4_mini/streams.py)
+(`sota_session`, `tool_session`, `code_exec`, `persona`, `math_school`, or
+`chat_mix` to weight several of them).
+
+### Train — reproducing the paper (closed arc)
+
+`train.py` is the trainer of the dsv4mini toy arc. It is kept working for
+repro; it is not where the current program runs.
+
 ```bash
 # language modelling
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml      # ~19M, TinyStories
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml      # code, per-sequence reset
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, PERSISTENT bank
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml      # ~19M, TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/code.yaml      # code, per-sequence reset
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/code_persist.yaml  # code, PERSISTENT bank
 
 # memory diagnostics (synthetic, no tokenizer)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable recall
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context gist
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/synth_recall.yaml  # addressable recall
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/gist.yaml          # latent-context gist
 
 # the paper's cells (keyed fresh-rule benchmark, S=128)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml        # fixed structure (zero-shot arm)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml  # policy cell, seed 42
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml  # replication, seed 43
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml        # fixed structure (zero-shot arm)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml  # policy cell, seed 42
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml  # replication, seed 43
 
 # or everything at once (training + probes + figures):
 bash repro/run_all.sh
@@ -142,11 +204,15 @@ out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank to the next segmen
 
 To probe a paper checkpoint instead:
 ```python
-cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml")
+cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml")
 model = ThoughtBankLM(cfg)
-model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt",
+model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt",
                                  map_location="cpu")["model"])
 ```
+> Most toy-arc checkpoints were purged across campaigns: the repro path is to
+> re-run the archived config, not to reload a checkpoint. See
+> [`deepseek_v4_mini/analysis/README.md`](deepseek_v4_mini/analysis/README.md)
+> for which ones still exist and what to re-run for the rest.
 
 ---
 
@@ -266,17 +332,32 @@ slot count identical:
 
 ## ⚙️ Configs
 
+**Active program** (un-archived, at the root of `deepseek_v4_mini/configs/`):
+
+| File | Purpose |
+|---|---|
+| `configs/v350_*.yaml` | 350M phase 1: bring-up, compile/fastpath smokes, the 10B run (`v350_phase1_10b.yaml`), the SIF teacher repass |
+| `configs/sft_sota_*.yaml` | phase 2 SFT on reassembled state-of-the-art instruction data (long sessions, tools, code-exec) |
+| `configs/sft_persona_*.yaml` | the persona prototype that opened the read channel (arc closed 2026-07-24; kept as the immediate lineage) |
+| `configs/rl_*.yaml` | GRPO: lives, deferred rollouts, disaggregated worker/learner |
+| `configs/code_defer_native_350m*.yaml` | 350M native deferred-continuation lineage |
+| `configs/farm/` | 350M ablations run on the 3070Ti rig |
+
+**Archive** — the two closed arcs, kept because FINDINGS/README and the
+`analysis/` probes cite them by name
+([details](deepseek_v4_mini/configs/archive/README.md)):
+
 | File | Dataset / task | Purpose |
 |---|---|---|
-| `configs/tiny.yaml` | TinyStories (~19M) | fast LM iteration |
-| `configs/small.yaml` | TinyStories (~32M) | single RTX 3090 |
-| `configs/code.yaml` | codeparrot (Python) | baseline, bank reset per sequence |
-| `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
-| `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
-| `configs/gist.yaml` | synthetic | latent-context (gist) test |
-| `configs/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 2, zero-shot arm of Table 4 / Fig 5) |
-| `configs/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 1/3, Figs 3–5) |
-| `configs/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
+| `configs/archive/dsv4mini/tiny.yaml` | TinyStories (~19M) | fast LM iteration |
+| `configs/archive/dsv4mini/small.yaml` | TinyStories (~32M) | single RTX 3090 |
+| `configs/archive/dsv4mini/code.yaml` | codeparrot (Python) | baseline, bank reset per sequence |
+| `configs/archive/dsv4mini/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
+| `configs/archive/dsv4mini/synth_recall.yaml` | synthetic | addressable key→value recall test |
+| `configs/archive/dsv4mini/gist.yaml` | synthetic | latent-context (gist) test |
+| `configs/archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 2, zero-shot arm of Table 4 / Fig 5) |
+| `configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 1/3, Figs 3–5) |
+| `configs/archive/dsv4mini/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
 
 Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
 
@@ -297,12 +378,26 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 paper/                   ← the paper (paper.pdf, draft.md, figures/)
 repro/                   ← end-to-end reproduction of the paper (run_all.sh)
 deepseek_v4_mini/        ← active project (fast-weight thought bank)
-  model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
+  model.py  memory.py  attention.py  moe.py  mhc.py  cascade.py  config.py
+  muon.py                ← Muon + the param split (shared by every trainer)
+  code_defer_native.py   ← THE trainer of the current program (phase 1 + SFT)
+  streams.py             ← name→class registry for conversation streams
+  *_data.py              ← the streams: sota_session, tool_env, code_exec,
+                           persona, math_school, chat_mix
+  rl_disagg.py  rl_lives.py  rl_rewards.py  exec_sandbox.py   ← GRPO + envs
+  train.py               ← trainer of the closed dsv4mini arc (repro only)
   eval_memory.py         ← offline PPL with/without the bank
   analysis/              ← mechanistic diagnostics + campaign results
-  configs/               ← tiny, small, code, code_persist, synth_recall, gist,
-                           multiturn_rule family (k2, heldout, horizon, switch, joint)
-thought_lm_minimal/      ← minimal thought-LM baseline
+                           (see its README for repro status per probe)
+  legacy/                ← closed arc: the SmolLM2 graft
+  configs/               ← active program: phase-1 SIF (v350_*), SFT (sft_*),
+                           RL (rl_*), 350M ablations (farm/)
+    archive/dsv4mini/    ← closed toy arc: tiny, small, code, code_persist,
+                           synth_recall, gist, multiturn_rule family
+    archive/mechanism/   ← closed native v2/v3 arc (+ farm/ sweeps)
+scripts/                 ← selftest.sh (hermetic CPU tests), farm/ (rig queue)
+vast/                    ← pod bring-up + HF checkpoint sync
+legacy/thought_lm_minimal/  ← the 2025 ancestor, kept for the record
 checkpoints/, runs/      ← training outputs
 ```
 
@@ -311,7 +406,7 @@ checkpoints/, runs/      ← training outputs
 ## 📚 References
 - DeepSeek-V4 (architecture base), DeepSeekMoE (Dai et al., 2024)
 - Hyper-Connections (Zhu et al., 2024), Muon optimizer (Jordan et al., 2024)
-- Thought-memory baseline: [`thought_lm_minimal/`](thought_lm_minimal/)
+- Thought-memory ancestor: [`legacy/thought_lm_minimal/`](legacy/thought_lm_minimal/)
 
 ## License
 

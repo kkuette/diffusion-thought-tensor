@@ -15,7 +15,7 @@ fp32 OR bf16 fits well under 8 GB with margin for fragmentation.
   python -m deepseek_v4_mini.vram_smoke_350m \
       deepseek_v4_mini/configs/rl_disagg_350m.yaml
 
-Farm job: scripts/farm/vram_smoke_350m.job (copy into /mnt/tb/queue/).
+Farm job: scripts/farm/vram_smoke_350m.job (copy into the rig queue).
 """
 from __future__ import annotations
 
@@ -24,14 +24,13 @@ import sys
 import time
 
 import torch
-import yaml
-
 from .cascade import CascadeMemory
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .rl_defer_grpo_lives import _lb, rollout
 from .rl_disagg import decode_lb
 from .rl_lives import mem_fork
+from .paths import load_yaml
 
 
 def measure(raw: dict, autocast: bool, device) -> dict:
@@ -98,7 +97,7 @@ def main(cfg_path: str) -> None:
     assert torch.cuda.is_available(), "VRAM smoke needs a GPU"
     device = torch.device("cuda")
     total = torch.cuda.get_device_properties(device).total_memory / 2**30
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     print(f"device {torch.cuda.get_device_name(device)} ({total:.1f} GB) | "
           f"config {cfg_path}", flush=True)
     for tag, autocast in (("fp32", False), ("autocast_bf16", True)):

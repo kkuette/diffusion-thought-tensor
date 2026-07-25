@@ -55,7 +55,7 @@ model:                                     # = code_defer_native_350m_mix (386M)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /workspace/data_cache         # pod-local (smoke 3090 : sed vers /mnt/tb/data_cache)
+  cache_dir: ${TB_ROOT}/data_cache         # pod-local (smoke 3090 : sed vers ${TB_ROOT}/data_cache)
   sources:
   - name: codeparrot
     dataset: codeparrot/codeparrot-clean
@@ -95,8 +95,8 @@ training:
   eval_depths: [2, 4, 6, 8]
   eval_depth_convs: 8
   save_every: 1000                         # pas de checkpoint voulu
-  save_dir: /workspace/checkpoints/v350_bringup
-  metrics_file: /workspace/runs/v350_bringup/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_bringup
+  metrics_file: ${TB_ROOT}/runs/v350_bringup/metrics.jsonl
   interleave_files: [2, 4]
   addr_prob: 0.5
   addr_label: true

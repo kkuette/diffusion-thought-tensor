@@ -5,7 +5,7 @@ bank and (b) with no bank (reset ablation), against the ground-truth continuatio
 and the turn-0 full-context ceiling.
 
     python -m deepseek_v4_mini.code_defer_sample \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml \
         checkpoints/code_defer_native_v1/final.pt  [n_examples]
 """
 import sys, yaml, torch
@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .code_data import CodeChunkStream
+from .paths import load_yaml
 
 
 def _fill(x, tok, w):
@@ -43,7 +44,7 @@ def _greedy_from_bank(model, x_ref, blank_id, bank, defer_len, ban=()):
 @torch.no_grad()
 def main(cfg_path, ckpt_path, n_ex=6, split="held"):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw = yaml.safe_load(open(cfg_path)); d = raw["data"]
+    raw = load_yaml(cfg_path); d = raw["data"]
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     for t in ("<think>", "<blank>"):
         if t not in tok.get_vocab():

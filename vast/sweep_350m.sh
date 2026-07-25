@@ -9,12 +9,13 @@ set -uo pipefail
 
 WORK=/workspace
 REPO_URL=${REPO_URL:-https://github.com/kkuette/thought-bank.git}
-BRANCH=${BRANCH:-claude/status-check-2fa903}
+BRANCH=${BRANCH:-sft-persona-350m}
 BASECFG=${BASECFG:-deepseek_v4_mini/configs/v350_bringup.yaml}
 SUMMARY=$WORK/sweep_summary.txt
 
 mkdir -p $WORK && cd $WORK
 export HF_HOME=$WORK/hf
+export TB_ROOT=${TB_ROOT:-$WORK}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 if [ ! -d thought-bank ]; then

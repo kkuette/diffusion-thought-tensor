@@ -51,7 +51,7 @@ model:
   use_dual_stream: true
   balance_loss_weight: 0.0001
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:
   # --- identique à v2e_divmix (cache hit garanti avec le job 107)
   - name: codeparrot
@@ -157,7 +157,7 @@ training:
   steps: 800
   grad_accum: 8
   amp: true
-  init_from: /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt
+  init_from: ${TB_ROOT}/checkpoints/farm/v350_rehearsal/final.pt
   lr: 0.0001
   muon_lr: 0.00024
   muon_ref_mem_dim: 64
@@ -181,8 +181,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 400
-  save_dir: /mnt/tb/checkpoints/farm/sft_school
-  metrics_file: /mnt/tb/runs/farm_sft_school/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/sft_school
+  metrics_file: ${TB_ROOT}/runs/farm_sft_school/metrics.jsonl
   interleave_files:
   - 2
   - 4

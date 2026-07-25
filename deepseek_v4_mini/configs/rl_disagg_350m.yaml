@@ -48,7 +48,7 @@ data:
   chunks_per_conv: 8
   defer_len: 16
   var_chunk: [128, 512]
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   envs:
   - name: code
     kind: code
@@ -62,7 +62,7 @@ data:
     weight: 0.25                           # d'exister dans le mix RL
     lambda_write: 0.03
     gen:
-      real_cache_dir: /mnt/tb/data_cache
+      real_cache_dir: ${TB_ROOT}/data_cache
       conv_cap: 8000
       max_turn_tok: 192
       max_conv_msgs: 10
@@ -85,7 +85,7 @@ data:
       max_turn_tok: 192
       max_schema_tok: 256
       eps_per_session: [2, 5]
-      real_cache_dir: /mnt/tb/data_cache
+      real_cache_dir: ${TB_ROOT}/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04
   - name: exec                             # cible cliquet 2 : exécution de
@@ -103,7 +103,7 @@ data:
       max_code_tok: 224                    # licence déclarée => exclus, même
       max_tests: 8                         # règle qu'APIGen-MT)
       probs_per_session: [2, 4]
-      real_cache_dir: /mnt/tb/data_cache
+      real_cache_dir: ${TB_ROOT}/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04
 
@@ -112,7 +112,7 @@ rl:
   train_scope: think_row                   # ancre du cliquet ; élargir SEULEMENT
                                            # sur verdict (post-mortem v1 : le
                                            # full-model RL érode le backbone)
-  init_from: /mnt/tb/checkpoints/v350_sft_sota_rw4_tools_exec/step_800.pt   # AJUSTER au ckpt final SFT
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_sota_rw4_tools_exec/step_800.pt   # AJUSTER au ckpt final SFT
   n_lives_per_worker: 2
   max_episodes_per_life: 0
   cascade_depth: 4                         # banque complète V3 (comme le SFT)
@@ -135,7 +135,7 @@ rl:
   max_new: 64
   amp: true
   disagg:
-    root: /mnt/tb/rl/disagg_350m
+    root: ${TB_ROOT}/rl/disagg_350m
     publish_every: 1
     max_lag: 2
     keep_weights: 3

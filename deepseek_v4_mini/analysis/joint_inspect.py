@@ -30,7 +30,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_joint/step_1200.pt"
-CFG  = "deepseek_v4_mini/configs/multiturn_rule_joint.yaml"
+CFG  = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_joint.yaml"
 S, m, SYM_OFF = 32, 6, 3
 SW, TURNS = 24, 40          # queries on s1, total query turns
 N = 64
