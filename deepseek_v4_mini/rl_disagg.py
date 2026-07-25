@@ -237,28 +237,22 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                         seed=seed + 31 * i)
             stream = CodeChunkStream(tok, split="train", **sd_e)
             envs.append(EnvSpec(e["name"], stream, weight=w))
-        elif kind == "tool":
-            from .tool_env_data import ToolSessionStream
-            stream = ToolSessionStream(tok, seed=seed + 31 * i,
-                                       **(e.get("gen") or {}))
-            fn = make_tool_reward(int(r.get("think_nmax", 8)),
-                                  float(r.get("think_floor", 0.4)))
-            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
-        elif kind == "exec":
-            from .code_exec_data import CodeExecStream
-            stream = CodeExecStream(tok, seed=seed + 31 * i,
-                                    **(e.get("gen") or {}))
-            fn = make_exec_reward(int(r.get("think_nmax", 8)),
-                                  float(r.get("think_floor", 0.4)),
-                                  float(e.get("exec_timeout", 6.0)))
-            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
-        elif kind == "sota":
-            from .sota_session_data import SotaSessionStream
-            stream = SotaSessionStream(tok, seed=seed + 31 * i,
-                                       **(e.get("gen") or {}))
-            envs.append(EnvSpec(e["name"], stream, weight=w))
         else:
-            raise ValueError(f"unknown env kind {kind!r}")
+            # tool / exec / sota : même contrat de construction (registre
+            # streams.py), seul le reward diffère.
+            from .streams import rl_stream_class
+            stream = rl_stream_class(kind)(tok, seed=seed + 31 * i,
+                                           **(e.get("gen") or {}))
+            if kind == "tool":
+                fn = make_tool_reward(int(r.get("think_nmax", 8)),
+                                      float(r.get("think_floor", 0.4)))
+            elif kind == "exec":
+                fn = make_exec_reward(int(r.get("think_nmax", 8)),
+                                      float(r.get("think_floor", 0.4)),
+                                      float(e.get("exec_timeout", 6.0)))
+            else:
+                fn = None                      # sota : reward par défaut
+            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
     return envs
 
 
