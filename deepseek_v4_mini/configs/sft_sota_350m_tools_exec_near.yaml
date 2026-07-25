@@ -1,6 +1,22 @@
-# sft_sota_350m_TOOLS_EXEC — SFT data SOTA + tool-call + CODE-EXEC (amorçage
-# cliquet RL, décision user 2026-07-24 : « entraîner directement l'exécution
-# de code / terminal »).
+# sft_sota_350m_TOOLS_EXEC_NEAR — v2 du run tools_exec (coupé @~550 sur
+# décision user 2026-07-25 : « le canal ne s'ouvre pas »).
+#
+# Verdict decode @500 du run 1 : registre de sortie OUVERT (JSON de call bien
+# formé, blocs python propres, Δnll banque +0.13 toolcall stable post-anneal)
+# mais le CONTENU ignore la banque — même snippet générique aux 4 tours
+# gradés, mauvais nom d'outil (attracteur argmax, jumeau « decode ≠ apply »).
+# Diagnostic : sessions UNIQUEMENT spec-loin = deux marches d'un coup ; le
+# modèle n'a jamais payé la marche 1 (implémenter la spec/choisir l'outil
+# quand elle vient d'être écrite).
+#
+# v2 = curriculum en place :
+#   - p_near 0.5 dans tools + exec (déclaration → implémentation immédiate,
+#     âges 1-2 : le mapping spec→sortie s'apprend sur le write le plus
+#     frais = défaut récence, puis les sessions far forcent les âges 3-10) ;
+#   - poids rééquilibrés sota .5 / tools .25 / exec .25 (0.15 trop peu
+#     contre l'attracteur chat à 0.7).
+# L'éval hérite du même gen (p_near 0.5) : lire la ventilation par âge —
+# le grade doit s'ouvrir d'abord sur <=4 (near), puis 5-8/9-16 (far).
 #
 # = sft_sota_350m_tools.yaml avec un 3e sub-stream chat : code_exec
 # (code_exec_data.py, nvidia/OpenCodeInstruct CC-BY-4.0) — sessions 2-4
@@ -210,11 +226,11 @@ training:
   - codeparrot
   - fineweb
   save_every: 50
-  save_dir: /mnt/tb/checkpoints/v350_sft_sota_rw4_tools_exec
-  metrics_file: /mnt/tb/runs/v350_sft_sota_rw4_tools_exec/metrics.jsonl
+  save_dir: /mnt/tb/checkpoints/v350_sft_sota_rw4_tools_exec_near
+  metrics_file: /mnt/tb/runs/v350_sft_sota_rw4_tools_exec_near/metrics.jsonl
 
 chat:
-  stream: chat_mix                         # sota 0.7 + tools 0.15 + exec 0.15
+  stream: chat_mix                         # sota 0.5 + tools 0.25 + exec 0.25
   p_chat: 1.0
   weight: 1.0
   eval_convs: 12
@@ -224,7 +240,7 @@ chat:
   gen:
     streams:
     - stream: sota_session
-      weight: 0.7
+      weight: 0.5
       gen:
         real_cache_dir: /mnt/tb/data_cache
         conv_cap: 8000
@@ -239,18 +255,19 @@ chat:
         surprisal_mode: sif
         sif_a: 1.0e-04
     - stream: tool_session                 # grade vérifiable à l'éval
-      weight: 0.15                         # (name gate x args-F1)
+      weight: 0.25                         # (name gate x args-F1)
       gen:
         datasets: ['nvidia/Nemotron-Agentic-v1#tool_calling']
         episode_cap: 6000                  # = cache déjà semé sur le NAS
         max_turn_tok: 192
         max_schema_tok: 256
         eps_per_session: [2, 5]
+        p_near: 0.5                        # marche 1 : schéma → call immédiat
         real_cache_dir: /mnt/tb/data_cache
         surprisal_mode: sif
         sif_a: 1.0e-04
     - stream: code_exec                    # grade vérifiable à l'éval
-      weight: 0.15                         # (exec_sandbox : tests passés)
+      weight: 0.25                         # (exec_sandbox : tests passés)
       gen:
         dataset: nvidia/OpenCodeInstruct   # CC-BY-4.0 ; golds vérifiés en
         problem_cap: 6000                  # sandbox au seed du cache
@@ -258,6 +275,7 @@ chat:
         max_code_tok: 224
         max_tests: 8
         probs_per_session: [2, 4]
+        p_near: 0.5                        # marche 1 : spec → code immédiat
         real_cache_dir: /mnt/tb/data_cache
         surprisal_mode: sif
         sif_a: 1.0e-04

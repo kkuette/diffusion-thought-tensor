@@ -74,6 +74,7 @@ class CodeExecStream(PersonaChatStream):
                  max_code_tok: int = 224,
                  max_tests: int = 8,
                  probs_per_session: tuple = (2, 4),
+                 p_near: float = 0.0,           # part de sessions spec-PROCHE
                  verify_gold: bool = True,      # sandbox-check at pool build
                  real_cache_dir: str = None,
                  surprisal_ref: str = None, surprisal_device: str = "cpu",
@@ -86,6 +87,7 @@ class CodeExecStream(PersonaChatStream):
                          surprisal_mode=surprisal_mode,
                          sif_a=sif_a, seed=seed)
         self.probs_per_session = tuple(int(v) for v in probs_per_session)
+        self.p_near = float(p_near)
         if _pool is not None:
             self.pool = _pool
         else:
@@ -153,6 +155,22 @@ class CodeExecStream(PersonaChatStream):
         n = self.rng.randint(*self.probs_per_session)
         probs = [self.pool[i]
                  for i in self.rng.sample(range(len(self.pool)), n)]
+        # sessions spec-PROCHE (p_near) : déclaration puis implémentation
+        # IMMÉDIATE (âge 1) — la marche 1 du curriculum, payer le mapping
+        # spec→code avant de le composer avec la lecture banque (verdict
+        # decode @500 run tools_exec : attracteur générique, spec ignorée)
+        if self.rng.random() < self.p_near:
+            segs, truths, tests, ages = [], [], [], []
+            for i, p in enumerate(probs):
+                segs.append(self._user(f"P{i + 1}. {p['problem']}"))
+                segs.append(self._user(_ASK.format(label=f"P{i + 1}")))
+                ages.append(1)                 # la spec = le write précédent
+                segs.append(self._assistant(p["gold"]))
+                truths.append(p["gold"])
+                tests.append(p["tests"])
+            return {"kind": "codeexec", "segs": segs,
+                    "info": {"truths": truths, "tests": tests,
+                             "ages": ages, "n_probs": n}}
         # declarations first, one turn each (chunk-friendly; each is a write
         # opportunity), labels in declaration order
         segs = [self._user(f"P{i + 1}. {p['problem']}")

@@ -143,6 +143,7 @@ class ToolSessionStream(PersonaChatStream):
                  max_turn_tok: int = 192,       # query/call token budget
                  max_schema_tok: int = 256,     # per-episode schema budget
                  eps_per_session: tuple = (2, 5),
+                 p_near: float = 0.0,           # part de sessions schéma-PROCHE
                  real_cache_dir: str = None,
                  surprisal_ref: str = None, surprisal_device: str = "cpu",
                  surprisal_alpha: float = 2.0, surprisal_mode: str = "nll",
@@ -154,6 +155,7 @@ class ToolSessionStream(PersonaChatStream):
                          surprisal_mode=surprisal_mode,
                          sif_a=sif_a, seed=seed)
         self.eps_per_session = tuple(int(v) for v in eps_per_session)
+        self.p_near = float(p_near)
         if _pool is not None:
             self.pool = _pool
         else:
@@ -243,6 +245,24 @@ class ToolSessionStream(PersonaChatStream):
         n_eps = self.rng.randint(*self.eps_per_session)
         eps = [self.pool[i]
                for i in self.rng.sample(range(len(self.pool)), n_eps)]
+        # sessions schéma-PROCHE (p_near) : schémas de l'épisode déclarés
+        # juste avant sa query (âge 2) — marche 1 du curriculum, cf.
+        # code_exec_data.next_conv
+        if self.rng.random() < self.p_near:
+            segs, truths, gold_calls, ages = [], [], [], []
+            for e in eps:
+                schema_idx = len(segs)
+                segs.append(self._user("Tools available this session:\n"
+                                       + "\n".join(e["schemas"])))
+                segs.append(self._user(e["query"]))
+                ages.append(len(segs) - schema_idx)  # = 2, schéma tout frais
+                segs.append(self._assistant(e["gold"]))
+                truths.append(e["gold"])
+                gold_calls.append(e["calls"])
+            return {"kind": "toolcall", "segs": segs,
+                    "info": {"truths": truths, "gold_calls": gold_calls,
+                             "queries": [e["query"] for e in eps],
+                             "ages": ages, "n_eps": n_eps}}
         # opening turn: every schema of the session, shuffled — the model
         # cannot know which episode a schema belongs to until its query lands
         schemas = [s for e in eps for s in e["schemas"]]
