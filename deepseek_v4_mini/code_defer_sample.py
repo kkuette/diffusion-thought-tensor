@@ -5,7 +5,7 @@ bank and (b) with no bank (reset ablation), against the ground-truth continuatio
 and the turn-0 full-context ceiling.
 
     python -m deepseek_v4_mini.code_defer_sample \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml \
         checkpoints/code_defer_native_v1/final.pt  [n_examples]
 """
 import sys, yaml, torch

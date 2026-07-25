@@ -109,18 +109,18 @@ Target hardware: a single 24 GB GPU (RTX 3090).
 ### Train
 ```bash
 # language modelling
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml      # ~19M, TinyStories
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml      # code, per-sequence reset
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, PERSISTENT bank
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml      # ~19M, TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/code.yaml      # code, per-sequence reset
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/code_persist.yaml  # code, PERSISTENT bank
 
 # memory diagnostics (synthetic, no tokenizer)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable recall
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context gist
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/synth_recall.yaml  # addressable recall
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/gist.yaml          # latent-context gist
 
 # the paper's cells (keyed fresh-rule benchmark, S=128)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml        # fixed structure (zero-shot arm)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml  # policy cell, seed 42
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml  # replication, seed 43
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml        # fixed structure (zero-shot arm)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml  # policy cell, seed 42
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml  # replication, seed 43
 
 # or everything at once (training + probes + figures):
 bash repro/run_all.sh
@@ -142,7 +142,7 @@ out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank to the next segmen
 
 To probe a paper checkpoint instead:
 ```python
-cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml")
+cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml")
 model = ThoughtBankLM(cfg)
 model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt",
                                  map_location="cpu")["model"])
@@ -268,15 +268,15 @@ slot count identical:
 
 | File | Dataset / task | Purpose |
 |---|---|---|
-| `configs/tiny.yaml` | TinyStories (~19M) | fast LM iteration |
-| `configs/small.yaml` | TinyStories (~32M) | single RTX 3090 |
-| `configs/code.yaml` | codeparrot (Python) | baseline, bank reset per sequence |
-| `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
-| `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
-| `configs/gist.yaml` | synthetic | latent-context (gist) test |
-| `configs/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 2, zero-shot arm of Table 4 / Fig 5) |
-| `configs/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 1/3, Figs 3–5) |
-| `configs/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
+| `configs/archive/dsv4mini/tiny.yaml` | TinyStories (~19M) | fast LM iteration |
+| `configs/archive/dsv4mini/small.yaml` | TinyStories (~32M) | single RTX 3090 |
+| `configs/archive/dsv4mini/code.yaml` | codeparrot (Python) | baseline, bank reset per sequence |
+| `configs/archive/dsv4mini/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
+| `configs/archive/dsv4mini/synth_recall.yaml` | synthetic | addressable key→value recall test |
+| `configs/archive/dsv4mini/gist.yaml` | synthetic | latent-context (gist) test |
+| `configs/archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 2, zero-shot arm of Table 4 / Fig 5) |
+| `configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 1/3, Figs 3–5) |
+| `configs/archive/dsv4mini/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
 
 Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
 
@@ -300,8 +300,11 @@ deepseek_v4_mini/        ← active project (fast-weight thought bank)
   model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
   eval_memory.py         ← offline PPL with/without the bank
   analysis/              ← mechanistic diagnostics + campaign results
-  configs/               ← tiny, small, code, code_persist, synth_recall, gist,
-                           multiturn_rule family (k2, heldout, horizon, switch, joint)
+  configs/               ← active program: phase-1 SIF (v350_*), SFT (sft_*),
+                           RL (rl_*), 350M ablations (farm/)
+    archive/dsv4mini/    ← closed toy arc: tiny, small, code, code_persist,
+                           synth_recall, gist, multiturn_rule family
+    archive/mechanism/   ← closed native v2/v3 arc (+ farm/ sweeps)
 thought_lm_minimal/      ← minimal thought-LM baseline
 checkpoints/, runs/      ← training outputs
 ```

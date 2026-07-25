@@ -51,7 +51,7 @@ window" claims — store-both-and-select, bank-as-workspace, gist-as-abstraction
 
 Usage (repo root):
     PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-        deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2b_mix.yaml \
         checkpoints/code_defer_native_v2b_mix/final.pt [--probes swap,dup,...]
 
 Stream seeds are fixed per probe (same file sampling as the published numbers).

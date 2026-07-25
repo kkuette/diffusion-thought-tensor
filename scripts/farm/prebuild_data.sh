@@ -2,7 +2,7 @@
 # Data server (server0/Unraid) : pré-tokenise des configs dans le cache partagé,
 # via Docker (CPU only, aucun GPU requis). À lancer depuis le terminal Unraid.
 #
-# Usage : ./prebuild_data.sh deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml [...]
+# Usage : ./prebuild_data.sh deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml [...]
 #   (chemins de configs relatifs à la racine du repo)
 #
 # Le HF cache partagé (data/hf_cache, déjà peuplé) sert aux téléchargements :

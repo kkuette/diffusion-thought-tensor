@@ -14,10 +14,10 @@ Usage:
 
     # With checkpoints (both architectures trained separately):
     python -m deepseek_v4_mini.eval_memory \\
-        --cfg_mem  deepseek_v4_mini/configs/tiny_with_mem.yaml \\
-        --cfg_base deepseek_v4_mini/configs/tiny_no_mem.yaml \\
-        --ckpt_mem checkpoints/tiny_with_mem/final.pt \\
-        --ckpt_base checkpoints/tiny_no_mem/final.pt
+        --cfg_mem  deepseek_v4_mini/configs/archive/dsv4mini/cpu_with_mem.yaml \\
+        --cfg_base deepseek_v4_mini/configs/archive/dsv4mini/cpu_no_mem.yaml \\
+        --ckpt_mem checkpoints/cpu_with_mem/final.pt \\
+        --ckpt_base checkpoints/cpu_no_mem/final.pt
 """
 from __future__ import annotations
 

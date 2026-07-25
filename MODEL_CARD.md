@@ -219,8 +219,9 @@ nats over the final 1,100 steps.
 final step; fp32, self-describing `{"cfg", "model"}`) of a single training
 run of `v350_phase1_10b.yaml`, trained with
 `deepseek_v4_mini.code_defer_native` at thought-bank commit
-[`073bb67`](https://github.com/kkuette/thought-bank/commit/073bb67) (branch
-`claude/status-check-2fa903` — config and stability patches exactly as run).
+[`073bb67`](https://github.com/kkuette/thought-bank/commit/073bb67) (config
+and stability patches exactly as run; that commit is now reachable from
+`sft-persona-350m`).
 The [usage repo](https://github.com/fractale-lm/fractale) vendors its
 inference code from that same commit, and ships a **step-by-step
 reproduction of this run** (environment, data prebuild, launch command,

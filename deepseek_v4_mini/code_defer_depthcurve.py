@@ -5,7 +5,7 @@ large n per depth => the reliable "does the bank hold as the conversation deepen
 curve the 8-conv live eval was too noisy/sparse to give.
 
     python -m deepseek_v4_mini.code_defer_depthcurve \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml \
         checkpoints/code_defer_native_ragged/final.pt
 """
 import sys, yaml, torch

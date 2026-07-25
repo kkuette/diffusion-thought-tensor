@@ -17,7 +17,7 @@ carried-vs-reset gap is the whole claim; held values test decode
 generalization to words never used as labels.
 
 Usage:
-  PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.sft_train deepseek_v4_mini/configs/sft_smollm_v1.yaml
+  PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.sft_train deepseek_v4_mini/configs/archive/mechanism/sft_smollm_v1.yaml
 """
 from __future__ import annotations
 

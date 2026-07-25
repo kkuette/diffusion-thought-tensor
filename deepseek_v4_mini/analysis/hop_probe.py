@@ -31,7 +31,7 @@ torch.manual_seed(23)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
         "checkpoints/multiturn_rule_k2_inter_s128hop_dsv5c/final.pt")
-CFG = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128hop_dsv5c.yaml"
+CFG = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128hop_dsv5c.yaml"
 if "--cfg" in sys.argv:
     CFG = sys.argv[sys.argv.index("--cfg") + 1]
 

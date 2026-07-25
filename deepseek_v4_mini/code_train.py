@@ -14,7 +14,7 @@ anti-forgetting anchor (native objective). Success = deferred gap > 0 (carried
 beats init_mem=None) AND in-context loss stays a competent LM (may rise then
 converge; monotone divergence = damage).
 
-    PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.code_train deepseek_v4_mini/configs/code_defer_v1.yaml
+    PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.code_train deepseek_v4_mini/configs/archive/mechanism/code_defer_v1.yaml
 """
 import os, sys, math, time, yaml, dataclasses
 import torch

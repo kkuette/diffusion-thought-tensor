@@ -2,8 +2,8 @@
 Training script for TrunkLM.
 
 Usage:
-    python -m deepseek_v4_mini.train configs/tiny.yaml
-    python -m deepseek_v4_mini.train configs/small.yaml
+    python -m deepseek_v4_mini.train configs/archive/dsv4mini/tiny.yaml
+    python -m deepseek_v4_mini.train configs/archive/dsv4mini/small.yaml
 
 Trains with:
   - CE loss on next-token prediction
@@ -1887,7 +1887,7 @@ def _save(path: Path, model: nn.Module, opt: "Muon", step: int) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("deepseek_v4_mini/configs/tiny.yaml")
+    cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml")
     import yaml
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)

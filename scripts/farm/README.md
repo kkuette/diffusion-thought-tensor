@@ -38,7 +38,7 @@ Exemple — une seed du 97M v2c :
 cat > /mnt/tb/queue/10_v2c_97m_seed44.job <<'EOF'
 cd deepseek_v4_mini
 python code_defer_native.py \
-  --config configs/v2c_varlen.yaml \
+  --config configs/archive/mechanism/code_defer_native_v2c_varlen.yaml \
   --seed 44 \
   --out $TB_MNT/checkpoints/v2c_97m_s44 \
   --log $TB_MNT/runs/v2c_97m_s44
@@ -79,7 +79,7 @@ Depuis le terminal Unraid :
 
 ```bash
 /mnt/user/llm_research/scripts/prebuild_data.sh \
-  deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml
+  deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v2c_varlen.yaml
 ```
 
 **Convention** : toute config destinée à la ferme déclare

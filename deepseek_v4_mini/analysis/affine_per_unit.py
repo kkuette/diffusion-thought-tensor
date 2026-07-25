@@ -16,7 +16,7 @@ s256L (many rules, no multiplication) is the right next vehicle.
 
 Usage (CPU by default: the GPU belongs to the training run):
   python -m deepseek_v4_mini.analysis.affine_per_unit \
-      deepseek_v4_mini/configs/multiturn_rule_k2_inter_affineL_wr.yaml \
+      deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_affineL_wr.yaml \
       checkpoints/multiturn_rule_k2_inter_affineL_wr/step_XXXX.pt [--gpu] [--n-conv 48]
 """
 from __future__ import annotations

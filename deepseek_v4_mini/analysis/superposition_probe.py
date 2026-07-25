@@ -25,7 +25,7 @@ torch.manual_seed(0)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = sys.argv[1]
 CFG = sys.argv[sys.argv.index("--cfg") + 1] if "--cfg" in sys.argv else \
-    "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml"
+    "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml"
 S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N = 128

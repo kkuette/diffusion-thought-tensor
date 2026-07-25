@@ -34,7 +34,7 @@ assistant answer tokens (+ the closing <|im_end|> so the model learns to stop);
 template/instruction/prefill tokens are masked. Vanilla segs have loss everywhere.
 
 Smoke:
-  python -m deepseek_v4_mini.chat_defer_data deepseek_v4_mini/configs/farm/v3_reach.yaml
+  python -m deepseek_v4_mini.chat_defer_data deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml
 """
 from __future__ import annotations
 

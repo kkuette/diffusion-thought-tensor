@@ -10,7 +10,7 @@ set -uo pipefail
 
 WORK=/workspace
 REPO_URL=${REPO_URL:-https://github.com/kkuette/thought-bank.git}
-BRANCH=${BRANCH:-claude/status-check-2fa903}
+BRANCH=${BRANCH:-sft-persona-350m}
 CFG=deepseek_v4_mini/configs/v350_bringup.yaml
 LOG=$WORK/bringup.log
 VRAMLOG=$WORK/vram_samples.csv

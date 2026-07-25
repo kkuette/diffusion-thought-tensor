@@ -44,7 +44,7 @@ code_defer_native (.next_conv() + .rng + module grade_conv).
 Hermetic self-test (stub tokenizer, no downloads):
   python -m deepseek_v4_mini.persona_chat_data
 Real-tokenizer smoke (decode one conv per kind + stats):
-  python -m deepseek_v4_mini.persona_chat_data deepseek_v4_mini/configs/farm/v3_reach.yaml
+  python -m deepseek_v4_mini.persona_chat_data deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml
 """
 from __future__ import annotations
 

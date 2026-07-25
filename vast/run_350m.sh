@@ -10,14 +10,14 @@
 # Variables (via `vastai create instance ... --env '-e X=...'`) :
 #   HF_TOKEN   (OBLIGATOIRE, write ; jamais en clair dans l'onstart)
 #   HF_REPO    défaut kkuette/dsv6-350m (repo privé, créé si absent)
-#   CFG        défaut deepseek_v4_mini/configs/v350_final.yaml (à committer)
+#   CFG        défaut deepseek_v4_mini/configs/v350_phase1_10b.yaml
 set -uo pipefail
 
 WORK=/workspace
 REPO_URL=${REPO_URL:-https://github.com/kkuette/thought-bank.git}
-BRANCH=${BRANCH:-claude/status-check-2fa903}
+BRANCH=${BRANCH:-sft-persona-350m}
 HF_REPO=${HF_REPO:-kkuette/dsv6-350m}
-CFG=${CFG:-deepseek_v4_mini/configs/v350_final.yaml}
+CFG=${CFG:-deepseek_v4_mini/configs/v350_phase1_10b.yaml}
 SAVE_DIR=$WORK/checkpoints/v350
 
 [ -n "${HF_TOKEN:-}" ] || { echo "HF_TOKEN manquant — abandon avant de brûler du GPU"; exit 1; }

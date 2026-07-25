@@ -19,7 +19,7 @@ identification dies at the write and no read recipe can work.
 
 Usage (CPU, safe to run alongside a GPU training):
   python -m deepseek_v4_mini.analysis.write_code_probe \
-      deepseek_v4_mini/configs/multiturn_rule_k2_inter_s256L.yaml \
+      deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s256L.yaml \
       checkpoints/multiturn_rule_k2_inter_s256L/step_2000.pt
 """
 from __future__ import annotations

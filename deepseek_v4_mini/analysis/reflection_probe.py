@@ -28,7 +28,7 @@ from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(11)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CFG = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml"
+CFG = "deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml"
 S, m, SYM_OFF = 128, 6, 3
 KEY_OFF = SYM_OFF + S
 N_CONV = 64

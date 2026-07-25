@@ -21,7 +21,7 @@ Success = deferred GAP > 0 (carried beats init_mem=None), STABLE across the anne
 and WSD decay (not the graft's spike-then-crash), while in-context ppl stays sane.
 
     PYTHONUNBUFFERED=1 python -m deepseek_v4_mini.code_defer_native \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml
 """
 import os, sys, math, time, yaml, json
 import torch

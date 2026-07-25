@@ -222,9 +222,9 @@ out2 = model(ids, init_mem=out["mem_bank"])
 ### Training
 
 ```bash
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml           # TinyStories
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml   # code, bank persists
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml # continual-rule benchmark (teacher-forced)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml           # TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/code_persist.yaml   # code, bank persists
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule.yaml # continual-rule benchmark (teacher-forced)
 ```
 
 The script streams from HuggingFace datasets or generates synthetic data for the
@@ -348,7 +348,7 @@ cfg = ThoughtBankConfig(
     n_experts=8, top_k_experts=2, d_ff=512,
     mem_dim=64, max_mem=32, mem_seed_slots=4, mem_read_rank=16,
 )
-cfg = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/small.yaml")
+cfg = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/archive/dsv4mini/small.yaml")
 cfg = ThoughtBankConfig.tiny()   # ~6.5M params
 ```
 

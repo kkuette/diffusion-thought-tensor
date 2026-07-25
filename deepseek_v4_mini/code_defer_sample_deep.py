@@ -5,7 +5,7 @@ against the ground truth and the no-bank reset. Shows whether the bank keeps
 producing sensible continuations deep into the conversation.
 
     python -m deepseek_v4_mini.code_defer_sample_deep \
-        deepseek_v4_mini/configs/code_defer_native_v1.yaml \
+        deepseek_v4_mini/configs/archive/mechanism/code_defer_native_v1.yaml \
         checkpoints/code_defer_native_ragged/final.pt
 """
 import sys, yaml, torch
