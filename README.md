@@ -64,15 +64,38 @@ The driving questions, in the order they were answered:
 > (hence the repo's former name). That line was abandoned for the autoregressive
 > fast-weight bank; the old code was removed and remains available in git history.
 
-## 🔬 After the paper: the bank on real data
+## 🔬 After the paper: the bank on real data, then at scale
 
-`main` has moved past the synthetic-rule benchmark: the current line trains
-from-scratch models (47M-97M) where the bank is the **only** channel carrying a
-real document (Python code / web text) across 512-token chunks, measured by a
-deferred-continuation loss. Latest results — +0.85 nats of bank advantage, flat
-to 10 chunks deep, shown by inference probes to be **file-specific content in a
-recency-weighted superposition** — are documented with exact reproduction
-commands in **[FINDINGS.md](FINDINGS.md)**.
+The work moved past the synthetic-rule benchmark in three steps, all
+documented with exact reproduction commands in **[FINDINGS.md](FINDINGS.md)**
+(newest-first journal) and mapped experiment-by-experiment in
+**[EXPERIMENTS.md](EXPERIMENTS.md)**:
+
+1. **Real data, from scratch (47M–97M).** The bank as the *only* channel
+   carrying a real document (Python code / web text) across 512-token chunks,
+   measured by a deferred-continuation loss: a positive bank advantage, flat
+   with depth, shown by inference probes to be file-specific content in a
+   recency-weighted superposition.
+2. **The mechanism arc closes (2026-07-16).** Addressing, eviction,
+   cross-modal transfer and warm-restart curriculum all validated at 97M on
+   real text — the stack composes, no staged curriculum needed. The `page`
+   (reach-back past eviction) stayed dead across four strikes and left the
+   critical path; the cascade remains a free deployment flag.
+3. **Scale point: a 350M phase-1 run on 10B tokens**, released as
+   **[Fractale-350M-base](https://huggingface.co/fractale-lm/Fractale-350M-base)**
+   (usage repo: [fractale-lm/fractale](https://github.com/fractale-lm/fractale),
+   card: [MODEL_CARD.md](MODEL_CARD.md)).
+
+The current phase is **phase 2**: instruction-following through a ChatML chat
+template (no address tokens), SFT on reassembled state-of-the-art instruction
+data stretched into long sessions, then a GRPO ratchet on verifiable
+environments. Active configs are the un-archived ones under
+[`deepseek_v4_mini/configs/`](deepseek_v4_mini/configs/); the closed arcs live
+in [`configs/archive/`](deepseek_v4_mini/configs/archive/README.md).
+
+> **Branches:** day-to-day work happens on the phase-2 branch
+> (`sft-persona-350m` at the time of writing); `main` is the last merged
+> checkpoint and lags behind it.
 
 ---
 
@@ -265,6 +288,21 @@ slot count identical:
 ---
 
 ## ⚙️ Configs
+
+**Active program** (un-archived, at the root of `deepseek_v4_mini/configs/`):
+
+| File | Purpose |
+|---|---|
+| `configs/v350_*.yaml` | 350M phase 1: bring-up, compile/fastpath smokes, the 10B run (`v350_phase1_10b.yaml`), the SIF teacher repass |
+| `configs/sft_sota_*.yaml` | phase 2 SFT on reassembled state-of-the-art instruction data (long sessions, tools, code-exec) |
+| `configs/sft_persona_*.yaml` | the persona prototype that opened the read channel (arc closed 2026-07-24; kept as the immediate lineage) |
+| `configs/rl_*.yaml` | GRPO: lives, deferred rollouts, disaggregated worker/learner |
+| `configs/code_defer_native_350m*.yaml` | 350M native deferred-continuation lineage |
+| `configs/farm/` | 350M ablations run on the 3070Ti rig |
+
+**Archive** — the two closed arcs, kept because FINDINGS/README and the
+`analysis/` probes cite them by name
+([details](deepseek_v4_mini/configs/archive/README.md)):
 
 | File | Dataset / task | Purpose |
 |---|---|---|
