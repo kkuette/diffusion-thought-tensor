@@ -73,7 +73,7 @@ pointe l'import `deepseek_v4_mini`.) L'alternative Docker-sur-Unraid
 
 `prebuild_data.py` rejoue la construction de données du trainer (mêmes clés de
 cache md5, y compris les tokens spéciaux `<think>`/`<blank>`) et remplit le
-cache partagé `/mnt/tb/data_cache/`. Validé : 4/4 cache hits sur la config v2c.
+cache partagé `${TB_ROOT}/data_cache/` (TB_ROOT = le montage, exporté par gpu_worker.sh). Validé : 4/4 cache hits sur la config v2c.
 
 Depuis le terminal Unraid :
 
@@ -83,7 +83,7 @@ Depuis le terminal Unraid :
 ```
 
 **Convention** : toute config destinée à la ferme déclare
-`data.cache_dir: /mnt/tb/data_cache` (le défaut du trainer est un `data_cache/`
+`data.cache_dir: ${TB_ROOT}/data_cache` (le défaut du trainer est un `data_cache/`
 local qui raterait le cache partagé). Le cache des corpus actuels est déjà
 semé (16 entrées, ~1 Go). Le HF cache partagé (`data/hf_cache`) évite aussi
 les re-téléchargements.

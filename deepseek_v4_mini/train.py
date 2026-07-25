@@ -33,6 +33,7 @@ from .model import TrunkLM, ThoughtBankLM
 # Muon vit dans .muon depuis 2026-07-25 ; réexporté ici pour que les commandes
 # de repro dsv4mini et les imports existants (`from .train import Muon`) tiennent.
 from .muon import Muon, _split_muon_params, _zeropower_via_newtonschulz  # noqa: F401
+from .paths import expand
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -1738,7 +1739,7 @@ def main() -> None:
     cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("deepseek_v4_mini/configs/archive/dsv4mini/tiny.yaml")
     import yaml
     with open(cfg_path) as f:
-        raw = yaml.safe_load(f)
+        raw = expand(yaml.safe_load(f))
 
     model_cfg = ThoughtBankConfig.from_yaml(cfg_path)
     train_cfg = raw.get("training", {})

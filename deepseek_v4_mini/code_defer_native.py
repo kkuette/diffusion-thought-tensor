@@ -33,6 +33,7 @@ from .model import ThoughtBankLM
 from .muon import Muon, _split_muon_params
 from .code_data import CodeChunkStream
 from .cascade import CascadeMemory
+from .paths import load_yaml
 
 
 def _fill(x_ref, tok_id, width):
@@ -306,7 +307,7 @@ def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
 
 
 def main(cfg_path: str, resume: bool = False) -> None:
-    raw = yaml.safe_load(open(cfg_path)); t = raw["training"]; d = raw["data"]
+    raw = load_yaml(cfg_path); t = raw["training"]; d = raw["data"]
 
     # DDP (opt-in via torchrun): data parallelism WITHOUT the DDP wrapper — the
     # conv loop runs many forwards (in-context + defer + addr + reach) per single

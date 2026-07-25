@@ -35,7 +35,7 @@ model:                                     # = v350_phase1_10b (386M), inchangé
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   surprisal_mode: sif
   sif_a: 1.0e-04
   sources:                                 # mix smol local (caches déjà chauds)
@@ -75,7 +75,7 @@ training:
   steps: 8
   grad_accum: 1
   amp: true
-  init_from: /mnt/tb/checkpoints/v350_phase1_release/final.pt
+  init_from: ${TB_ROOT}/checkpoints/v350_phase1_release/final.pt
   lr: 1.0e-04
   muon_lr: 2.4e-04
   muon_ref_mem_dim: 64
@@ -96,8 +96,8 @@ training:
   eval_depth_sources:
   - codeparrot
   save_every: 1000
-  save_dir: /mnt/tb/checkpoints/v350_sif_repass_smoke
-  metrics_file: /mnt/tb/runs/v350_sif_repass_smoke/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sif_repass_smoke
+  metrics_file: ${TB_ROOT}/runs/v350_sif_repass_smoke/metrics.jsonl
 
 teacher:
   enabled: true

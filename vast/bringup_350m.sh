@@ -17,6 +17,7 @@ VRAMLOG=$WORK/vram_samples.csv
 
 mkdir -p $WORK && cd $WORK
 export HF_HOME=$WORK/hf
+export TB_ROOT=${TB_ROOT:-$WORK}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # --- setup (idempotent : relançable après préemption/retry)

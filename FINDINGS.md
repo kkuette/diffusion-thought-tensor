@@ -142,9 +142,8 @@ boutons (p_chat, poids stages, partial credit d'éval) restent en réserve —
 une variable à la fois.
 
 ```
-# ckpt: /mnt/tb/checkpoints/farm/sft_school/final.pt (step 800)
-# logs: /mnt/tb/runs/GPUrig0-gpu1__117_sft_school.workerlog (0→400, tué),
-#       GPUrig0-gpu2__118 (tué, sans biais), GPUrig0-gpu1__119 (400→800+probes)
+# ckpt: checkpoints/sft_school/final.pt (step 800)
+# run mené en 3 tranches (deux workers tués sans biais, reprise 400→800)
 # diag décodes : scratchpad diag_math_decode.py (rejouable sur tout ckpt)
 ```
 
@@ -231,7 +230,7 @@ completion; not a crash.
 **Question.** Avant de payer la run 10B : l'anneal teacher [2850,4300] de
 `v350_phase1_10b.yaml` (proportion héritée du twin, ~730k convs de teacher) et
 le `wsd_decay_start` à 60% (convention DeepSeek) sont-ils bien réglés ? Deux
-ablations à une variable chacune sur GPUrig0, contre la baseline
+ablations à une variable chacune, contre la baseline
 `v350_curr_p1` (même seed, même data — trajectoires identiques hors points de
 schedule, ic 10.863 vs 10.862 @10).
 
@@ -260,8 +259,8 @@ bien plus avancé en loss qu'un step 100 du twin grâce au batch 256) et
 `grad_checkpoint: true` (B4×512×8 OOM sur 8GB — même gradient, recompute).
 
 Repro : `deepseek_v4_mini/configs/farm/v350_p1_annealfast.yaml`,
-`.../v350_p1_wsd85.yaml`, metrics `/mnt/tb/runs/farm_v350_p1_{annealfast,wsd85}/`
-vs `/mnt/tb/runs/farm_v350_curr_p1/`.
+`.../v350_p1_wsd85.yaml`, metrics `runs/v350_p1_{annealfast,wsd85}/`
+vs `runs/v350_curr_p1/`.
 
 ---
 
@@ -360,7 +359,7 @@ déjà validée). Pour le 350M : la profondeur de cascade est un multiplicateur 
 contribution page quasi gratuit (d3 = même coût, job 111), et aucun risque de falaise
 de capacité en vie longue.
 
-Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (jobs 113/114/115, logs `GPUrig0-gpu{3,2,4}__11{3,4,5}_capdeep_*.workerlog`).
+Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (3 runs, un par profondeur).
 
 ---
 
@@ -426,7 +425,7 @@ Repro:
 ```
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml \
-  /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt \
+  checkpoints/v350_rehearsal/final.pt \
   --probes swap,distractor,cued,page,capacity_curve --n-files 48
 # d3: config farm/v350_d3_probes.yaml, ckpt farm/v350_rehearsal_d3/final.pt
 # md128: config farm/v2e_md128.yaml, ckpt farm/v2e_md128/final.pt, probes swap,distractor,cued,merge
@@ -495,7 +494,7 @@ python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/me
 python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_delta.yaml --resume
 python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml --resume
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
-  deepseek_v4_mini/configs/farm/<cfg>.yaml /mnt/tb/checkpoints/farm/<run>/final.pt \
+  deepseek_v4_mini/configs/farm/<cfg>.yaml checkpoints/<run>/final.pt \
   --probes invar|cued,xmodal|page,capacity_curve --n-files 48
 ```
 
@@ -537,8 +536,8 @@ Repro:
 python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/mechanism/farm/v2e_resetcue.yaml --resume
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v2e_resetcue.yaml \
-  /mnt/tb/checkpoints/farm/v2e_resetcue/final.pt --probes resetcue,swap,distractor --n-files 48
-# contrôle OOD : même probe sur /mnt/tb/checkpoints/farm/v2e_interleave/final.pt
+  checkpoints/v2e_resetcue/final.pt --probes resetcue,swap,distractor --n-files 48
+# contrôle OOD : même probe sur checkpoints/v2e_interleave/final.pt
 ```
 
 ---
@@ -589,8 +588,7 @@ Repro:
 ```
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v2h_stack.yaml \
-  /mnt/tb/checkpoints/farm/v2h_stack/final.pt --probes capacity_curve --n-files 48
-# logs: /mnt/tb/runs/GPUrig0-gpu{2,3}__10{1,2,9}_*.workerlog
+  checkpoints/v2h_stack/final.pt --probes capacity_curve --n-files 48
 ```
 
 ---
@@ -626,7 +624,7 @@ Repro: `python -m deepseek_v4_mini.code_defer_native
 deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml --resume` puis
 `PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py
 deepseek_v4_mini/configs/archive/mechanism/farm/v3_deep.yaml
-/mnt/tb/checkpoints/farm/v3_deep/final.pt --probes page,swap,distractor,cued
+checkpoints/v3_deep/final.pt --probes page,swap,distractor,cued
 --n-files 48`.
 
 ---
@@ -802,7 +800,7 @@ reward signal") is why SFT came first.
 ```bash
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v2f_addr.yaml \
-  /mnt/tb/checkpoints/farm/v2f_addr/final.pt \
+  checkpoints/v2f_addr/final.pt \
   --probes cued,merge,cohab,invar --n-files 48
 ```
 
@@ -857,7 +855,7 @@ mem_dim grid's seed-4 pairs (the taper argument for small deep-block reads).
 ```bash
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v2e_interleave.yaml \
-  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  checkpoints/v2e_interleave/final.pt \
   --probes merge --n-files 48
 ```
 
@@ -1006,7 +1004,7 @@ python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/archive/me
 # probe battery incl. the cued probe (any checkpoint)
 PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
   deepseek_v4_mini/configs/archive/mechanism/farm/v2e_interleave.yaml \
-  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  checkpoints/v2e_interleave/final.pt \
   --probes swap,dup,distractor,order,eviction,cued --n-files 48
 ```
 

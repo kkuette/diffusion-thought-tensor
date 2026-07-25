@@ -33,7 +33,11 @@ while true; do
   log="$TB_MNT/runs/${name}.workerlog"
   echo "[$WORKER] job: $name" | tee -a "$log"
   (
+    # TB_ROOT : racine des chemins de config (data_cache/checkpoints/runs).
+    # Défaut du loader = "." (dépôt local, pour qui reproduit) ; sur la ferme
+    # c'est le montage NFS, donc les .job n'ont rien à déclarer.
     export CUDA_VISIBLE_DEVICES="$GPU_ID" TB_MNT TB_REPO WORKER
+    export TB_ROOT="$TB_MNT"
     source "$TB_VENV/bin/activate"
     cd "$TB_REPO"
     bash "$job"

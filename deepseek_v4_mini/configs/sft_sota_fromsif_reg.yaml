@@ -44,7 +44,7 @@ model:                                     # = v350_phase1_10b (386M)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # --- identique au bloc sft_school (cache hit garanti, ancres GAP code/web)
   sources:
   - name: codeparrot
@@ -153,7 +153,7 @@ training:
   amp: true
   # Base = phase 1 SIF repass (canal WRITE natif, zéro registre,
   # zéro persona). Poids seuls, optim frais, step→0. Banque fraîche.
-  init_from: /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+  init_from: ${TB_ROOT}/checkpoints/v350_sif_repass/final_step2500.pt
   lr: 1.0e-04
   muon_lr: 2.4e-04
   muon_ref_mem_dim: 64
@@ -178,8 +178,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 50
-  save_dir: /mnt/tb/checkpoints/v350_sft_sota_fromsif_reg
-  metrics_file: /mnt/tb/runs/v350_sft_sota_fromsif_reg/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_sota_fromsif_reg
+  metrics_file: ${TB_ROOT}/runs/v350_sft_sota_fromsif_reg/metrics.jsonl
 
 chat:
   stream: sota_session
@@ -188,7 +188,7 @@ chat:
   eval_convs: 12
   max_new: 64                              # réponses réelles > valeurs persona
   gen:
-    real_cache_dir: /mnt/tb/data_cache
+    real_cache_dir: ${TB_ROOT}/data_cache
     conv_cap: 8000
     max_turn_tok: 192
     max_conv_msgs: 10

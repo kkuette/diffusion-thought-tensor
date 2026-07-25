@@ -10,8 +10,8 @@ producing inconsistent grads).
 
     python -m deepseek_v4_mini.nan_repro \
         deepseek_v4_mini/configs/sft_persona_350m.yaml \
-        /mnt/tb/checkpoints/v350_sft_persona/nan_weights.pt \
-        /mnt/tb/checkpoints/v350_sft_persona/nan_conv_step33_g2.pt \
+        checkpoints/v350_sft_persona/nan_weights.pt \
+        checkpoints/v350_sft_persona/nan_conv_step33_g2.pt \
         [--gc both] [--anomaly] [--trials 3]
 
 Chat segs only (the persona SFT is p_chat 1.0). Weights file: either the
@@ -24,11 +24,10 @@ import argparse
 
 import torch
 import torch.nn.functional as F
-import yaml
-
 from .cascade import CascadeMemory
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
+from .paths import load_yaml
 
 
 def _first_nonfinite_hooks(model, record):
@@ -145,7 +144,7 @@ def main():
     ap.add_argument("--anomaly", action="store_true")
     args = ap.parse_args()
 
-    raw = yaml.safe_load(open(args.config))
+    raw = load_yaml(args.config)
     t = raw.get("training", {})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(t.get("amp", False))

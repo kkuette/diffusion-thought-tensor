@@ -25,6 +25,7 @@ sys.path.insert(0, ".")
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
+from ..paths import load_yaml
 
 torch.manual_seed(11)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -33,7 +34,7 @@ S, m, SYM_OFF = 128, 6, 3
 KEY_OFF = SYM_OFF + S
 N_CONV = 64
 
-raw = yaml.safe_load(open(CFG))
+raw = load_yaml(CFG)
 _u, _n, TRAIN, HELD, _apply = _rule_space(raw["data"])
 POOL = torch.tensor(HELD)
 

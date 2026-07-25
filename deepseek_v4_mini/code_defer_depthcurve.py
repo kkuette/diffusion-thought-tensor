@@ -14,11 +14,12 @@ from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .code_data import CodeChunkStream
 from .code_defer_native import evaluate_by_depth
+from .paths import load_yaml
 
 
 def main(cfg_path, ckpt_path, n_per=48):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw = yaml.safe_load(open(cfg_path)); d = raw["data"]
+    raw = load_yaml(cfg_path); d = raw["data"]
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     for tkn in ("<think>", "<blank>"):
         if tkn not in tok.get_vocab():

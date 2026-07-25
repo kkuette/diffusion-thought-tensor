@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .code_data import CodeChunkStream
+from .paths import load_yaml
 
 
 def _fill(x, tok, w):
@@ -35,7 +36,7 @@ def _greedy(model, ref, blank_id, bank, dl):
 @torch.no_grad()
 def main(cfg_path, ckpt_path, depths=(1, 2, 4, 6, 8, 10)):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw = yaml.safe_load(open(cfg_path)); d = raw["data"]
+    raw = load_yaml(cfg_path); d = raw["data"]
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     for tkn in ("<think>", "<blank>"):
         if tkn not in tok.get_vocab():

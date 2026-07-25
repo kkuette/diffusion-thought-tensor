@@ -9,7 +9,7 @@
 # décoller. Verdict au juge @600-800.
 #
 # DIFFS vs sft_persona_350m_sif_hot.yaml :
-#   - init_from = /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+#   - init_from = ${TB_ROOT}/checkpoints/v350_sif_repass/final_step2500.pt
 #     (ckpt WARM : WSD interrompu à lr 1.71e-4/2.4e-4 — le SFT-chaud à
 #     muon 2.4e-4 est en continuité de LR, pas un choc)
 #   - eval_every 200→50 (décision mémoire post-sif_hot : suivre Δnll/grade
@@ -50,7 +50,7 @@ model:                                     # = v350_phase1_10b (386M)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # --- identique au bloc sft_school (cache hit garanti sur le cache local)
   sources:
   - name: codeparrot
@@ -159,7 +159,7 @@ training:
   amp: true
   # Base = repass SIF stoppée à 2500/3750 (budget), poids seuls, schedule/optim
   # frais, step→0 (ré-arme β). Banque fraîche : re-remplissage FIFO.
-  init_from: /mnt/tb/checkpoints/v350_sif_repass/final_step2500.pt
+  init_from: ${TB_ROOT}/checkpoints/v350_sif_repass/final_step2500.pt
   lr: 1.0e-04
   muon_lr: 2.4e-04
   muon_ref_mem_dim: 64
@@ -184,8 +184,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 50
-  save_dir: /mnt/tb/checkpoints/v350_sft_persona_sif_repass
-  metrics_file: /mnt/tb/runs/v350_sft_persona_sif_repass/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_persona_sif_repass
+  metrics_file: ${TB_ROOT}/runs/v350_sft_persona_sif_repass/metrics.jsonl
 
 chat:
   stream: persona
@@ -195,7 +195,7 @@ chat:
   max_new: 24
   gen:
     real_filler: HuggingFaceTB/smol-smoltalk
-    real_cache_dir: /mnt/tb/data_cache
+    real_cache_dir: ${TB_ROOT}/data_cache
     surprisal_mode: sif                    # SIF a/(a+p) — MÊME famille de codes
     sif_a: 1.0e-04                         # que le pretrain repass : continuité
     value_weight: 4.0                      # pression native routage read→valeur

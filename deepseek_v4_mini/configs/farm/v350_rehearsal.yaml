@@ -64,7 +64,7 @@ model:
   use_dual_stream: true
   balance_loss_weight: 0.0001
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:
   # --- identique à v2e_divmix (cache hit garanti avec le job 107)
   - name: codeparrot
@@ -195,8 +195,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/farm/v350_rehearsal
-  metrics_file: /mnt/tb/runs/farm_v350_rehearsal/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/v350_rehearsal
+  metrics_file: ${TB_ROOT}/runs/farm_v350_rehearsal/metrics.jsonl
   interleave_files:
   - 2
   - 4

@@ -63,12 +63,12 @@ import statistics as st
 
 import torch
 import torch.nn.functional as F
-import yaml
 from transformers import AutoTokenizer
 
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.code_data import CodeChunkStream
+from ..paths import load_yaml
 
 DL = 16     # defer_len used for all targets
 DELTA = None  # B4 : canal delta chargé depuis le ckpt s'il y en a un
@@ -76,7 +76,7 @@ DELTA = None  # B4 : canal delta chargé depuis le ckpt s'il y en a un
 
 def _load(cfg_path, ckpt_path, dev):
     global DELTA
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     for t in ("<think>", "<blank>"):
         if t not in tok.get_vocab():

@@ -12,6 +12,7 @@ import os
 import sys
 
 import yaml
+from deepseek_v4_mini.paths import load_yaml
 
 
 def main() -> None:
@@ -28,7 +29,7 @@ def main() -> None:
     ap.add_argument("--stream-cap", type=int, default=0, help="override data.stream_cap")
     a = ap.parse_args()
 
-    raw = yaml.safe_load(open(a.base))
+    raw = load_yaml(a.base)
     suffix = a.suffix or a.dataset.split("/")[-1].replace("-", "_")
     base_name = os.path.basename(a.base)[: -len(".yaml")]
 

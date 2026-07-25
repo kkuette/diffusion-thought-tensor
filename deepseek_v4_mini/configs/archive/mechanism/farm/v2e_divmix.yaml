@@ -50,7 +50,7 @@ model:
   use_dual_stream: true
   balance_loss_weight: 0.0001
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:
   # --- code 50 % (python = ancre v2e, poids et params identiques sauf budget)
   - name: codeparrot
@@ -157,7 +157,7 @@ training:
   steps: 800
   grad_accum: 8
   amp: true
-  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  init_from: ${TB_ROOT}/checkpoints/code_defer_native_v2c_varlen/final.pt
   lr: 0.0001
   muon_lr: 0.00024
   muon_ref_mem_dim: 64
@@ -182,8 +182,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 400
-  save_dir: /mnt/tb/checkpoints/farm/v2e_divmix
-  metrics_file: /mnt/tb/runs/farm_v2e_divmix/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/v2e_divmix
+  metrics_file: ${TB_ROOT}/runs/farm_v2e_divmix/metrics.jsonl
   interleave_files:
   - 2
   - 4

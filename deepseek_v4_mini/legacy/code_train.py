@@ -23,6 +23,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from .smollm_graft import GraftConfig, SmolBankLM
 from ..code_data import CodeChunkStream
+from ..paths import load_yaml
 
 
 def _append_think(x, am, think_id):
@@ -71,7 +72,7 @@ def evaluate(model, stream, device, amp_dtype, think_id, defer_len, n_conv):
 
 
 def main(cfg_path: str) -> None:
-    raw = yaml.safe_load(open(cfg_path)); t = raw["training"]; d = raw["data"]
+    raw = load_yaml(cfg_path); t = raw["training"]; d = raw["data"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_dtype = torch.bfloat16
 

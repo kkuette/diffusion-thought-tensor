@@ -61,6 +61,7 @@ import re
 import sys
 
 import torch
+from .paths import load_yaml
 
 # ── ChatML pieces (same as chat_defer_data) ──────────────────────────────────
 U_OPEN = "<|im_start|>user\n"
@@ -716,9 +717,8 @@ def _show(tok, conv, max_seg_chars=160):
 
 
 def main(cfg_path: str) -> None:
-    import yaml
     from transformers import AutoTokenizer
-    name = (yaml.safe_load(open(cfg_path))["tokenizer"]
+    name = (load_yaml(cfg_path)["tokenizer"]
             if cfg_path.endswith((".yaml", ".yml")) else cfg_path)
     tok = AutoTokenizer.from_pretrained(name)
     ms = MathSchoolStream(tok, seed=0)

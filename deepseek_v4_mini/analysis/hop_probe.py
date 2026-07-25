@@ -26,6 +26,7 @@ sys.path.insert(0, ".")
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
+from ..paths import load_yaml
 
 torch.manual_seed(23)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,7 +43,7 @@ KEY_OFF = SYM_OFF + S
 OPFMT = "--op" in sys.argv
 N_CONV = 64
 
-raw = yaml.safe_load(open(CFG))
+raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")

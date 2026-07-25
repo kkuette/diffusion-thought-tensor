@@ -76,8 +76,8 @@ training:
   eval_every: 100000
   eval_convs: 2
   save_every: 100000
-  save_dir: /workspace/checkpoints/v350_sync_val
-  metrics_file: /workspace/runs/v350_sync_val/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sync_val
+  metrics_file: ${TB_ROOT}/runs/v350_sync_val/metrics.jsonl
 
 teacher:
   enabled: true

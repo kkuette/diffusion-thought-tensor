@@ -19,6 +19,7 @@ PY=${PY:-python}
 TIMEOUT=${TIMEOUT:-900}
 
 MODULES=(
+  paths               # expansion ${TB_ROOT} dans les configs
   streams             # registre nom→classe : tout résout, alias RL compris
   exec_sandbox        # bac à sable d'exécution (le juge de l'env code)
   rl_rewards          # extraction + grading des récompenses RL

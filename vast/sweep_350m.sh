@@ -15,6 +15,7 @@ SUMMARY=$WORK/sweep_summary.txt
 
 mkdir -p $WORK && cd $WORK
 export HF_HOME=$WORK/hf
+export TB_ROOT=${TB_ROOT:-$WORK}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 if [ ! -d thought-bank ]; then

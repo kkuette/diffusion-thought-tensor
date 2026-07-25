@@ -36,7 +36,7 @@ model:
   use_dual_stream: true
   balance_loss_weight: 0.0001
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:
   - name: codeparrot
     dataset: codeparrot/codeparrot-clean
@@ -63,7 +63,7 @@ training:
   steps: 400
   grad_accum: 8
   amp: true
-  init_from: /mnt/tb/checkpoints/v2d_noreset_step_400.pt
+  init_from: ${TB_ROOT}/checkpoints/v2d_noreset_step_400.pt
   lr: 0.0001
   muon_lr: 0.00024
   muon_ref_mem_dim: 64
@@ -82,8 +82,8 @@ training:
   - 8
   eval_depth_convs: 8
   save_every: 400
-  save_dir: /mnt/tb/checkpoints/farm/v2d_noreset_resume
-  metrics_file: /mnt/tb/runs/farm_v2d_noreset_resume/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/v2d_noreset_resume
+  metrics_file: ${TB_ROOT}/runs/farm_v2d_noreset_resume/metrics.jsonl
   no_reset_files: 4
 teacher:
   enabled: false

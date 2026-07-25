@@ -16,8 +16,8 @@
 #   torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
 #     deepseek_v4_mini/configs/v350_sif_repass.yaml
 #
-# PRÉREQUIS POD : /workspace/data_cache = cache uint16 de la 10B (tar HF privé)
-# + le release AVEC optim à /workspace/ckpts/v350_phase1_release_final.pt.
+# PRÉREQUIS POD : ${TB_ROOT}/data_cache = cache uint16 de la 10B (tar HF privé)
+# + le release AVEC optim à ${TB_ROOT}/ckpts/v350_phase1_release_final.pt.
 # Verdict de la passe : dist [surp] descend (le write imite des cibles SIF sur
 # data réelle) + GAP code/fineweb ne recule pas (la capacité phase 1 tient) ;
 # ensuite SFT persona local depuis le ckpt final => le juge réel.
@@ -51,7 +51,7 @@ model:                                     # = v350_phase1_10b (386M), inchangé
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /workspace/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # Mix divmix officiel — poids et pools IDENTIQUES à v350_phase1_10b (cache
   # déjà construit) ; seule addition : surprisal_mode sif => chaque seg chunk
   # porte surp_w, la table unigram se construit au chargement (~1 s).
@@ -178,7 +178,7 @@ training:
                                            # mêmes convs absolues, moitié du temps mur
   grad_accum: 1
   amp: true
-  init_from: /workspace/ckpts/v350_phase1_release_final.pt
+  init_from: ${TB_ROOT}/ckpts/v350_phase1_release_final.pt
   # Warm restart : paire chaude validée au SFT sif_hot (muon 2.4e-4 / adam
   # 1e-4, warmup 0). WSD post-anneal => le ckpt final sort FROID, prêt pour
   # le SFT persona local.
@@ -197,7 +197,7 @@ training:
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
   gc_save_topk: false                      # OFF (décision user post-fix clamp) : +35% step
   compile: true                            # torch>=2.6 (image cuda12.4 devel min)
-  compile_cache_dir: /workspace/compile_cache  # inductor+triton persistant (fastpath
+  compile_cache_dir: ${TB_ROOT}/compile_cache  # inductor+triton persistant (fastpath
                                            #   af3f4a5) : warmé 1x A100, resservi 4x/8x
   prefetch: true                           # producteur host // compute (ordre rng intact)
   skip_final_eval: true
@@ -216,8 +216,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 250                          # même intervalle en tokens que 500@4x
-  save_dir: /workspace/checkpoints/v350_sif_repass
-  metrics_file: /workspace/runs/v350_sif_repass/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sif_repass
+  metrics_file: ${TB_ROOT}/runs/v350_sif_repass/metrics.jsonl
   # AUCUN flag de stack (définition phase 1) — la cascade/no_reset restent
   # affaire du SFT.
 

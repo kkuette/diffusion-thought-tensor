@@ -15,8 +15,8 @@ saved in the artifact. The --both/--ablated arm decodes with NO memory at all
 
     python -m deepseek_v4_mini.chat_cli \
         deepseek_v4_mini/configs/sft_persona_350m.yaml \
-        /mnt/tb/checkpoints/v350_sft_persona/step_200.pt \
-        [--bank /mnt/tb/checkpoints/v350_sft_persona/bank_step_200.pt] \
+        checkpoints/v350_sft_persona/step_200.pt \
+        [--bank checkpoints/v350_sft_persona/bank_step_200.pt] \
         [--both] [--max-new 48] [--temp 0.7 --top-p 0.9 --seed 0]
 
 Options:
@@ -35,12 +35,12 @@ REPL commands: /reset (fresh bank+cascade), /save PATH (dump bank), /quit.
 import argparse
 
 import torch
-import yaml
 from transformers import AutoTokenizer
 
 from .cascade import CascadeMemory
 from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
+from .paths import load_yaml
 
 U_OPEN = "<|im_start|>user\n"
 A_OPEN = "<|im_start|>assistant\n"
@@ -164,7 +164,7 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    raw = yaml.safe_load(open(args.config))
+    raw = load_yaml(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tcfg = raw.get("training", {})
     amp = bool(tcfg.get("amp", False))

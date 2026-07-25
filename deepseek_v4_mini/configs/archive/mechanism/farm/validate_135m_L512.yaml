@@ -41,7 +41,7 @@ model:                                     # ThoughtBankConfig -> 135.0M
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache                                      # SAME corpus knobs as v2b_mix => cache hit
+  cache_dir: ${TB_ROOT}/data_cache                                      # SAME corpus knobs as v2b_mix => cache hit
   sources:
   - name: codeparrot
     dataset: codeparrot/codeparrot-clean
@@ -83,8 +83,8 @@ training:
   eval_depths: [2, 4, 6, 8]
   eval_depth_convs: 8
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/farm/validate_135m_L512
-  metrics_file: /mnt/tb/runs/farm_validate_135m_L512/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/validate_135m_L512
+  metrics_file: ${TB_ROOT}/runs/farm_validate_135m_L512/metrics.jsonl
 
 teacher:
   enabled: true

@@ -29,9 +29,8 @@ CFG = sys.argv[sys.argv.index("--cfg") + 1] if "--cfg" in sys.argv else \
 S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N = 128
-
-import yaml
-raw = yaml.safe_load(open(CFG))
+from ..paths import load_yaml
+raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")

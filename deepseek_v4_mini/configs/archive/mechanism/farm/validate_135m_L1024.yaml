@@ -53,7 +53,7 @@ data:
   batch_size: 1
   n_files: 24000                           # ~70M tokens a L=1024 = ~2 epoques pour 2000 steps (6000 => 7 epoques, piege data-bound du 135m)
   stream_cap: 90000
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
 training:
   seed: 0
   steps: 100
@@ -80,9 +80,9 @@ training:
   - 8
   eval_depth_convs: 8
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/farm/validate_135m_L1024
-  metrics_file: /mnt/tb/runs/farm_validate_135m_L1024/metrics.jsonl
-  init_from: /mnt/tb/checkpoints/code_defer_native_135m_mix/final.pt
+  save_dir: ${TB_ROOT}/checkpoints/farm/validate_135m_L1024
+  metrics_file: ${TB_ROOT}/runs/farm_validate_135m_L1024/metrics.jsonl
+  init_from: ${TB_ROOT}/checkpoints/code_defer_native_135m_mix/final.pt
 teacher:
   enabled: false                           # scaffold dismantled, v2c pattern
   distill_weight: 2.0

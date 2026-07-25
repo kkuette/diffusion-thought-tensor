@@ -48,7 +48,7 @@ data:
   batch_size: 1
   n_files: 6000
   stream_cap: 90000
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
 training:
   seed: 1
   steps: 500
@@ -75,8 +75,8 @@ training:
   - 8
   eval_depth_convs: 8
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/farm/validate_97m
-  metrics_file: /mnt/tb/runs/farm_validate_97m/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/farm/validate_97m
+  metrics_file: ${TB_ROOT}/runs/farm_validate_97m/metrics.jsonl
 teacher:
   enabled: true
   distill_weight: 2.0

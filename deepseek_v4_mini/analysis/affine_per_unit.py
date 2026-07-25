@@ -29,6 +29,7 @@ import yaml
 from deepseek_v4_mini import train as T
 from deepseek_v4_mini.config import ThoughtBankConfig
 from deepseek_v4_mini.model import ThoughtBankLM
+from ..paths import expand
 
 
 def main() -> None:
@@ -40,7 +41,7 @@ def main() -> None:
         n_conv = int(sys.argv[sys.argv.index("--n-conv") + 1])
 
     with open(cfg_path) as f:
-        raw = yaml.safe_load(f)
+        raw = expand(yaml.safe_load(f))
     model_cfg = ThoughtBankConfig.from_yaml(cfg_path)
     device = torch.device("cuda" if use_gpu else "cpu")
 

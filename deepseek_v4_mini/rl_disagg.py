@@ -62,6 +62,7 @@ from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_rewards import make_exec_reward, make_tool_reward
+from .paths import load_yaml
 
 
 # ── shared-FS primitives ─────────────────────────────────────────────────────
@@ -680,9 +681,8 @@ class Learner:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv):
-    import yaml
     role, cfg_path = argv[0], argv[1]
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     if role == "learner":
         Learner(raw).run()
     elif role == "worker":

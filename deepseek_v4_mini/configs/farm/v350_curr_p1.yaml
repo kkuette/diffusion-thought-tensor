@@ -42,7 +42,7 @@ model:
   use_dual_stream: true
   balance_loss_weight: 0.0001
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   sources:
   # --- identique à v2e_divmix (cache hit garanti avec le job 107)
   - name: codeparrot
@@ -172,8 +172,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/v350_curr_p1
-  metrics_file: /mnt/tb/runs/farm_v350_curr_p1/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_curr_p1
+  metrics_file: ${TB_ROOT}/runs/farm_v350_curr_p1/metrics.jsonl
   # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
   # pas de reach, pas de cascade — c'est la définition de la phase 1.
 teacher:

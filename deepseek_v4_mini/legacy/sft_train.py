@@ -30,11 +30,11 @@ import time
 from typing import Optional
 
 import torch
-import yaml
 from torch.optim import AdamW
 
 from .smollm_graft import GraftConfig, SmolBankLM
 from .verbal_tasks import VerbalRuleGen, VerbalTaskConfig, UltraChatTurns
+from ..paths import load_yaml
 
 
 # ── Conversation plumbing ────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ def eval_gap(model, streams: dict[str, ConvStream], device, n_convs: int,
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(cfg_path: str) -> None:
-    raw = yaml.safe_load(open(cfg_path))
+    raw = load_yaml(cfg_path)
     t   = raw["training"]
     d   = raw["data"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

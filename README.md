@@ -150,6 +150,15 @@ python -m deepseek_v4_mini.rl_disagg deepseek_v4_mini/configs/rl_disagg_350m.yam
 scripts/selftest.sh
 ```
 
+Configs write relative to `${TB_ROOT}`, which defaults to `.` — out of the
+box a run puts its dataset cache, checkpoints and metrics inside the repo
+(`./data_cache`, `./checkpoints/<run>`, `./runs/<run>`). Point it elsewhere
+with one variable, no config edit:
+
+```bash
+TB_ROOT=/mnt/big_volume python -m deepseek_v4_mini.code_defer_native <config>
+```
+
 The `chat.stream` key of an SFT config picks the conversation stream from the
 registry in [`deepseek_v4_mini/streams.py`](deepseek_v4_mini/streams.py)
 (`sota_session`, `tool_session`, `code_exec`, `persona`, `math_school`, or

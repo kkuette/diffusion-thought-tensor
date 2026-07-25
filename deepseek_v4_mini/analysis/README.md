@@ -7,39 +7,44 @@ RNG either way); the older diagnostics are CPU-only.
 Run from the repo root with `PYTHONPATH=.`; each script takes an optional
 checkpoint path as first argument.
 
-## État de repro (audit 2026-07-25)
+## How to re-run a probe
 
-Deux choses à savoir avant d'en lancer une.
-
-**Ce sont des scripts, pas des modules.** Config et checkpoint sont des
-constantes de niveau module, chargées dès la première ligne : importer une
-sonde *la lance*, et échoue si le checkpoint manque.
-
-**La plupart des checkpoints jouets n'existent plus** — purgés au fil des
-campagnes. La voie de repro n'est donc pas « recharger le ckpt » mais
-« relancer la config », qui est intacte et versionnée sous
-`configs/archive/` :
+**No checkpoints are distributed.** Each probe reproduces in two steps: train
+the config it belongs to, then point the probe at the checkpoint that run
+produced. Every config is versioned under `configs/archive/`, so the claims
+are reproducible from source on a single 24 GB GPU — the toy-arc cells are
+hours, not days.
 
 ```bash
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/archive/dsv4mini/<config>.yaml
-python -m deepseek_v4_mini.analysis.<sonde> <chemin/du/ckpt/produit.pt>
+python -m deepseek_v4_mini.analysis.<probe> <checkpoint produced above>
 ```
 
-Ce qui survit encore sur le NAS (`/mnt/tb/checkpoints/`) :
+The default checkpoint path hardcoded at the top of each probe is the one
+from the original campaign; pass yours as the first argument instead.
 
-| sonde | checkpoint |
+| probe | config to train |
 |---|---|
-| `gate_probe`, `reflection_probe` | `archive/multiturn_rule_k2_inter_s128_dsv4w_s43` |
-| `reflection_probe` (2ᵉ bras) | `archive/multiturn_rule_k2_inter_s128structmerge_dsv5b` |
-| `code_defer_bank_probes` | `archive/code_defer_native_v2b_mix` |
-| `doc2code_probe` | `code_defer_native_v2c_varlen` |
+| `ttt_demo`, `switch_probe_k2` | `archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml` |
+| `ttt_demo_act2`, `superposition_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml` |
+| `gate_probe`, `reflection_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml` |
+| `switch_inspect`, `canonical_ident` | `archive/dsv4mini/multiturn_rule_switch.yaml` |
+| `joint_inspect` | `archive/dsv4mini/multiturn_rule_joint.yaml` |
+| `rehearsal_inspect` | `archive/dsv4mini/multiturn_rule_horizon.yaml` |
+| `hop_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128hop_dsv5c.yaml` |
+| `write_code_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s256L.yaml` |
+| `affine_per_unit` | `archive/dsv4mini/multiturn_rule_k2_inter_affineL_wr.yaml` |
+| `code_geometry` | `archive/dsv4mini/multiturn_rule_k2_heldout.yaml` |
+| `code_defer_bank_probes` | `archive/mechanism/code_defer_native_v2b_mix.yaml` |
+| `doc2code_probe` | `rl_defer_grpo_97m.yaml` |
 
-Tous les autres (`multiturn_rule`, `_switch`, `_joint`, `_horizon`,
-`_dsv4m`, `_dsv4w`, `_s256L`, `_affineL_wr`, `_hop_dsv5c`) sont à
-reproduire depuis leur config. `freq_vs_surp*` ne dépendent d'aucun
-checkpoint (mesures sur la data). `smollm_graft_smoke` et
-`verbal_tasks_smoke` visent l'arc greffe, passé sous
-`deepseek_v4_mini/legacy/`.
+`freq_vs_surp` and `freq_vs_surp_mix` need no checkpoint (they measure the
+data). `smollm_graft_smoke` and `verbal_tasks_smoke` target the SmolLM2 graft
+arc, now under `deepseek_v4_mini/legacy/`.
+
+**These are scripts, not modules.** Config and checkpoint are module-level
+constants evaluated at import: importing a probe *runs* it, and fails if the
+checkpoint is missing.
 
 | Script | Question | Key result |
 |---|---|---|

@@ -50,7 +50,7 @@ data:
   chunks_per_conv: 8
   defer_len: 16
   var_chunk: [128, 512]
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   envs:                                    # le MIX : chaque env = un stream pondéré ;
   - name: code                             # reward_fn (rubric verifiers) branchable par env
     dataset: codeparrot/codeparrot-clean   # plus tard sans toucher l'orchestrateur
@@ -71,7 +71,7 @@ data:
 rl:
   seed: 0
   train_scope: think_row
-  init_from: /mnt/tb/checkpoints/farm/v2h_stack/final.pt
+  init_from: ${TB_ROOT}/checkpoints/farm/v2h_stack/final.pt
   n_lives: 4                               # vies parallèles (round-robin par groupe)
   max_episodes_per_life: 0                 # 0 = illimité ; >0 = mort naturelle + vie neuve
   cascade_depth: 0                         # 0 = banque vive seule (brancher 2 apres verdict 110)

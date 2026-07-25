@@ -50,7 +50,7 @@ data:
   chunks_per_conv: 8
   defer_len: 16
   var_chunk: [128, 512]
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   envs:
   - name: code
     kind: code
@@ -80,7 +80,7 @@ data:
       max_turn_tok: 192
       max_schema_tok: 256
       eps_per_session: [2, 5]
-      real_cache_dir: /mnt/tb/data_cache
+      real_cache_dir: ${TB_ROOT}/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04
   - name: exec                             # rubric exec_sandbox (tests passés
@@ -95,14 +95,14 @@ data:
       max_code_tok: 224
       max_tests: 8
       probs_per_session: [2, 4]
-      real_cache_dir: /mnt/tb/data_cache
+      real_cache_dir: ${TB_ROOT}/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04
 
 rl:
   seed: 0
   train_scope: think_row
-  init_from: /mnt/tb/checkpoints/farm/v2h_stack/final.pt
+  init_from: ${TB_ROOT}/checkpoints/farm/v2h_stack/final.pt
   n_lives_per_worker: 2                    # 6 workers x 2 = 12 vies au total
   max_episodes_per_life: 0
   cascade_depth: 0
@@ -126,7 +126,7 @@ rl:
   max_new: 64                              # décodage du tour d'appel (rubric)
   amp: true
   disagg:
-    root: /mnt/tb/rl/disagg_97m_smoke
+    root: ${TB_ROOT}/rl/disagg_97m_smoke
     publish_every: 1                       # poids publiés à chaque step learner
     max_lag: 2                             # staleness tolérée (itérations)
     keep_weights: 3

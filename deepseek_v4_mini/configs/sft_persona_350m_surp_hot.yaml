@@ -65,7 +65,7 @@ model:                                     # = v350_phase1_10b (386M, release)
   balance_loss_weight: 1.0e-4
 
 data:
-  cache_dir: /mnt/tb/data_cache
+  cache_dir: ${TB_ROOT}/data_cache
   # --- identique au bloc sft_school (cache hit garanti sur le cache local)
   sources:
   - name: codeparrot
@@ -179,7 +179,7 @@ training:
   # repart avec le teacher DISCRIMINANT. Banque fraîche (pas de bank_init) :
   # elle se re-remplit par FIFO, évite de mélanger les slots écrits sous
   # l'ancien teacher chunk-gist.
-  init_from: /mnt/tb/checkpoints/v350_phase1_release/final.pt
+  init_from: ${TB_ROOT}/checkpoints/v350_phase1_release/final.pt
   # LR CHAUD (décision user 2026-07-21) : les bras base à muon 1e-4 apprennent
   # le registre trop lentement pour la fenêtre d'anneal (surp×base : chat 7.5
   # quasi plat @17 steps — le blend sur TOUS les segs ajoute un surcoût). On
@@ -219,8 +219,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 50                           # 400->50 (décision user 2026-07-20 : coupure de courant, sauvegardes rapprochées)
-  save_dir: /mnt/tb/checkpoints/v350_sft_persona_surp_hot
-  metrics_file: /mnt/tb/runs/v350_sft_persona_surp_hot/metrics.jsonl
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_persona_surp_hot
+  metrics_file: ${TB_ROOT}/runs/v350_sft_persona_surp_hot/metrics.jsonl
 
 chat:
   stream: persona
@@ -233,7 +233,7 @@ chat:
   # naturel supervisé ; faits/requêtes restent synthétiques et notables.
   gen:
     real_filler: HuggingFaceTB/smol-smoltalk
-    real_cache_dir: /mnt/tb/data_cache
+    real_cache_dir: ${TB_ROOT}/data_cache
     # Teacher surprisal (label-free) : poids par token = nll^alpha sous la ref
     # GELÉE. Ref = INSTRUCT (connaît ChatML — avec la base, <|im_end|>/user
     # nll ~20 dominaient toutes les cibles : cos inter-faits 0.94 = zéro

@@ -44,6 +44,7 @@ import sys
 import torch
 
 from .code_data import CodeChunkStream
+from .paths import load_yaml
 
 # ── ChatML pieces (tokenized once in __init__) ──────────────────────────────
 U_OPEN = "<|im_start|>user\n"
@@ -224,9 +225,8 @@ def _show(tok, conv, max_seg_chars=200):
 
 
 def main(cfg_path: str) -> None:
-    import yaml
     from transformers import AutoTokenizer
-    raw = yaml.safe_load(open(cfg_path)); d = dict(raw["data"])
+    raw = load_yaml(cfg_path); d = dict(raw["data"])
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     add = [x for x in ("<think>", "<blank>") if x not in tok.get_vocab()]
     if add:

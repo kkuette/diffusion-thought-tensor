@@ -55,6 +55,7 @@ import sys
 import torch
 
 from .math_school_data import U_OPEN, A_OPEN, CLOSE
+from .paths import load_yaml
 
 # ── fact slots ───────────────────────────────────────────────────────────────
 # Each slot: statement templates, question templates, answer templates, value
@@ -674,14 +675,14 @@ def main() -> None:
     if len(sys.argv) < 2:
         _self_test()
         return
-    import yaml
     from transformers import AutoTokenizer
-    raw = yaml.safe_load(open(sys.argv[1]))
+    raw = load_yaml(sys.argv[1])
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     kw = {}
     if "--real" in sys.argv:
+        from .paths import expand_str
         kw = dict(real_filler="HuggingFaceTB/smol-smoltalk",
-                  real_cache_dir="/mnt/tb/data_cache")
+                  real_cache_dir=expand_str("${TB_ROOT}/data_cache"))
     ps = PersonaChatStream(tok, seed=0, **kw)
     for want in ("smalltalk", "recall"):
         for _ in range(100):
