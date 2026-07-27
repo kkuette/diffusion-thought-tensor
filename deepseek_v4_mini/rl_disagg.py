@@ -57,11 +57,13 @@ import torch
 import torch.nn.functional as F
 
 from .cascade import CascadeMemory
+from .decode import generate
 from .rl_defer_grpo import pos_write_corr
 from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_rewards import make_exec_reward, make_tool_reward
+from .cfg_schema import check as check_cfg
 from .paths import load_yaml
 
 
@@ -277,20 +279,13 @@ def sample_episode(mixer: EnvMixer, defer_len: int, device, rng=None):
 
 # ── rubric decode (tool envs) ────────────────────────────────────────────────
 
-@torch.no_grad()
 def decode_lb(model, prefix, bank, lb, max_new, stop_id, amp):
-    """code_defer_native._greedy + layer_banks: the call turn is decoded from
-    the exact carried state the rollout ended in (reads only)."""
-    out = prefix
-    for _ in range(max_new):
-        with torch.autocast("cuda", dtype=torch.bfloat16,
-                            enabled=amp and out.is_cuda):
-            o = model(out, init_mem=bank, layer_banks=lb)
-        nt = o["logits"][:, -1].argmax(-1, keepdim=True)
-        out = torch.cat([out, nt], dim=1)
-        if int(nt) == stop_id:
-            break
-    return out[:, prefix.size(1):]
+    """Le tour d'appel est décodé depuis l'état exact où le rollout s'est arrêté
+    (lectures seules). Mono-ligne ; pour les G rollouts d'un groupe, préférer
+    `decode.generate` batché — c'est le goulot de ce worker."""
+    gen, lens = generate(model, prefix, bank=bank, layer_banks=lb,
+                         max_new=max_new, stop_id=stop_id, amp=amp)
+    return gen[:, :int(lens[0])]
 
 
 # ── worker ───────────────────────────────────────────────────────────────────
@@ -346,6 +341,9 @@ class Worker:
                     for e in d["envs"]}
         self.min_std = float(r.get("min_reward_std", 1.0e-4))
         self.max_rs = int(r.get("max_resample", 4))
+        # plancher d'exploration du write (amorçage à froid, voir rollout()) :
+        # 0.0 = comportement historique
+        self.explore_floor = float(r.get("explore_floor", 0.0))
         self.casc_depth = int(r.get("cascade_depth", 0))
         self.cmap = r.get("cascade_map") or [0] * int(self.mcfg["n_layers"])
         self.max_mem = int(self.mcfg["max_mem"])
@@ -355,6 +353,11 @@ class Worker:
         self.max_new_env = {e["name"]: int(e.get("max_new", self.max_new))
                             for e in d["envs"]}
         self.amp = bool(r.get("amp", True))
+        # decode_cache : cache KV incrémental pour le décodage des rollouts.
+        # Un rollout est un ÉCHANTILLON — une bascule de routage MoE due aux
+        # ULP y est aussi légitime qu'un autre tirage, alors qu'en éval elle
+        # rendrait les chiffres incomparables. Voir decode.generate.
+        self.decode_cache = bool(r.get("decode_cache", False))
         stop = "<|im_end|>"
         self.stop_id = (self.tok.convert_tokens_to_ids(stop)
                         if stop in self.tok.get_vocab() else -1)
@@ -411,20 +414,63 @@ class Worker:
             time.sleep(self.poll_s)
 
     # ── reward ───────────────────────────────────────────────────────────────
-    def _reward(self, env, ro, lam, info) -> float:
-        if env.reward_fn is None:
-            return -ro["ce"] - lam * ro["n_writes"]
-        lb = _lb(ro["casc"], ro["bank"], self.cmap)
+    def _decode_calls(self, env, cands) -> list[str]:
+        """Le tour d'appel de plusieurs rollouts, décodé EN UN SEUL batch.
+
+        C'est le goulot du worker : chaque token coûtait un forward complet sur
+        tout le préfixe, une ligne à la fois. Les G rollouts d'un groupe partent
+        du même état et décodent le même préfixe — il n'y avait aucune raison de
+        les faire un par un, sinon que la boucle de décodage câblait B=1.
+
+        Les banques ne sont empilables que si elles ont la même forme, et ce
+        n'est pas garanti : une banque grandit d'un slot par write, donc deux
+        rollouts qui n'ont pas écrit autant diffèrent — jusqu'à saturation de
+        `max_mem`, après quoi tous se valent (le cas courant d'une vie établie).
+        On groupe donc par forme : batch quand c'est possible, ligne à ligne
+        quand ça ne l'est pas, jamais faux dans un cas comme dans l'autre.
+        """
         max_new = self.max_new_env.get(env.name, self.max_new)
-        txt = self.tok.decode(decode_lb(self.model, self.a_open, ro["bank"],
-                                        lb, max_new, self.stop_id,
-                                        self.amp)[0].tolist())
+        lbs = [_lb(c["casc"], c["bank"], self.cmap) for c in cands]
+
+        def _sig(i):
+            lb = lbs[i]
+            return (tuple(cands[i]["bank"].shape),
+                    None if lb is None else
+                    tuple(None if x is None else tuple(x.shape) for x in lb))
+
+        buckets = {}
+        for i in range(len(cands)):
+            buckets.setdefault(_sig(i), []).append(i)
+
+        texts: list[str | None] = [None] * len(cands)
+        for idx in buckets.values():
+            bank = torch.cat([cands[i]["bank"] for i in idx], dim=0)
+            ref = lbs[idx[0]]
+            lb = None if ref is None else [
+                None if ref[l] is None
+                else torch.cat([lbs[i][l] for i in idx], dim=0)
+                for l in range(len(ref))]
+            gen, lens = generate(self.model, self.a_open.expand(len(idx), -1),
+                                 bank=bank, layer_banks=lb, max_new=max_new,
+                                 stop_id=self.stop_id, amp=self.amp,
+                                 use_cache=self.decode_cache)
+            for j, i in enumerate(idx):
+                texts[i] = self.tok.decode(gen[j, :int(lens[j])].tolist())
+        return texts
+
+    def _rewards(self, env, cands, lam, info) -> list[float]:
+        if env.reward_fn is None:
+            return [-c["ce"] - lam * c["n_writes"] for c in cands]
         # rubric payload: the LAST episode's gold, whichever family (tool
         # envs read gold_calls, exec envs read tests)
-        return env.reward(ro["ce"], {
-            "text": txt, "n_think": ro["n_writes"],
-            "gold_calls": (info.get("gold_calls") or [[]])[-1],
-            "tests": (info.get("tests") or [[]])[-1]})
+        gold = (info.get("gold_calls") or [[]])[-1]
+        tests = (info.get("tests") or [[]])[-1]
+        return [env.reward(c["ce"], {"text": txt, "n_think": c["n_writes"],
+                                     "gold_calls": gold, "tests": tests})
+                for c, txt in zip(cands, self._decode_calls(env, cands))]
+
+    def _reward(self, env, ro, lam, info) -> float:
+        return self._rewards(env, [ro], lam, info)[0]
 
     # ── one group ────────────────────────────────────────────────────────────
     def one_group(self):
@@ -440,9 +486,11 @@ class Worker:
             forks = mem_fork(life.bank, life.casc, self.G)
             cand = [rollout(self.model, chunks, tgt, self.temp, lam, self.ids,
                             self.rng, fb, fc, life.n_evict, self.seed_slots,
-                            self.max_mem, self.cmap) for fb, fc in forks]
-            for c in cand:
-                c["reward"] = self._reward(env, c, lam, info)
+                            self.max_mem, self.cmap,
+                            explore_floor=self.explore_floor)
+                    for fb, fc in forks]
+            for c, rw in zip(cand, self._rewards(env, cand, lam, info)):
+                c["reward"] = rw
             rs = [c["reward"] for c in cand]
             if st.pstdev(rs) >= self.min_std:
                 keep = cand[self.rng.randrange(self.G)]
@@ -474,7 +522,8 @@ class Worker:
             (fb, fc), = mem_fork(src.bank, src.casc, 1)
             ro = rollout(self.model, chunks, tgt, self.temp, lam, self.ids,
                          _random.Random(0), fb, fc, src.n_evict,
-                         self.seed_slots, self.max_mem, self.cmap)
+                         self.seed_slots, self.max_mem, self.cmap,
+                         explore_floor=self.explore_floor)
             ro["reward"] = self._reward(env, ro, lam, info)
             out[f"r_{tag}"] = ro["reward"]
         args = (own.n_evict, self.seed_slots, self.max_mem, self.cmap)
@@ -683,6 +732,7 @@ class Learner:
 def main(argv):
     role, cfg_path = argv[0], argv[1]
     raw = load_yaml(cfg_path)
+    check_cfg(raw, "rl_disagg")
     if role == "learner":
         Learner(raw).run()
     elif role == "worker":

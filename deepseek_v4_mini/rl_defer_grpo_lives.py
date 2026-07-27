@@ -59,10 +59,22 @@ from .paths import load_yaml
 # ── policy primitives (cascade-aware variants of v1) ────────────────────────
 
 def boundary_step(model, x, bank, think_id, temp, lb=None):
-    """One turn on the carried bank (+ optional cascade layer_banks)."""
-    xt = torch.cat([x, torch.full((1, 1), think_id, dtype=torch.long, device=x.device)], 1)
-    o = model(xt, init_mem=bank, layer_banks=lb)
-    lg = o["logits"].float()[0, x.size(1) - 1]
+    """One turn on the carried bank (+ optional cascade layer_banks).
+
+    Forward du chunk NU. Les logits de la dernière position suffisent pour
+    p(write) — l'attention est causale, un token appondu APRÈS ne peut pas les
+    changer — et surtout le write `o["mem_bank"]` doit être celui du chemin
+    d'entraînement. L'ancienne version appondait un `<think>` au chunk avant le
+    forward : sur un ckpt dont l'embedding `<think>` n'a jamais reçu de gradient
+    (aucune donnée SFT ne le contient), ce token de BRUIT était poolé dans
+    chaque écriture. Mesuré 2026-07-27 (A/B 4 bras, mêmes épisodes, banque
+    écrite à chaque chunk) : tools 3/16 → 0/16 et exec 0.328 → 0.000 en passant
+    du chunk nu au chunk appondu — l'append détruisait la totalité du signal
+    des envs à rubric. Un token de moins par forward, et le write redevient
+    identique à celui de l'éval/du trainer.
+    """
+    o = model(x, init_mem=bank, layer_banks=lb)
+    lg = o["logits"].float()[0, -1]
     logp = F.log_softmax(lg, dim=-1)
     p1 = logp[think_id].exp().clamp(1e-6, 1.0 - 1e-6)
     p_w = torch.sigmoid(torch.logit(p1) / temp).clamp(1e-6, 1.0 - 1e-6)  # Bernoulli temp (v1)
@@ -81,16 +93,35 @@ def _lb(casc, bank, cmap):
 
 @torch.no_grad()
 def rollout(model, chunks, tgt, temp, lam, ids, rng, bank, casc, n_evict,
-            seed_slots, max_mem, cmap):
+            seed_slots, max_mem, cmap, explore_floor: float = 0.0):
     """One sampled trajectory from a FORKED life state. Mutates its own copies
-    only. Stores per-turn detached (bank_in, lb_in) for exact pass-2 replay."""
+    only. Stores per-turn detached (bank_in, lb_in) for exact pass-2 replay.
+
+    `explore_floor` : plancher sur la probabilité de COMPORTEMENT du write,
+    p_b = max(p_w, floor). Amorçage à froid : un ckpt SFT n'a jamais vu
+    `<think>` en sortie, donc p_w ≈ 0.02 — la banque des rollouts reste vide et
+    les envs à rubric rendent 0 partout (pré-vol 2026-07-27 : tools 0/27
+    groupes vivants, writes/rollout 0.2). Le comportement SFT effectif était
+    « écrire chaque seg » : le plancher initialise le comportement près de là,
+    en gardant p_b < 1 pour que les motifs d'écriture DIFFÈRENT entre rollouts
+    — c'est cette diversité qui fabrique la variance intra-groupe du GRPO.
+    `logp_old` enregistre la politique de comportement RÉELLE (le ratio de la
+    passe 2 se corrige off-policy) ; dès que think_row dépasse le plancher, on
+    redevient on-policy sans rien changer. floor=0.0 = comportement historique
+    bit à bit.
+    """
     think_id, blank_id = ids
     recs = []
     for x in chunks:
         lb = _lb(casc, bank, cmap)
         lw, ls, new_bank, p_w = boundary_step(model, x, bank, think_id, temp, lb)
-        a = 1 if rng.random() < float(p_w) else 0
-        recs.append({"x": x, "a": a, "logp_old": float(lw if a else ls),
+        if explore_floor > 0.0 and float(p_w) < explore_floor:
+            p_b = explore_floor
+            l1, l0 = math.log(p_b), math.log1p(-p_b)
+        else:
+            p_b, l1, l0 = float(p_w), float(lw), float(ls)
+        a = 1 if rng.random() < p_b else 0
+        recs.append({"x": x, "a": a, "logp_old": l1 if a else l0,
                      "bank_in": bank.detach(),
                      "lb_in": None if lb is None else [None if t is None else t.detach()
                                                        for t in lb],
@@ -156,6 +187,7 @@ def grpo_backward(model, ref, group, advs, temp, clip_lo, clip_hi, kl_coef,
 
 def main(cfg_path: str) -> None:
     raw = load_yaml(cfg_path)
+    check_cfg(raw, "rl_defer_grpo_lives")
     r, d = raw["rl"], raw["data"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(r.get("seed", 0)))

@@ -76,11 +76,18 @@ data:
     weight: 0.30
     lambda_write: 0.0
     gen:
-      datasets:                          # CC-BY-4.0 / Apache — libres pour
-      - 'nvidia/Nemotron-Agentic-v1#tool_calling'   # l'option open-core
-      - glaiveai/glaive-function-calling-v2
-      # (xlam-60k = gated ; Salesforce/APIGen-MT-5k = CC-BY-NC + clause
-      #  anti-OpenAI : JAMAIS dans le train, éval éventuelle seulement)
+      datasets:                          # CC-BY-4.0 — libre pour l'open-core
+      - 'nvidia/Nemotron-Agentic-v1#tool_calling'
+      # Nemotron SEUL pour le premier cliquet (2026-07-27) : c'est la
+      # distribution où le SFT valsif_stair a ouvert la sélection (33 % de
+      # noms exacts en éval, contre 19 % sur le pool mixte avec glaive — que
+      # le SFT n'a jamais vu). La ressource rare du GRPO tools est l'épisode
+      # « touchable » (~10-15 % des tirages ; dedans, le contraste est bon :
+      # 4-5/8 rollouts positifs) — on maximise leur taux d'abord, glaive
+      # revient quand la politique généralise.
+      # (glaiveai/glaive-function-calling-v2 = Apache, réserve ; xlam-60k =
+      #  gated ; Salesforce/APIGen-MT-5k = CC-BY-NC + clause anti-OpenAI :
+      #  JAMAIS dans le train, éval éventuelle seulement)
       episode_cap: 6000
       max_turn_tok: 192
       max_schema_tok: 256
@@ -112,11 +119,18 @@ rl:
   train_scope: think_row                   # ancre du cliquet ; élargir SEULEMENT
                                            # sur verdict (post-mortem v1 : le
                                            # full-model RL érode le backbone)
-  init_from: ${TB_ROOT}/checkpoints/v350_sft_sota_rw4_tools_exec/step_800.pt   # AJUSTER au ckpt final SFT
+  # Ckpt SFT valsif_stair (2026-07-27) : la gate est OUVERTE dessus — tools
+  # nom exact 10/30 (ablaté 0/30), grade_calls moyen 0.133 avec des tours à
+  # 1.00/0.67/0.33 ; exec 0.222 vs null 0.006. Voir FINDINGS 2026-07-27.
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_valsif_stair/final.pt
   n_lives_per_worker: 2
   max_episodes_per_life: 0
   cascade_depth: 4                         # banque complète V3 (comme le SFT)
-  cascade_map: [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+  # = la map EFFECTIVE du trainer SFT (son défaut, vérifié au --check du run
+  # valsif_stair). L'ancienne valeur [0,0,0,1,1,1,2,2,2,3,3,3] faisait lire la
+  # cascade avec un routage par couche que le ckpt n'a JAMAIS vu à
+  # l'entraînement — les rewards mesurées n'auraient pas été celles du modèle.
+  cascade_map: [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4]
   steps: 1000
   group_size: 8
   groups_per_step: 4
@@ -128,12 +142,24 @@ rl:
   kl_coef: 1.0e-2
   min_reward_std: 1.0e-4
   max_resample: 4
+  # Amorçage à froid de la politique write. Le ckpt SFT n'a jamais émis
+  # <think> (p_w ≈ 0.02 ⇒ banque vide en rollout, tools 0/27 groupes vivants
+  # au pré-vol du 07-27) alors que son comportement d'entraînement était
+  # « écrire chaque seg ». p_b = max(p_w, floor) ; 0.5 et pas 1.0 : la variance
+  # intra-groupe vient de la DIVERSITÉ des motifs d'écriture. logp_old
+  # enregistre le comportement réel ; on redevient on-policy dès que think_row
+  # dépasse le plancher. Voir rollout().
+  explore_floor: 0.5
   grad_clip: 1.0
   save_every: 50
   think_nmax: 8
   think_floor: 0.4
   max_new: 64
   amp: true
+  decode_cache: true                       # rollout = un ÉCHANTILLON : une
+                                           # bascule MoE due aux ULP y est aussi
+                                           # légitime qu'un autre tirage (déc.
+                                           # 07-25) ; ×1.6 sur le goulot worker
   disagg:
     root: ${TB_ROOT}/rl/disagg_350m
     publish_every: 1
