@@ -387,30 +387,56 @@ def run_time(raw, a):
         from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
         if a.batch != 1:
             sys.exit("[bench] --cuda-graphs : B == 1 requis (gate MoE dense)")
-        runner = GraphDecodeRunner(model, bank)
+        amp = None if a.amp == "none" else a.amp
+        runner = GraphDecodeRunner(model, bank, amp=amp)
         if runner.eager_only:
             print("[bench] --cuda-graphs sur CPU : dégradation eager annoncée "
                   "(la capture attend un GPU libre)")
-        runner.step(prefix)                                 # préfixe + warmup
-        fed = prefix[:, -1:]
-        t0 = time.perf_counter()
-        if a.device == "cuda":
-            torch.cuda.synchronize()
-            e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
-            e0.record()
-        for _ in range(a.tokens):
+        # HORS chrono : préfixe, warmup mono-token, cycle de capture — le
+        # chrono ne mesure que le régime établi. (Le 23,4 ms/token du
+        # 2026-07-27 amortissait warmup + captures sur les 192 tokens.)
+        o = runner.step(prefix)
+        fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+        budget = runner.warmup + 3 * runner.lcm + 8
+        while (not runner.eager_only and len(runner.graphs) < runner.lcm
+               and budget > 0):
             o = runner.step(fed)
             fed = o["logits"][:, -1].argmax(-1, keepdim=True)
-        if a.device == "cuda":
-            e1.record()
-            torch.cuda.synchronize()
-            dt = e0.elapsed_time(e1) / 1e3
-        else:
-            dt = time.perf_counter() - t0
-        runner.close()
-        print(f"graphs     {a.tokens / dt:.2f} tok/s  "
+            budget -= 1
+        label = "graphs+bf16" if amp else "graphs"
+
+        def _clock(fn):
+            if a.device == "cuda":
+                torch.cuda.synchronize()
+                e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+                e0.record()
+                fn()
+                e1.record()
+                torch.cuda.synchronize()
+                return e0.elapsed_time(e1) / 1e3
+            t0 = time.perf_counter()
+            fn()
+            return time.perf_counter() - t0
+
+        state = {"fed": fed}
+
+        def _steps():
+            f = state["fed"]
+            for _ in range(a.tokens):
+                o = runner.step(f)
+                f = o["logits"][:, -1].argmax(-1, keepdim=True)
+            state["fed"] = f
+
+        dt = _clock(_steps)
+        print(f"{label}/step   {a.tokens / dt:.2f} tok/s  "
               f"({1e3 * dt / a.tokens:.1f} ms/token)"
               + ("  [eager fallback]" if runner.eager_only else ""))
+        # bras chaîné : argmax DANS le graph, zéro aller-retour host par token
+        if not runner.eager_only and len(runner.graphs) == runner.lcm:
+            dt = _clock(lambda: runner._chain(state["fed"], a.tokens))
+            print(f"{label}/chain  {a.tokens / dt:.2f} tok/s  "
+                  f"({1e3 * dt / a.tokens:.1f} ms/token)")
+        runner.close()
 
     for use_cache in arms:
         generate(model, prefix, bank=bank, max_new=4, stop_id=None,
@@ -461,6 +487,8 @@ def main(argv=None):
     p.add_argument("--time", action="store_true", help="chrono (GPU gardé)")
     p.add_argument("--cuda-graphs", dest="cuda_graphs", action="store_true",
                    help="bras GraphDecodeRunner dans --time (eager sur CPU)")
+    p.add_argument("--amp", default="none", choices=("none", "bf16"),
+                   help="autocast bf16 dans le bras --cuda-graphs (classe ULP)")
     p.add_argument("--force", action="store_true")
     p.add_argument("--fingerprint", action="store_true")
     p.add_argument("--ab-check", dest="ab_check", action="store_true")
