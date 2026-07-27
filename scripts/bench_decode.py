@@ -159,16 +159,25 @@ def _mk_model(raw: dict, a, flags: list[str], dtype=None):
 
     torch.manual_seed(a.seed)
     model = ThoughtBankLM(cfg).eval()
-    if a.ckpt:
-        ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-        sd = ck.get("model", ck)
-        model.load_state_dict({k.replace("_orig_mod.", ""): v
-                               for k, v in sd.items()})
     for p in model.parameters():
         p.requires_grad_(False)
     if dtype is not None:
         model = model.to(dtype)
+    # sur GPU AVANT le load : le load_state_dict copie alors NFS→GPU tenseur
+    # par tenseur. Avec mmap, le pic RAM CPU reste ~1 tenseur — un torch.load
+    # plein de 3+ Go sur un rig déjà chargé, c'est la tempête de swap
+    # documentée dans gpu_worker.sh.
     model = model.to(a.device)
+    if a.ckpt:
+        try:
+            ck = torch.load(a.ckpt, map_location="cpu", weights_only=False,
+                            mmap=True)
+        except (TypeError, RuntimeError):
+            ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
+        sd = ck.get("model", ck)
+        model.load_state_dict({k.replace("_orig_mod.", ""): v
+                               for k, v in sd.items()})
+        del ck, sd
 
     g = torch.Generator().manual_seed(a.bank_seed)
     bank = torch.rand(a.batch, cfg.max_mem, cfg.mem_dim, generator=g)
@@ -328,24 +337,32 @@ def run_ab(raw, a):
 
 def _gpu_guard(force: bool):
     """Un seul run par GPU — refuse si quoi que ce soit tourne déjà.
-    Sous WSL2 nvidia-smi peut être aveugle : on double avec pgrep."""
+    Sous WSL2 nvidia-smi peut être aveugle : on double avec pgrep.
+
+    Sous un slot de la ferme (CUDA_VISIBLE_DEVICES posé par gpu_worker.sh sur
+    UN index), le jugement se limite à CE GPU : les autres cartes du rig
+    portent leurs propres runs, et pgrep les verrait toujours."""
     busy = []
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    slot = cvd.isdigit()                      # un index nu = slot ferme
+    smi = ["nvidia-smi"] + (["-i", cvd] if slot else []) + \
+          ["--query-compute-apps=pid,process_name", "--format=csv,noheader"]
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,process_name",
-             "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+        out = subprocess.run(smi, capture_output=True, text=True,
+                             timeout=10).stdout.strip()
         if out:
             busy.append(f"nvidia-smi: {out}")
     except (OSError, subprocess.TimeoutExpired) as e:
         busy.append(f"nvidia-smi injoignable ({e}) — impossible de prouver "
                     f"que le GPU est libre")
-    pg = subprocess.run(
-        ["pgrep", "-af", "deepseek_v4_mini|rl_disagg|code_defer_native"],
-        capture_output=True, text=True).stdout.strip()
-    pg = "\n".join(l for l in pg.splitlines() if str(os.getpid()) not in l.split()[:1])
-    if pg:
-        busy.append(f"pgrep: {pg}")
+    if not slot:
+        pg = subprocess.run(
+            ["pgrep", "-af", "deepseek_v4_mini|rl_disagg|code_defer_native"],
+            capture_output=True, text=True).stdout.strip()
+        pg = "\n".join(l for l in pg.splitlines()
+                       if str(os.getpid()) not in l.split()[:1])
+        if pg:
+            busy.append(f"pgrep: {pg}")
     if busy and not force:
         sys.exit("[bench] GPU refusé (règle un-run-par-GPU) :\n  "
                  + "\n  ".join(busy) + "\n--force pour outrepasser SCIEMMENT.")
