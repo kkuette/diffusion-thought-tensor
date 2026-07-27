@@ -97,6 +97,45 @@ colonne concaténée (~7 ops→1 par appel, ULP), `_win_push` en ring buffer
 (ordre de sommation), `bool(done.all())` de generate (1 sync/token, utile
 seulement avec `stop_id`).
 
+**LIVRÉ (même jour, branche `perf/decode-dispatch`, 9 commits).** Mesures au
+même census (toy structurel v350, cache KV, régime établi, B=1) :
+
+| bras | ops/fwd | delta |
+|---|---|---|
+| baseline (decode_cache seul) | 12 865 | — |
+| + `decode_fuse` + `decode_dense_moe` + `decode_static_cache` | 12 355 | −4 % (et −~190 syncs GPU/token, invisibles au census CPU) |
+| + `sinkhorn_closed_form` (flag existant, décision de config) | **9 787** | **−24 %** |
+| + CUDA graphs (runner prêt, capture non validée) | ~0 lancement/replay attendu | à chiffrer au premier GPU libre |
+
+Preuve « une config existante reproduit à l'octet », trois étages, tous verts :
+les self-tests étendus (attention/moe/model/decode, `torch.equal` float64 ET
+float32, top-k neutralisés ET durs), `--ab-check` sur le vrai stack
+(B∈{1,2} × 5 préfixes × cache on/off), et TROIS fingerprints identiques par
+bras (sha256 des logits float64) : branche mère `chore/durcissement-pre-run`
+== `perf/decode-dispatch` flags OFF == flags ON. 24 modules selftest verts.
+
+Trois découvertes de chantier, payées en mesures :
+1. **Le dispatch dense MoE n'est bit-exact qu'à BT=1** : à BT≥2 la boucle
+   historique évalue chaque expert sur un SOUS-ENSEMBLE des lignes, et un GEMM
+   M=1 vs M=2 ne rend pas les mêmes bits (rel ~1.2e-16 float64 CPU — kernels
+   BLAS). Gate resserré à BT==1 (l'éval greedy en profite, les rollouts
+   batchés gardent la boucle) ; témoin de l'écart DANS le self-test moe.
+2. **La largeur du candidat set change la sélection du top-k CSA** : les ex
+   æquo du relu (scores 0.0 EXACTS, régime permanent) se départagent par une
+   règle interne dépendante de la largeur — présenter le buffer statique plein
+   au lieu de nbf candidats divergeait de O(1) au décodage. Le mode statique
+   NARROW donc aux largeurs historiques (bit-exact prouvé) ; idem HCA (softmax
+   élargi = autre arbre de sommation, ~5e-15).
+3. **Conséquence pour les CUDA graphs** : les shapes pleines fixes sont de
+   classe ULP par nature (points 1-2) — le runner `decode_graphs` est donc un
+   OBJET opt-in (largeur pleine + comptabilité de blocs en tenseurs device +
+   injection RoPE), même statut que `decode_cache` : rollouts RL oui, évals
+   comparées non. Son self-test CPU prouve le proxy de capturabilité
+   (signature ops+shapes constante par phase sur 2×lcm pas) ; la capture
+   réelle et le chrono attendent un GPU libre :
+   `python scripts/bench_decode.py <cfg> --real --ckpt <pt> --time --device cuda --cuda-graphs --flags all`
+   (gardé par nvidia-smi+pgrep, un-run-par-GPU).
+
 ---
 
 ## 2026-07-27 — run `valsif_stair` (2000 steps) : la SÉLECTION depuis la banque S'OUVRE — 10/30 noms d'outils contre 0/30 sans banque, codeexec 0.222 contre un null à 0.006 — et le mur du 07-26 tombe
