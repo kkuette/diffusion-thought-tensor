@@ -2,9 +2,19 @@
 
 Le décodage caché du 386M reste launch-bound après les flags eager (~12.4k ops
 aten/token, FINDINGS 2026-07-27) : le levier qui absorbe TOUT le compte d'ops
-est de rejouer le pas de décodage comme un CUDA graph. Ce module prépare cette
-capture ; le chrono et la validation GPU attendent un GPU libre (règle
-un-run-par-GPU).
+est de rejouer le pas de décodage comme un CUDA graph. Validé sur rig
+(2026-07-27) : 135,3 → 23,4 ms/token, et le reliquat était le python de la
+boucle (argmax host, remplissage RoPE, copies) — d'où le graph ÉTENDU :
+
+  graph = [ tête RoPE ] → forward → [ argmax → chaînage → comptabilité ]
+
+  * tête : cos/sin lus DANS le graph par index_select sur un compteur de
+    position device (`_pos_dev`) — plus aucun remplissage host par token ;
+  * queue : argmax des logits, le token produit est recopié dans le buffer
+    d'entrée partagé (`_in_buf`) — le graph suivant le consomme tel quel —,
+    journalisé dans `_out_toks[_wptr]`, et les compteurs device avancent ;
+  * `_chain(fed, n)` : n × `graph.replay()`, ZÉRO aller-retour host — le mode
+    de croisière de `decode()` quand stop_id est None.
 
 Ce que la capture exige, et comment c'est obtenu :
 
@@ -12,12 +22,19 @@ Ce que la capture exige, et comment c'est obtenu :
     statiques (`enter_full_width`) : toutes les largeurs valent `cap`, la
     comptabilité des blocs fermés passe par des tenseurs device (index_copy_ /
     index_fill_ / add_) — le python ne tourne pas au replay ;
-  * aucun scalaire python baké → la position RoPE est INJECTÉE via deux
-    buffers statiques (attention._ROPE_OVERRIDE) remplis avant chaque replay ;
+  * aucun scalaire python baké → position et RoPE vivent en tenseurs device
+    (tête de graph), l'injection passe par attention._ROPE_OVERRIDE ;
   * aucune shape data-dependent → exige les flags decode_fuse +
     decode_dense_moe + decode_static_cache, et B == 1 (le gate du MoE dense) ;
   * une banque EXPLICITE (init_mem non None) : un torch.rand de seed_bank
-    capturé rejouerait la même « randomness » à chaque token.
+    capturé rejouerait la même « randomness » à chaque token ;
+  * la capture ENREGISTRE sans exécuter (sémantique cudaStreamBeginCapture) :
+    chaque capture est suivie d'un replay immédiat qui exécute réellement le
+    pas (sorties + mutations de cache + compteurs).
+
+Bras bf16 (`amp="bf16"`) : autocast CUDA avec cache_enabled=False (la
+contrainte documentée pour capturer sous autocast). Même statut opt-in que le
+reste — un rollout RL le prend, une éval comparée non.
 
 CE QUE LE MODE LARGEUR PLEINE CHANGE (classe ULP, comme decode_cache — c'est
 pour ça que le runner est un OBJET à construire explicitement, pas un flag de
@@ -38,6 +55,7 @@ silencieux (piège WSL2 connu).
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import warnings
 
@@ -56,12 +74,19 @@ class GraphDecodeRunner:
 
     Sur CPU (ou si la capture échoue) : eager pur en mode statique NORMAL,
     strictement identique à decode.generate — c'est le self-test. La bascule
-    largeur pleine + graphs n'arme que sur CUDA, après `warmup` tokens eager
-    (fenêtres pleines, k CSA saturé, régime de fermeture établi).
+    largeur pleine + graphs n'arme que sur CUDA, après `warmup` pas MONO-token
+    eager (fenêtres pleines, kernels S=1 chauffés — indispensable sous
+    autocast : une première exécution de GEMM pendant la capture alloue du
+    workspace cublas, interdit).
+
+    `amp="bf16"` : forward sous autocast bf16 (cache_enabled=False, la forme
+    capturable). Classe ULP assumée — les logits changent, le greedy peut
+    dévier. `chain=False` désactive le mode croisière `_chain` (diagnostic).
     """
 
     def __init__(self, model, bank: torch.Tensor, *, layer_banks=None,
-                 warmup: int = 32) -> None:
+                 warmup: int = 32, amp: str | None = None,
+                 chain: bool = True) -> None:
         cfg = model.cfg
         missing = [f for f in ("decode_fuse", "decode_dense_moe",
                                "decode_static_cache")
@@ -75,10 +100,14 @@ class GraphDecodeRunner:
                 "GraphDecodeRunner exige une banque EXPLICITE : le torch.rand "
                 "de seed_bank capturé dans un graph rejouerait la même "
                 "« randomness » à chaque token")
+        if amp not in (None, "bf16"):
+            raise ValueError(f"amp={amp!r} : seul 'bf16' (ou None) est supporté")
         self.model = model
         self.bank = bank
         self.layer_banks = layer_banks
         self.warmup = int(warmup)
+        self.amp = amp
+        self.chain = bool(chain)
         self.lcm = math.lcm(int(cfg.csa_m), int(cfg.hca_m))
         self.d_head = int(cfg.d_head)
         # une génération entière doit tenir dans les caches statiques
@@ -86,13 +115,18 @@ class GraphDecodeRunner:
 
         self.cache = None       # posé au premier step (préfixe)
         self.pos = 0
-        self.graphs: dict[int, tuple] = {}   # phase -> (graph, in_buf, out_buf)
+        self._singles = 0       # pas mono-token déjà servis en eager (warmup)
+        self.graphs: dict[int, tuple] = {}   # phase -> (graph, out)
         # Le juge est le DEVICE DU MODÈLE (via la banque), pas
         # cuda.is_available() : sur une machine dont le GPU est occupé par un
         # autre run, un décodage CPU ne doit JAMAIS créer de contexte CUDA
         # (torch.cuda.CUDAGraph en crée un — ~centaines de Mo de VRAM chez le
         # voisin, règle un-run-par-GPU).
         self.eager_only = not (bank.is_cuda and torch.cuda.is_available())
+        if self.amp and self.eager_only:
+            warnings.warn("amp='bf16' ignoré : le modèle n'est pas sur CUDA "
+                          "(autocast bf16 n'arme qu'avec les graphs)",
+                          stacklevel=2)
         self._rope_bufs = None
         self._full = False
 
@@ -110,8 +144,10 @@ class GraphDecodeRunner:
             raise RuntimeError(f"génération > max_seq_len={self.max_pos} : "
                                f"les caches statiques sont dimensionnés dessus")
 
-        if self.eager_only or self.pos + fed.size(1) <= self.warmup or fed.size(1) > 1:
+        if self.eager_only or fed.size(1) > 1 or self._singles < self.warmup:
             out = self._eager(fed)
+            if fed.size(1) == 1:
+                self._singles += 1
         else:
             if not self._full:
                 self._enter_full()
@@ -126,13 +162,26 @@ class GraphDecodeRunner:
     def decode(self, prefix: torch.Tensor, *, max_new: int = 48,
                stop_id: int | None = None):
         """Greedy, une ligne. Rend (gen [1, n], len utile) — contrat trim-é
-        de decode.generate, sans la machinerie multi-lignes."""
+        de decode.generate, sans la machinerie multi-lignes.
+
+        Mode croisière : dès que les lcm phases sont capturées et que stop_id
+        est None (pas de test d'arrêt ⇒ pas de sync par token), le reste de la
+        génération part en `_chain` — replays purs, argmax dans le graph."""
         toks = []
         fed = prefix
-        for _ in range(max_new):
-            nt = self.step(fed)["logits"][:, -1].argmax(-1, keepdim=True)
+        left = max_new
+        while left > 0:
+            if (stop_id is None and self.chain and self._full
+                    and not self.eager_only and len(self.graphs) == self.lcm
+                    and fed.size(1) == 1):
+                toks.append(self._chain(fed, left))
+                left = 0
+                break
+            out = self.step(fed)
+            nt = out["logits"][:, -1].argmax(-1, keepdim=True)
             toks.append(nt)
             fed = nt
+            left -= 1
             if stop_id is not None and int(nt) == stop_id:
                 break
         gen = torch.cat(toks, dim=1)
@@ -140,9 +189,18 @@ class GraphDecodeRunner:
 
     # ── chemins internes ─────────────────────────────────────────────────────
 
+    def _autocast(self):
+        if self.amp is None or self.eager_only:
+            return contextlib.nullcontext()
+        # cache_enabled=False : la contrainte documentée pour capturer sous
+        # autocast (le cache de recast d'autocast ne survit pas à un graph)
+        return torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
+
     def _eager(self, fed):
-        return self.model(fed, init_mem=self.bank, layer_banks=self.layer_banks,
-                          write=False, cache=self.cache)
+        with self._autocast():
+            return self.model(fed, init_mem=self.bank,
+                              layer_banks=self.layer_banks,
+                              write=False, cache=self.cache)
 
     def _enter_full(self):
         for c in self.cache:
@@ -151,15 +209,37 @@ class GraphDecodeRunner:
         dev = self.bank.device
         self._rope_bufs = (torch.zeros(1, half, device=dev),
                            torch.zeros(1, half, device=dev))
+        # table RoPE forcée à pleine capacité PUIS référencée : la tête de
+        # graph la lit par index_select — si _rope_at_cached la reconstruisait
+        # plus tard, le graph pointerait sur l'ancien storage. Capacité ≥
+        # max_pos + garde-fou step() sur max_pos ⇒ jamais de reconstruction.
+        _rope_at_cached(self.max_pos - 1, 1, self.d_head, dev)
+        self._rope_tab = attention._ROPE_TABLES[(str(dev), self.d_head)]
+        # buffers du graph étendu : entrée partagée entre toutes les phases
+        # (le tail de l'une nourrit la tête de la suivante), journal des
+        # tokens produits, compteurs device (le python ne tourne pas au replay)
+        self._in_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
+        self._out_toks = torch.zeros(self.max_pos, dtype=torch.long, device=dev)
+        self._wptr = torch.zeros(1, dtype=torch.long, device=dev)
+        self._pos_dev = torch.tensor([self.pos], dtype=torch.long, device=dev)
         self._full = True
 
-    def _fill_rope(self):
-        cos, sin = _rope_at_cached(self.pos, 1, self.d_head, self.bank.device)
-        self._rope_bufs[0].copy_(cos)
-        self._rope_bufs[1].copy_(sin)
+    def _graph_head(self):
+        """Tête de graph : cos/sin de la position courante, lus depuis la
+        table par le compteur device — remplace le remplissage host par token."""
+        self._rope_bufs[0].copy_(self._rope_tab[0].index_select(0, self._pos_dev))
+        self._rope_bufs[1].copy_(self._rope_tab[1].index_select(0, self._pos_dev))
+
+    def _graph_tail(self, out):
+        """Queue de graph : argmax, chaînage token→token, comptabilité device."""
+        nt = out["logits"][:, -1].argmax(-1)            # [1]
+        self._in_buf.copy_(nt.unsqueeze(0))             # le graph suivant lit ça
+        self._out_toks.index_copy_(0, self._wptr, nt)
+        self._wptr.add_(1)
+        self._pos_dev.add_(1)
 
     def _capture(self, phase, fed):
-        """Capture le graph de cette phase, puis le REJOUE aussitôt.
+        """Capture le graph étendu de cette phase, puis le REJOUE aussitôt.
 
         La capture ENREGISTRE sans exécuter (sémantique cudaStreamBeginCapture) :
         sans le replay immédiat, la sortie rendue serait de la mémoire jamais
@@ -167,8 +247,7 @@ class GraphDecodeRunner:
         fermetures de bloc) n'auraient jamais lieu. Échec ⇒ fallback eager
         définitif, bruyant."""
         try:
-            in_buf = fed.clone()
-            self._fill_rope()
+            self._in_buf.copy_(fed)
             attention._ROPE_OVERRIDE = self._rope_bufs
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
@@ -177,11 +256,13 @@ class GraphDecodeRunner:
             # mêmes adresses — d'où la capture DANS L'ORDRE du premier cycle
             pool = getattr(self, "_pool", None)
             with torch.cuda.graph(g, pool=pool):
-                out = self._eager(in_buf)
+                self._graph_head()
+                out = self._eager(self._in_buf)
+                self._graph_tail(out)
             g.replay()                  # exécuter RÉELLEMENT le pas capturé
             torch.cuda.synchronize()    # faire surfacer ICI toute erreur de
             self._pool = g.pool() if pool is None else pool   # capture différée
-            self.graphs[phase] = (g, in_buf, out)
+            self.graphs[phase] = (g, out)
             return out
         except Exception as e:                      # noqa: BLE001 — piège WSL2
             import traceback
@@ -202,11 +283,28 @@ class GraphDecodeRunner:
                 attention._ROPE_OVERRIDE = None
 
     def _replay(self, phase, fed):
-        g, in_buf, out = self.graphs[phase]
-        in_buf.copy_(fed)
-        self._fill_rope()
+        g, out = self.graphs[phase]
+        # redondant en chaîne (le tail du graph précédent a déjà posé le token)
+        # mais nécessaire en pilotage python — même valeur dans les deux cas
+        self._in_buf.copy_(fed)
         g.replay()
         return out
+
+    @torch.no_grad()
+    def _chain(self, fed: torch.Tensor, n: int) -> torch.Tensor:
+        """n tokens en replays PURS — zéro aller-retour host. Le premier replay
+        consomme `fed`, chaque tail nourrit la tête suivante ; les tokens
+        sortent de `_out_toks` (une lecture device, la sync arrive quand
+        l'appelant matérialise). Exige les lcm phases capturées."""
+        if self.pos + n > self.max_pos:
+            raise RuntimeError(f"chaîne de {n} tokens > max_seq_len="
+                               f"{self.max_pos} depuis pos {self.pos}")
+        self._in_buf.copy_(fed)
+        self._wptr.zero_()
+        for _ in range(n):
+            self.graphs[self.pos % self.lcm][0].replay()
+            self.pos += 1
+        return self._out_toks[:n].unsqueeze(0).clone()
 
     def close(self):
         """Rend la main proprement (l'override RoPE est module-level)."""
@@ -217,17 +315,19 @@ class GraphDecodeRunner:
 
 def _selftest() -> None:
     """Ce qui est prouvable sans GPU :
-      1. le runner refuse les configs sans flags, et l'absence de banque ;
+      1. le runner refuse les configs sans flags, l'absence de banque, un amp
+         inconnu — et prévient qu'amp n'arme pas sur CPU ;
       2. sur CPU il dégrade en eager et rend EXACTEMENT decode.generate ;
       3. l'injection RoPE est bit-identique au calcul en place ;
-      4. en mode largeur pleine, le POINT DE CAPTURE est atteignable : les
-         shapes et le compte d'ops de chaque pas sont CONSTANTS par phase sur
-         deux cycles lcm — le proxy CPU de la capturabilité ;
+      4. le PROGRAMME DU GRAPH ÉTENDU (tête RoPE → forward → queue argmax/
+         chaînage) a des ops et shapes CONSTANTS par phase sur deux cycles
+         lcm — le proxy CPU de la capturabilité ;
       5. la comptabilité device des blocs (idx/index_copy_) ferme les mêmes
-         blocs que la comptabilité python.
+         blocs que la comptabilité python ;
+      6. le chaînage émulé (le programme du graph rejoué en boucle depuis
+         _in_buf) rend EXACTEMENT les tokens du pilotage python en largeur
+         pleine, et ses compteurs device tombent juste.
     """
-    from collections import Counter
-
     from torch.utils._python_dispatch import TorchDispatchMode
 
     from .config import ThoughtBankConfig
@@ -259,6 +359,18 @@ def _selftest() -> None:
         raise SystemExit("bank=None aurait dû être refusé")
     except ValueError as e:
         assert "seed_bank" in str(e)
+    try:
+        GraphDecodeRunner(m_on, bank, amp="fp16")
+        raise SystemExit("amp='fp16' aurait dû être refusé")
+    except ValueError as e:
+        assert "bf16" in str(e)
+    with warnings.catch_warnings(record=True) as wlog:
+        warnings.simplefilter("always")
+        r_amp = GraphDecodeRunner(m_on, bank, amp="bf16")
+    assert any("ignoré" in str(x.message) for x in wlog), \
+        "amp sur CPU doit prévenir qu'il n'arme pas"
+    assert isinstance(r_amp._autocast(), contextlib.nullcontext), \
+        "amp sur CPU (eager_only) doit rester un nullcontext"
 
     # 2. CPU ⇒ eager, tokens == generate (bit, float64, top-k durs compris)
     pr = torch.randint(0, 61, (1, 5))
@@ -288,8 +400,9 @@ def _selftest() -> None:
                 attention._ROPE_OVERRIDE = None
             assert torch.equal(a, b), f"injection RoPE ≠ calcul en place (pos {i})"
 
-    # 4. largeur pleine : ops et shapes CONSTANTS par phase sur 2 cycles —
-    #    le proxy CPU de « ce pas est capturable dans un CUDA graph »
+    # 4. largeur pleine : le programme du graph ÉTENDU (tête → forward →
+    #    queue) a des ops et shapes CONSTANTS par phase sur 2 cycles — le
+    #    proxy CPU de « ce pas est capturable dans un CUDA graph »
     class ShapeProbe(TorchDispatchMode):
         def __init__(self):
             super().__init__()
@@ -306,31 +419,34 @@ def _selftest() -> None:
 
     lcm = math.lcm(3, 5)
     runner2 = GraphDecodeRunner(m_on, bank, warmup=4)
-    runner2.step(pr)                                # préfixe (eager)
-    fed = torch.randint(0, 61, (1, 1))
-    while runner2.pos < 4 + 2:                      # sort du warmup en eager…
-        runner2.step(fed)
-    # …puis on force la bascule largeur pleine SANS CUDA (test structurel)
-    if not runner2._full:
+    with torch.no_grad():
+        runner2.step(pr)                            # préfixe (eager)
+        fed = torch.randint(0, 61, (1, 1))
+        for _ in range(4):                          # warmup mono-token eager
+            runner2.step(fed)
+        # …puis bascule largeur pleine SANS CUDA (test structurel) : on rejoue
+        # à la main le programme que _capture mettrait dans le graph
         runner2._enter_full()
-        runner2.eager_only = True                   # pas de capture sur CPU
-    sigs = {}
-    for _ in range(2 * lcm):
-        probe = ShapeProbe()
-        runner2._fill_rope()
-        attention._ROPE_OVERRIDE = runner2._rope_bufs
-        try:
-            with probe:
-                runner2.step(fed)
-        finally:
-            attention._ROPE_OVERRIDE = None
-        ph = (runner2.pos - 1) % lcm
-        if ph in sigs:
-            assert sigs[ph] == probe.sig, (
-                f"phase {ph} : la signature d'ops/shapes change entre deux "
-                f"cycles — pas capturable")
-        else:
-            sigs[ph] = probe.sig
+        runner2._in_buf.copy_(fed)
+        sigs = {}
+        for _ in range(2 * lcm):
+            probe = ShapeProbe()
+            attention._ROPE_OVERRIDE = runner2._rope_bufs
+            try:
+                with probe:
+                    runner2._graph_head()
+                    out = runner2._eager(runner2._in_buf)
+                    runner2._graph_tail(out)
+            finally:
+                attention._ROPE_OVERRIDE = None
+            ph = runner2.pos % lcm
+            runner2.pos += 1
+            if ph in sigs:
+                assert sigs[ph] == probe.sig, (
+                    f"phase {ph} : la signature d'ops/shapes change entre deux "
+                    f"cycles — pas capturable")
+            else:
+                sigs[ph] = probe.sig
     assert len(sigs) == lcm
     runner2.close()
 
@@ -341,11 +457,52 @@ def _selftest() -> None:
     assert idxs == [c.count for c in runner2.cache], (idxs,
         [c.count for c in runner2.cache])
 
-    print(f"decode_graphs self-test: OK (refus sans flags/banque, eager CPU == "
-          f"generate au bit, injection RoPE bit-identique, largeur pleine : "
-          f"signature ops+shapes CONSTANTE par phase sur 2×lcm={2 * lcm} pas "
-          f"(proxy de capturabilité), comptabilité de blocs device == python ; "
-          f"la capture réelle attend un GPU libre)")
+    # 6. chaînage émulé == pilotage python (largeur pleine, greedy, au bit) :
+    #    deux runners jumeaux, même préfixe, même warmup ; l'un piloté par
+    #    argmax python, l'autre par le programme du graph bouclé sur _in_buf
+    ra = GraphDecodeRunner(m_on, bank, warmup=2)
+    rb = GraphDecodeRunner(m_on, bank, warmup=2)
+    pr2 = torch.randint(0, 61, (1, 4))
+    with torch.no_grad():
+        f = None
+        for r in (ra, rb):
+            o = r.step(pr2)
+            f = o["logits"][:, -1].argmax(-1, keepdim=True)
+            for _ in range(2):
+                o = r.step(f)
+                f = o["logits"][:, -1].argmax(-1, keepdim=True)
+            r._enter_full()
+        pos0 = int(rb._pos_dev)
+        n = 9
+        toks_a, fa = [], f.clone()
+        for _ in range(n):                          # bras python
+            o = ra._eager(fa)
+            fa = o["logits"][:, -1].argmax(-1, keepdim=True)
+            toks_a.append(fa)
+        rb._in_buf.copy_(f)                         # bras « graph émulé »
+        rb._wptr.zero_()
+        for _ in range(n):
+            attention._ROPE_OVERRIDE = rb._rope_bufs
+            try:
+                rb._graph_head()
+                o = rb._eager(rb._in_buf)
+                rb._graph_tail(o)
+            finally:
+                attention._ROPE_OVERRIDE = None
+    assert torch.equal(torch.cat(toks_a, dim=1).view(-1), rb._out_toks[:n]), (
+        "chaînage émulé ≠ pilotage python\n"
+        f"  python : {torch.cat(toks_a, dim=1).view(-1)}\n"
+        f"  chaîne : {rb._out_toks[:n]}")
+    assert int(rb._wptr) == n and int(rb._pos_dev) == pos0 + n, \
+        "compteurs device du chaînage faux"
+    ra.close(); rb.close()
+
+    print(f"decode_graphs self-test: OK (refus sans flags/banque/amp inconnu, "
+          f"eager CPU == generate au bit, injection RoPE bit-identique, "
+          f"programme du graph étendu : signature ops+shapes CONSTANTE par "
+          f"phase sur 2×lcm={2 * lcm} pas, comptabilité de blocs device == "
+          f"python, chaînage émulé == pilotage python au bit ; la capture "
+          f"réelle attend un GPU libre)")
 
 
 if __name__ == "__main__":
