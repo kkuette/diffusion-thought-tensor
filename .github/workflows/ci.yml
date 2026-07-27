@@ -31,6 +31,13 @@ jobs:
         run: |
           python scripts/farm/rl_status.py
           python scripts/farm/farm_dashboard.py --selftest
+          # Le front est un module ES servi tel quel (aucun build) : sa seule
+          # barrière contre une faute de frappe est ce contrôle de syntaxe.
+          if command -v node >/dev/null; then
+            node --check scripts/farm/web/dashboard.mjs
+          else
+            echo "node absent — contrôle de syntaxe du front sauté"
+          fi
 
       - name: Dépendances (torch CPU — les tests ne touchent pas au GPU)
         run: |

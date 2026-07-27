@@ -58,19 +58,36 @@ Dashboard : `http://<IP_VM_DATA>:8787` (service `tb-dashboard`, installé par
 `setup_dashboard.sh`). Il agrège les `status/*.json` des rigs (service
 `tb-agent`), la file de jobs, et **les runs RL de `rl/*/`**.
 
+Un bandeau collant en haut répond à « ça va ? » sans scroller : une pastille par
+nœud, une par run RL vivant avec son step, la file, les échecs. Le reste est en
+cartes, sur une grille qui se réorganise avec la largeur de l'écran ; l'état de
+santé se lit à la bordure gauche de chaque carte.
+
 Pretraining : dernier step, `ic`, s/step, et le dernier GAP par domaine.
 
 RL désagrégé : le learner ne passe pas par la file (il tourne à la main sur la
-3090) — il est lu via ses JSONL, pas via un log. Sont affichés le step et la
-progression, reward/kl/write%/p(w) avec micro-courbe et flèche de tendance, le
-lag de politique par worker, le débit, la file de rollouts, et le **découpage
-par environnement** — dont le `grade` (taux d'appels justes, pass-rate exec)
-qui est le vrai suivi, le reward agrégé mélangeant des échelles incompatibles.
+3090) — il est lu via ses JSONL, pas via un log. La carte du run donne le step
+et sa progression, cinq tuiles (reward, ce, write%, lag, s/step) avec
+micro-courbe et flèche de tendance, puis le **découpage par environnement** —
+dont le `grade` (taux d'appels justes, pass-rate exec) qui est le vrai suivi, le
+reward agrégé mélangeant des échelles incompatibles.
+
+La flèche de tendance porte une polarité : un reward qui monte est vert, une
+entropie croisée qui monte est rouge, `write%` reste neutre (la politique
+d'écriture est ce que le RL doit trouver, pas une note).
+
+Les workers RL n'apparaissent qu'**une fois**, dans la carte du run, avec le nom
+de leur job. Un job `rl_worker` qui n'a écrit aucune métrique n'est pas masqué
+pour autant : il reste dans « jobs actifs », puisque c'est justement celui qu'il
+faut voir.
 
 Un worker RL n'imprime quasiment rien sur stdout : ne pas juger sa santé à son
 `.workerlog`. Son horloge, c'est son JSONL, et le seuil de silence est calé sur
 son débit (un step learner 350M dure ~13 min : le seuil fixe de 300 s des jobs
 de pretraining y voyait une panne permanente).
+
+Si le dashboard devient injoignable, la page **garde le dernier instantané** et
+l'annonce dans le bandeau, au lieu de s'effacer au moment où on en a besoin.
 
 En terminal, même lecture sans navigateur :
 
@@ -83,6 +100,16 @@ Déployer une modif du dashboard (jamais de copie hors du repo) :
 
 ```bash
 ssh <VM_DATA> 'git -C /opt/thought-bank pull && sudo systemctl restart tb-dashboard'
+```
+
+Le front vit dans `scripts/farm/web/` (preact + htm, vendorés dans
+`web/vendor/` : la VM data n'a pas de réseau, et il n'y a ni npm ni build).
+Les fichiers sont relus à chaque requête, donc **un changement de CSS ou de JS
+ne demande qu'un `git pull`** — le `systemctl restart` ne sert que si
+`farm_dashboard.py` ou `rl_status.py` change. Contrôles avant de pousser :
+
+```bash
+python scripts/farm/rl_status.py && python scripts/farm/farm_dashboard.py --selftest && node --check scripts/farm/web/dashboard.mjs
 ```
 
 ## 5. Pré-tokenisation (VM `data`, CPU, sans GPU)

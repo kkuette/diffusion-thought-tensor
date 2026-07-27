@@ -5,6 +5,9 @@ qui monte le share NFS (VM data par défaut). Agrège :
   - $TB_MNT/queue/          (file, running, done, failed)
   - $TB_MNT/runs/*.workerlog (dernier step + dernière éval par job actif)
   - $TB_MNT/rl/*/           (runs RL désagrégés, via rl_status.py)
+Le front (preact/htm, vendoré) vit dans web/ à côté de ce fichier et est servi
+tel quel : changer le CSS ou le JS ne demande qu'un `git pull`, sans redémarrer
+le service.
 Usage : farm_dashboard.py [port] [tb_mnt]   (défauts : 8787, /mnt/tb)
 """
 import json, os, re, sys, time
@@ -19,6 +22,23 @@ PORT = int(_ARGS[0]) if _ARGS else 8787
 STALE_S = 45   # agent muet depuis > STALE_S => nœud offline
 JOB_STALE_S = 300  # défaut pour un job de pretraining (voir job_info)
 CACHE_S = 3    # le serveur est mono-thread et snapshot() retaille tous les logs
+
+WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+VENDOR = "htm-preact-standalone-3.1.1.mjs"
+# Épinglé : voir web/vendor/README.md. Le self-test revérifie cette empreinte,
+# donc une substitution ou une édition accidentelle casse la CI au lieu de
+# partir en production.
+VENDOR_SHA256 = "72284e8e9079c87817145df1110f74e8a2aa040b2fc384922e18dfcb46fc1fd7"
+
+# Table BLANCHE explicite : aucun chemin fourni par le client n'est joint à WEB,
+# donc pas de traversée possible (le serveur écoute sur 0.0.0.0 du LAN).
+STATIC = {
+    "dashboard.css": (os.path.join(WEB, "dashboard.css"), "text/css; charset=utf-8"),
+    "dashboard.mjs": (os.path.join(WEB, "dashboard.mjs"),
+                      "text/javascript; charset=utf-8"),
+    VENDOR: (os.path.join(WEB, "vendor", VENDOR), "text/javascript; charset=utf-8"),
+}
+INDEX = os.path.join(WEB, "index.html")
 
 # ic/ppl optionnels : les runs SFT persona loggent « chat X  dist Y » sans ic
 # quand aucun step ic n'est passé — seuls step + s/step sont garantis.
@@ -161,113 +181,34 @@ def cached_body():
     return _cache["body"]
 
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>ferme tb</title>
-<style>
- body{background:#101418;color:#cdd6e0;font:14px/1.5 monospace;margin:20px;max-width:1100px}
- h1{font-size:18px;color:#7ec8a8} h2{font-size:15px;color:#8fb4d8;margin:18px 0 6px}
- table{border-collapse:collapse;width:100%} td,th{padding:3px 10px;text-align:left;border-bottom:1px solid #232a31}
- th{color:#67707a;font-weight:normal} .ok{color:#7ec8a8} .warn{color:#e0b060} .bad{color:#e07070}
- .dim{color:#5a636d} .bar{display:inline-block;height:9px;background:#2e6e54;vertical-align:middle;border-radius:2px}
- .barbox{display:inline-block;width:90px;height:9px;background:#20262c;border-radius:2px;margin-right:6px}
- .chip{display:inline-block;background:#1a2027;border-radius:3px;padding:0 6px;margin:1px 4px 1px 0;white-space:nowrap}
- .stat{display:inline-block;margin:0 16px 5px 0;white-space:nowrap} .k{color:#67707a}
- .spk{vertical-align:middle;margin-left:5px}
- h3{font-size:14px;color:#8fb4d8;margin:14px 0 4px;font-weight:normal}
-</style></head><body>
-<h1>ferme thought-bank</h1><div id="c">chargement…</div>
-<script>
-const pct=(a,b)=>b?Math.round(100*a/b):0;
-const bar=(a,b)=>`<span class="barbox"><span class="bar" style="width:${pct(a,b)*0.9}px"></span></span>${pct(a,b)}%`;
-const nf=(x,d=3)=>(x==null||isNaN(x))?'<span class=dim>—</span>':(Math.abs(x)<1e-3&&x!=0?x.toExponential(1):x.toFixed(d));
-const dur=s=>s==null?'—':s<90?`${Math.round(s)} s`:s<5400?`${Math.round(s/60)} min`:`${Math.floor(s/3600)} h${String(Math.floor(s%3600/60)).padStart(2,'0')}`;
-// flèche de tendance = fenêtre courante vs précédente. Le reward RL est bruité :
-// le dernier point ne dit pas le SENS, et c'est le sens qui décide.
-const tr=t=>t==null?'':t>0?' <span class=ok>↑</span>':t<0?' <span class=bad>↓</span>':'';
-function spark(a,col,w=64,h=14){
- if(!a||a.length<2) return '';
- const mn=Math.min(...a),mx=Math.max(...a),r=(mx-mn)||1;
- const p=a.map((v,i)=>`${(1+i*(w-2)/(a.length-1)).toFixed(1)},${(h-1-(v-mn)/r*(h-2)).toFixed(1)}`).join(' ');
- return `<svg class=spk width=${w} height=${h} viewBox="0 0 ${w} ${h}"><polyline points="${p}" fill=none stroke="${col}" stroke-width=1/></svg>`;}
-const stat=(k,v,t,sp)=>`<span class=stat><span class=k>${k}</span> ${v}${tr(t)}${sp||''}</span>`;
-async function r(){
- let d;try{d=await(await fetch('data.json')).json()}catch(e){document.getElementById('c').innerHTML='<span class=bad>dashboard injoignable</span>';return}
- let h='';
- for(const n of d.nodes){
-  h+=`<h2>${n.host} ${n.offline?'<span class=bad>OFFLINE</span>':'<span class=ok>en ligne</span>'}
-      <span class=dim>load ${n.load} · RAM ${n.mem_mb[0]}/${n.mem_mb[1]} Mo · swap ${n.swap_mb[0]}/${n.swap_mb[1]} Mo</span></h2>`;
-  h+='<table><tr><th>gpu</th><th>util</th><th>vram</th><th>W</th><th>°C</th></tr>';
-  for(const g of n.gpus||[]) h+=`<tr><td>${g.i}</td><td>${bar(g.util,100)}</td><td>${bar(g.vram,g.vram_tot)} <span class=dim>${g.vram} Mo</span></td><td>${g.w}</td><td class="${g.temp>80?'bad':g.temp>70?'warn':''}">${g.temp}</td></tr>`;
-  h+='</table>';}
- for(const R of d.rl||[]){
-  const L=R.learner, cls=R.state=='ok'?'ok':R.state=='stop'?'dim':R.state=='sec'?'warn':'bad';
-  // « à sec » = le learner attend, aucun rollout ne rentre : regarder les
-  // workers. « muet » = il a des groupes en attente et ne les prend pas.
-  const lbl={ok:'en cours',stop:'STOP',sec:'à sec — aucun rollout'}[R.state]||'MUET';
-  let hd=`<h2>RL ${R.run} <span class=${cls}>[${lbl}]</span>`;
-  if(L&&L.step!=null) hd+=` <span class=dim>step ${L.step}${R.steps?'/'+R.steps+' '+bar(L.step,R.steps):''}${R.eta_s?' · eta '+dur(R.eta_s):''}</span>`;
-  h+=hd+'</h2>';
-  h+='<div>'+stat('poids',R.weights.step==null?'<span class=dim>—</span>':'step '+R.weights.step)
-   +stat('file',`${R.queue.incoming}`+(R.queue.stale?` <span class=warn>+${R.queue.stale} stale</span>`:''))
-   +(R.queue.traces_mb!=null?stat('traces',R.queue.traces_mb+' Mo'):'')
-   +stat('learner vu il y a',`<span class="${L&&L.alive?'ok':'bad'}">${L?dur(L.age_s):'—'}</span>`)+'</div>';
-  // Un run arrêté reste sur le share pour toujours : réduit à son en-tête, il
-  // ne pousse pas le run vivant hors de l'écran. Le détail reste en CLI.
-  if(R.state=='stop'){h+=`<div class=dim>run terminé — détail : rl_status.py ${R.run}</div>`;continue;}
-  if(L){const w=L.win,t=L.trend,S=L.spark;
-   h+='<div>'+stat('r',nf(w.reward),t.reward,spark(S.reward,'#7ec8a8'))
-    +stat('ce',nf(w.ce),t.ce)
-    +stat('p(w)',nf(w.p_write,2))
-    +stat('write%',nf(w.write_rate,2),t.write_rate,spark(S.write_rate,'#8fb4d8'))
-    +stat('kl',nf(w.kl),t.kl,spark(S.kl,'#e0b060'))
-    +stat('poscorr',nf(w.pos_corr,2))+stat('lag',nf(w.lag,1))
-    +stat('stale',L.stale==null?'<span class=dim>—</span>':L.stale)
-    +stat('s/step',dur(L.s_per_step),null,spark(S.sps,'#67707a'))+'</div>';}
-  const envs=Object.entries(R.envs||{});
-  if(envs.length){
-   h+='<h3>par environnement</h3><table><tr><th>env</th><th>groupes</th><th>reward</th><th>grade</th><th>write%</th><th>p(w)</th></tr>';
-   for(const [e,v] of envs) h+=`<tr><td>${e}</td><td>${v.n}</td><td>${nf(v.reward)}</td><td>${nf(v.grade,2)}</td><td>${nf(v.write_rate,2)}</td><td>${nf(v.p_write,2)}</td></tr>`;
-   // Colonnes NON comparables entre elles : les envs denses rendent -ce (~-8),
-   // les envs à rubrique rendent [0,1]. C'est pour ça que le reward agrégé du
-   // learner ne veut rien dire — il bouge avec le mix, pas avec la politique.
-   h+='</table><div class=dim>reward dense (-ce) pour code/sota, rubrique [0,1] pour tools/exec — ne pas comparer les lignes entre elles. grade = succès brut avant économie de think.</div>';}
-  if(R.workers.length){
-   h+='<h3>workers</h3><table><tr><th>worker</th><th>groupes</th><th>lag</th><th>s/groupe</th><th>dégén.</th><th>dernier env</th><th>reward</th><th>vu il y a</th></tr>';
-   for(const k of R.workers) h+=`<tr><td>w${String(k.wid).padStart(2,'0')}</td><td>${k.n??'—'}</td>`
-    +`<td class="${(k.lag!=null&&R.meta.max_lag!=null&&k.lag>R.meta.max_lag)?'bad':''}">${k.lag??'—'}</td>`
-    +`<td>${dur(k.s_per_group)}</td><td>${k.degen??'—'}</td><td>${k.env||'—'}</td><td>${nf(k.reward)}</td>`
-    +`<td class="${k.alive?'':'warn'}">${dur(k.age_s)}</td></tr>`;
-   h+='</table>';}
-  const x=R.xdom;
-  if(x) h+=`<div><span class=k>sonde xdom @${x.n}</span> `
-   +`<span class="chip ${x.r_own>x.r_xdom?'ok':'bad'}">own ${nf(x.r_own)} vs xdom ${nf(x.r_xdom)}</span>`
-   +`<span class=chip>always ${nf(x.r_always)}</span><span class=chip>never ${nf(x.r_never)}</span></div>`;
- }
- h+=`<h2>jobs actifs (${d.running.length})</h2><table><tr><th>job</th><th>step / état</th><th>ic · détail</th><th>s/step</th><th>dernier GAP par domaine</th><th>log il y a</th></tr>`;
- for(const j of d.running){
-  // GAP par domaine en chips (mix divmix = 13 sources) : vert/rouge par signe,
-  // @step affiché seulement si la source est en retard sur l'éval la plus récente.
-  const s=j.step, at=(j.evals&&j.evals.length)?Math.max(...j.evals.map(x=>x.at)):0;
-  const e=(j.evals||[]).map(x=>`<span class="chip ${x.gap>0?'ok':'bad'}">${x.src} <b>${x.gap>0?'+':''}${x.gap.toFixed(2)}</b>${x.at<at?` <span class=dim>@${x.at}</span>`:''}</span>`).join('');
-  // seuil de silence fourni par le serveur : 300 s pour un trainer bavard,
-  // 3×s/groupe pour un worker RL (muet par construction), aucun pour un job fini.
-  const lim=j.stale_after;
-  const age=j.log_age_s==null?'?':((lim&&j.log_age_s>lim)?`<span class=bad>${dur(j.log_age_s)}</span>`:dur(j.log_age_s));
-  let c2,c3,c4='';
-  if(j.kind=='rl_worker'){c2=`<span class=ok>RL w${String(j.rl_wid).padStart(2,'0')}</span>`;
-   c3=j.rl?`${j.rl.n} groupes · lag ${j.rl.lag??'—'}`:'<span class=dim>pas de métriques</span>';}
-  else if(j.kind=='rl_done'){c2='<span class=dim>terminé</span>';c3=`${j.rl_groups} groupes`;}
-  else if(j.kind=='rl_learner'&&s){c2=s.n;c3=`r ${nf(s.r)} · ce ${nf(s.ce)}`;c4=s.sps;}
-  else {c2=s?s.n:'<span class=dim>init…</span>';c3=s?s.ic:'';c4=s?s.sps:'';}
-  h+=`<tr><td>${j.job}</td><td>${c2}</td><td>${c3}</td><td>${c4}</td><td>${e?`<span class=dim>@${at}</span> ${e}`:'<span class=dim>—</span>'}</td><td>${age}</td></tr>`;}
- h+='</table>';
- h+=`<h2>file (${d.queued.length})</h2><div class=dim>${d.queued.join('<br>')||'vide'}</div>`;
- h+=`<h2>terminés (${d.done.length}) — <span class=bad>échecs (${d.failed.length})</span></h2>`;
- h+=`<div class=dim>${d.done.join('<br>')||'—'}</div>`;
- if(d.failed.length) h+=`<div class=bad>${d.failed.join('<br>')}</div>`;
- h+=`<p class=dim>maj ${new Date(d.ts*1000).toLocaleTimeString()}</p>`;
- document.getElementById('c').innerHTML=h;}
-r();setInterval(r,10000);
-</script></body></html>"""
+def serve(path):
+    """Route une requête GET → (code, corps, type, cache).
+
+    Séparée du handler HTTP pour être testable sans ouvrir de socket.
+    Un fichier statique manquant rend 500 avec le chemin attendu : « oublié au
+    déploiement » doit se lire, pas donner une page blanche.
+    """
+    path = path.split("?", 1)[0]
+    if path.startswith("/data.json"):
+        return 200, cached_body(), "application/json", "no-cache"
+    if path in ("/", "/index.html"):
+        target, ctype, cache = INDEX, "text/html; charset=utf-8", "no-cache"
+    elif path.startswith("/static/"):
+        hit = STATIC.get(path[len("/static/"):])
+        if hit is None:
+            return 404, b"404", "text/plain; charset=utf-8", "no-cache"
+        target, ctype = hit
+        # Le vendor porte sa version dans son nom : immuable, donc cachable
+        # pour toujours. Le CSS et le JS de l'app, eux, changent au git pull.
+        cache = "max-age=31536000, immutable" if path.endswith(VENDOR) else "no-cache"
+    else:
+        return 404, b"404", "text/plain; charset=utf-8", "no-cache"
+    try:
+        with open(target, "rb") as fh:
+            return 200, fh.read(), ctype, cache
+    except OSError as e:
+        msg = f"fichier du front introuvable : {target}\n{e}\n"
+        return 500, msg.encode(), "text/plain; charset=utf-8", "no-cache"
 
 
 class H(BaseHTTPRequestHandler):
@@ -275,12 +216,10 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path.startswith("/data.json"):
-            body, ctype = cached_body(), "application/json"
-        else:
-            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
-        self.send_response(200)
+        code, body, ctype, cache = serve(self.path)
+        self.send_response(code)
         self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", cache)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -379,7 +318,42 @@ def _self_test():
         body = cached_body()
         assert json.loads(body)["rl"][0]["run"] == "run1"
         assert cached_body() is body
-        print("farm_dashboard: OK (jobs RL, GAP mono-source, seuils, cache)")
+
+        # ── le front ────────────────────────────────────────────────────────
+        # Contrat front/back : le JS lit ces clés de premier niveau. Un
+        # renommage côté serveur doit casser ICI, pas vider une carte en
+        # silence sur la VM.
+        assert {"ts", "nodes", "rl", "running", "queued", "done",
+                "failed"} <= set(snapshot())
+
+        # Les routes servent de vrais fichiers : « oublié au déploiement » est
+        # le mode de panne qui donnait une page blanche.
+        for path, ctype in (("/", "text/html; charset=utf-8"),
+                            ("/index.html", "text/html; charset=utf-8"),
+                            ("/static/dashboard.css", "text/css; charset=utf-8"),
+                            ("/static/dashboard.mjs", "text/javascript; charset=utf-8"),
+                            (f"/static/{VENDOR}", "text/javascript; charset=utf-8")):
+            code, b, ct, cache = serve(path)
+            assert code == 200 and b and ct == ctype, (path, code, ct)
+        # le vendor est immuable (son nom porte sa version), l'app ne l'est pas
+        assert "immutable" in serve(f"/static/{VENDOR}")[3]
+        assert serve("/static/dashboard.mjs")[3] == "no-cache"
+
+        # table blanche : rien d'autre ne sort, traversée comprise
+        for bad in ("/static/../farm_dashboard.py", "/static/vendor/x.mjs",
+                    "/etc/passwd", "/static/", "/nimportequoi"):
+            assert serve(bad)[0] == 404, bad
+        # …et le corps servi est bien celui du disque, pas une page de secours
+        assert b"preact" in serve("/static/dashboard.mjs")[1]
+        assert b"<div id=\"app\">" in serve("/")[1]
+
+        # empreinte du paquet vendoré : une substitution casse la CI
+        import hashlib
+        got = hashlib.sha256(serve(f"/static/{VENDOR}")[1]).hexdigest()
+        assert got == VENDOR_SHA256, f"{VENDOR} altéré : {got}"
+
+        print("farm_dashboard: OK (jobs RL, GAP mono-source, seuils, cache, "
+              "routes du front, empreinte du vendor)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

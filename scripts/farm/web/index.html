@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ferme thought-bank</title>
+<!-- Tout est servi par farm_dashboard.py depuis ce dossier : la VM data n'a pas
+     d'accès réseau, aucune ressource externe ne doit apparaître ici. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🌾</text></svg>">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<div id="app"><p class="boot">chargement…</p></div>
+<noscript><p class="boot">Ce dashboard a besoin de JavaScript (rendu preact, aucun réseau externe).</p></noscript>
+<script type="module" src="/static/dashboard.mjs"></script>
+</body>
+</html>

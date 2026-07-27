@@ -178,6 +178,7 @@ def _learner(root, now):
         "env_mix": last.get("env_mix") or {},
         "age_s": age,
         "spark": {"reward": _spark(lines, "reward"),
+                  "ce": _spark(lines, "ce"),
                   "kl": _spark(lines, "kl"),
                   "write_rate": _spark(lines, "write_rate"),
                   "sps": per[-SPARK_N:]},
@@ -522,6 +523,11 @@ def _self_test():
         muet = [r for r in runs if r["run"] == "muet"][0]
         assert muet["learner"] is None and muet["weights"]["step"] is None
         assert muet["state"] == "sec"          # rien écrit, rien en attente
+
+        # les séries des tuiles du dashboard sont toutes servies
+        sp = st["learner"]["spark"]
+        assert set(sp) == {"reward", "ce", "kl", "write_rate", "sps"}, set(sp)
+        assert sp["ce"] == [8.0, 8.0, 8.0] and sp["sps"] == [50.0, 30.0]
 
         # le formateur avale les trous sans exploser
         assert "fake" in format_run(st) and format_run(muet)
