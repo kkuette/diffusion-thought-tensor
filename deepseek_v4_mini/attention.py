@@ -106,12 +106,14 @@ class CompressedSparseAttention(nn.Module):
         d_latent_q: int,
         n_groups: int,
         dropout: float = 0.0,
+        fuse_rope: bool = False,
     ) -> None:
         super().__init__()
         assert n_heads % n_groups == 0
         self.d_model, self.n_heads, self.d_head = d_model, n_heads, d_head
         self.m, self.top_k, self.n_win = csa_m, top_k, n_win
         self.n_groups = n_groups
+        self.fuse_rope = fuse_rope   # decode_fuse : RoPE servi depuis la table
         hpg = n_heads // n_groups
 
         # Overlapping KV compression – two series (Ca/Cb = values, Za/Zb = gates)
@@ -308,7 +310,8 @@ class CompressedSparseAttention(nn.Module):
         # 1. requête à la position absolue p (RoPE décalé)
         cQ = self.W_dq(h)
         q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
-        cos, sin = _rope_at(p, 1, self.d_head, h.device)
+        cos, sin = (_rope_at_cached if self.fuse_rope else _rope_at)(
+            p, 1, self.d_head, h.device)
         q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
         q = self.q_norm(q)
 
@@ -398,12 +401,14 @@ class HeavilyCompressedAttention(nn.Module):
         d_latent_q: int,
         n_groups: int,
         dropout: float = 0.0,
+        fuse_rope: bool = False,
     ) -> None:
         super().__init__()
         assert n_heads % n_groups == 0
         self.d_model, self.n_heads, self.d_head = d_model, n_heads, d_head
         self.m_prime, self.n_win = hca_m, n_win
         self.n_groups = n_groups
+        self.fuse_rope = fuse_rope   # decode_fuse : RoPE servi depuis la table
         hpg = n_heads // n_groups
 
         # Single KV projection (no overlapping for HCA)
@@ -523,7 +528,8 @@ class HeavilyCompressedAttention(nn.Module):
 
         cQ = self.W_dq(h)
         q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
-        cos, sin = _rope_at(p, 1, self.d_head, h.device)
+        cos, sin = (_rope_at_cached if self.fuse_rope else _rope_at)(
+            p, 1, self.d_head, h.device)
         q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
         q = self.q_norm(q)
         q_bt = q.reshape(B, self.n_heads, self.d_head)
@@ -606,6 +612,29 @@ def _rope_at(pos: int, n: int, dim: int, device: torch.device):
     t = torch.arange(pos, pos + n, device=device).float()
     freqs = torch.outer(t, inv_freq)
     return freqs.cos(), freqs.sin()
+
+
+# Table RoPE mémoïsée (flag `decode_fuse`) : `_rope_at` recrée arange + outer +
+# cos + sin par COUCHE et par TOKEN alors que le résultat est une constante —
+# ~6 ops × 12 couches × 1 token, du pur coût de lancement. La table est
+# construite par `_rope_cache` (la même formule) et TRANCHÉE : élément par
+# élément `p · inv_freq` ne dépend pas de la longueur du tenseur qui le porte
+# (docstring de `_rope_at`), donc la tranche est ÉGALE au calcul direct, au bit.
+# Toujours float32 — comme `_rope_at`, même sous un modèle float64 : c'est ce
+# float32 partagé qui rend les deux chemins comparables par torch.equal.
+_ROPE_TABLES: dict = {}
+
+
+def _rope_at_cached(pos: int, n: int, dim: int, device: torch.device):
+    """`_rope_at`, servi depuis une table mémoïsée par (device, dim)."""
+    key = (str(device), dim)
+    tab = _ROPE_TABLES.get(key)
+    if tab is None or tab[0].size(0) < pos + n:
+        # capacité en puissance de 2, ≥ 2048 : on reconstruit rarement, et une
+        # reconstruction rend les MÊMES valeurs (formule élémentaire).
+        cap = 1 << max(pos + n - 1, 2047).bit_length()
+        _ROPE_TABLES[key] = tab = _rope_cache(cap, dim, device)
+    return tab[0][pos:pos + n], tab[1][pos:pos + n]
 
 
 def _win_push(buf, new, n_win):
@@ -694,6 +723,32 @@ def _selftest() -> None:
                 assert worst < 1e-13, worst
                 _worst64 = worst
 
+    # ── decode_fuse : la table RoPE mémoïsée rend les MÊMES bits que le calcul
+    #    direct — sur la tranche (y compris à travers un agrandissement de
+    #    table) et sur un décodage entier à poids partagés ────────────────────
+    _ROPE_TABLES.clear()
+    for pos in (0, 1, 7, 100, 2047, 2048, 5000):    # 2048/5000 = reconstruction
+        a = _rope_at(pos, 1, 8, torch.device("cpu"))
+        b = _rope_at_cached(pos, 1, 8, torch.device("cpu"))
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), \
+            f"table RoPE ≠ calcul direct à pos={pos}"
+    for cls, kw, m in ((CompressedSparseAttention, {"csa_m": M, "top_k": 3}, M),
+                       (HeavilyCompressedAttention, {"hca_m": MP}, MP)):
+        torch.manual_seed(3)
+        plain = _mk(cls, torch.float64, **kw)
+        fused = _mk(cls, torch.float64, fuse_rope=True, **kw)
+        fused.load_state_dict(plain.state_dict())
+        H = torch.randn(2, 3 * m + 5, 24, dtype=torch.float64)
+        with torch.no_grad():
+            c1, c2 = AttnCache(), AttnCache()
+            o1 = plain.forward_cached(H[:, :2], c1)
+            o2 = fused.forward_cached(H[:, :2], c2)
+            for i in range(2, H.size(1)):
+                o1 = plain.forward_cached(H[:, i:i + 1], c1)
+                o2 = fused.forward_cached(H[:, i:i + 1], c2)
+                assert torch.equal(o1, o2), \
+                    f"{cls.__name__}: fuse_rope change les bits à pos {i}"
+
     # ── la fenêtre glissante n'inclut PAS le token courant, et démarre sur des
     #    zéros — c'est la convention du F.pad du chemin complet, pas un choix ─
     mod = _mk(CompressedSparseAttention, torch.float64, csa_m=M, top_k=3)
@@ -709,7 +764,8 @@ def _selftest() -> None:
     print(f"attention self-test: OK (CSA+HCA, cache incrémental exact au "
           f"recompute complet — float64 ≤1e-13, float32 ≤1e-5 (ULP BLAS) — "
           f"7 longueurs de préfixe, franchissements csa_m={M}/hca_m={MP} "
-          f"inclus, blocs fermés = pos//m, fenêtre zéro-paddée à gauche)")
+          f"inclus, blocs fermés = pos//m, fenêtre zéro-paddée à gauche, "
+          f"fuse_rope BIT-identique — tranche et décodage entier)")
 
 
 if __name__ == "__main__":

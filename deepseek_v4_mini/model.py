@@ -249,19 +249,20 @@ class DualModalBlock(nn.Module):
         d    = cfg.d_model
         n_hc = cfg.n_hc
 
+        _fuse = bool(getattr(cfg, "decode_fuse", False))
         if layer_idx % 2 == 0:
             attn: nn.Module = CompressedSparseAttention(
                 d_model=d, n_heads=cfg.n_heads, d_head=cfg.d_head,
                 csa_m=cfg.csa_m, top_k=cfg.top_k_csa, n_win=cfg.n_win,
                 d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
-                dropout=cfg.dropout,
+                dropout=cfg.dropout, fuse_rope=_fuse,
             )
         else:
             attn = HeavilyCompressedAttention(
                 d_model=d, n_heads=cfg.n_heads, d_head=cfg.d_head,
                 hca_m=cfg.hca_m, n_win=cfg.n_win,
                 d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
-                dropout=cfg.dropout,
+                dropout=cfg.dropout, fuse_rope=_fuse,
             )
 
         moe = DeepSeekMoE(

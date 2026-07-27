@@ -29,6 +29,24 @@ class ThoughtBankConfig:
     # l'identique. À poser dans toute config neuve (n_hc vaut 2 partout).
     sinkhorn_closed_form: bool = False
 
+    # ── Décodage : réduire le NOMBRE de dispatches ────────────────────────────
+    # Le décodage token-par-token est LAUNCH-BOUND (FINDINGS 2026-07-27 : 12,9k
+    # ops aten par forward AVEC cache KV, ~137 ms/token sur 3090 pour ~10 ms de
+    # calcul utile). Ces flags coupent des lancements SANS changer un bit des
+    # sorties (preuve : A/B float64 torch.equal dans les self-tests attention/
+    # model/moe/decode). OFF par défaut — le contrat de non-régression du dépôt
+    # veut qu'une config existante reproduise à l'identique.
+    #
+    # decode_fuse : (1) table RoPE mémoïsée — `_rope_at` recréait arange+outer+
+    # cos+sin par couche et par token ; (2) hoisting fw_A/fw_B — la banque est
+    # CONSTANTE entre deux writes (l'invariant du projet : seule modif = append
+    # au `<think>`), or le read les reprojetait à chaque token ; mémo par
+    # identité d'objet + compteur _version, donc un write (nouveau tenseur via
+    # cat) ou une mutation en place invalident seuls ; (3) balance_loss MoE
+    # coupée sous no_grad — de la télémétrie d'entraînement calculée à chaque
+    # token décodé.
+    decode_fuse: bool = False
+
     # ── Attention (§2.3) ──────────────────────────────────────────────────────
     csa_m: int = 4             # CSA: compress every m tokens (overlapping)
     hca_m: int = 16            # HCA: compress every m' tokens (non-overlapping, m' >> m)
