@@ -136,6 +136,39 @@ Trois découvertes de chantier, payées en mesures :
    `python scripts/bench_decode.py <cfg> --real --ckpt <pt> --time --device cuda --cuda-graphs --flags all`
    (gardé par nvidia-smi+pgrep, un-run-par-GPU).
 
+**MAJ le soir même — CHRONO GPU RÉEL (rig gpu5, 3070 Ti, ckpt
+`v350_sft_valsif_stair/final.pt`, jobs 30-32 via la queue de la ferme —
+zéro git sur le rig, arbre `git archive` sur `$TB_MNT/perf_decode`) :**
+
+| bras (B=1, greedy, prefix 65) | ms/token | tok/s | vs baseline |
+|---|---|---|---|
+| sans cache, flags none | 197,1 | 5,1 | — |
+| cache KV, flags none (≈ le déployé) | 135,3 | 7,4 | 1× |
+| + les 3 flags eager (bit-identiques) | 82,9 | 12,1 | **1,63×** |
+| CUDA graphs (runner, classe ULP) | **23,4** | **42,8** | **5,8×** |
+
+Lectures :
+* le **−39 % eager** là où le census CPU ne promettait que −4 % d'ops : les
+  ~190 syncs GPU→CPU/token du dispatch MoE valaient bien plus que les
+  lancements — une sync se paie en aller-retour host, pas en µs de launch ;
+* 135,3 ms (3070 Ti) ≈ 137 ms (3090) sur la baseline : preuve définitive que
+  le décodage était de la latence pure — la vitesse de la carte ne comptait
+  pas. Corollaire : ALLÉGER le modèle (bf16, moins large) ne gagnait RIEN
+  avant ces travaux ; maintenant que le plancher graphs est ~23 ms, bf16
+  devient le prochain levier (~2× sur la part calcul) ;
+* la capture avait UNE seule op bloquante dans tout le stack :
+  `inf_mask[0] = True` dans `_compress_kv` CSA (copie scalaire python
+  host→device pageable, interdite en capture — cassait à la première
+  fermeture de bloc, phases 1-2 passaient). Fix : `arange == 0`, device-only,
+  mêmes booléens ⇒ mêmes bits partout (fingerprints inchangés, self-tests
+  verts). Diagnostiqué en un job avec `CUDA_LAUNCH_BLOCKING=1` + traceback ;
+* les 16 phases capturent et rejouent, fermetures CSA/HCA comprises — le
+  chaînage des activations par pool partagé (capture dans l'ordre du premier
+  cycle) tient en pratique ;
+* le reliquat ~23 ms/token = python de la boucle (argmax, copies d'entrée,
+  remplissage RoPE, dispatch du replay) + ~10 ms de calcul fp32 — prochaine
+  marche : bf16, et/ou sortir l'argmax dans le graph.
+
 ---
 
 ## 2026-07-27 — run `valsif_stair` (2000 steps) : la SÉLECTION depuis la banque S'OUVRE — 10/30 noms d'outils contre 0/30 sans banque, codeexec 0.222 contre un null à 0.006 — et le mur du 07-26 tombe
