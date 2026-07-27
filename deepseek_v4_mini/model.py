@@ -326,7 +326,14 @@ class DualModalBlock(nn.Module):
         memo_ok = self.decode_fuse and not torch.is_grad_enabled()
         if memo_ok and self._fw_memo is not None:
             mb, mv, A, Bm = self._fw_memo
-            if mb is bank and mv == bank._version:
+            # A.dtype == bank.dtype : hors autocast les deux coïncident ; sous
+            # autocast A sort en bf16 ⇒ mismatch ⇒ recalcul. Sans cette garde,
+            # un mémo rempli sous autocast (bras graphs bf16) est SERVI à un
+            # forward eager fp32 — einsum plante en dtype (vu au job 33,
+            # 2026-07-27). Sous autocast le mémo ne colle donc jamais : le
+            # hoisting y est inerte (dans un graph capturé, le recalcul est
+            # rejoué à coût de lancement nul — seul cas d'usage d'autocast).
+            if mb is bank and mv == bank._version and A.dtype == bank.dtype:
                 return A, Bm
         B, M, _ = bank.shape
         r = self.read_rank
@@ -684,6 +691,22 @@ def _selftest() -> None:
     assert calls["n"] == 1 and torch.equal(lc, ld), \
         "banque mutée en place : le mémo a servi des poids périmés"
     m_on.blocks[0].fw_A.forward = orig
+    # un mémo rempli SOUS AUTOCAST ne doit pas être servi hors autocast : le
+    # scénario du job 33 (bras graphs bf16 puis eager fp32, même banque) —
+    # sans la garde dtype, l'einsum de _cross_modal plante en dtype. float32
+    # ici : autocast CPU ne couvre pas float64.
+    m32 = ThoughtBankLM(_cfg(decode_fuse=True)).eval()
+    bank32 = torch.randn(B, 3, 16)
+    with torch.no_grad():
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            m32(pr, init_mem=bank32, write=False)
+        memo = m32.blocks[0]._fw_memo
+        assert memo is not None and memo[2].dtype == torch.bfloat16, \
+            "le scénario suppose un mémo autocast bf16"
+        le = m32(pr, init_mem=bank32, write=False)["logits"]   # eager fp32
+    assert le.dtype == torch.float32 and \
+        m32.blocks[0]._fw_memo[2].dtype == torch.float32, \
+        "mémo autocast servi à un forward eager (garde dtype morte)"
     # sous gradient, le mémo est purgé : l'entraînement reprojette à chaque pas
     bg = bank64.clone().requires_grad_(True)
     m_on.train()
@@ -695,8 +718,8 @@ def _selftest() -> None:
           "mem_read_layers restreint LITTÉRALEMENT, layer_banks + None, "
           "déterminisme eval, pad_mask, read swiglu/SN, poids liés, "
           "decode_fuse : fw_A/fw_B hoistés BIT-identiques — mémo servi 1×/"
-          "generate, invalidé par write (identité) ET mutation (_version), "
-          "purgé sous gradient)")
+          "generate, invalidé par write (identité), mutation (_version) ET "
+          "autocast (dtype), purgé sous gradient)")
 
 
 if __name__ == "__main__":
