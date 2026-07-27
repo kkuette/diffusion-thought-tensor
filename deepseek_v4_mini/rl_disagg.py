@@ -459,15 +459,22 @@ class Worker:
         return texts
 
     def _rewards(self, env, cands, lam, info) -> list[float]:
+        self.last_raw = []
         if env.reward_fn is None:
             return [-c["ce"] - lam * c["n_writes"] for c in cands]
         # rubric payload: the LAST episode's gold, whichever family (tool
         # envs read gold_calls, exec envs read tests)
         gold = (info.get("gold_calls") or [[]])[-1]
         tests = (info.get("tests") or [[]])[-1]
-        return [env.reward(c["ce"], {"text": txt, "n_think": c["n_writes"],
-                                     "gold_calls": gold, "tests": tests})
-                for c, txt in zip(cands, self._decode_calls(env, cands))]
+        # les payloads sont matérialisés (et pas construits dans la
+        # comprehension) pour qu'on puisse relire info["raw"] : le succès brut
+        # que la fonction de reward calcule puis dilue dans l'économie de think.
+        pl = [{"text": txt, "n_think": c["n_writes"],
+               "gold_calls": gold, "tests": tests}
+              for c, txt in zip(cands, self._decode_calls(env, cands))]
+        out = [env.reward(c["ce"], d) for c, d in zip(cands, pl)]
+        self.last_raw = [d.get("raw") for d in pl]
+        return out
 
     def _reward(self, env, ro, lam, info) -> float:
         return self._rewards(env, [ro], lam, info)[0]
@@ -501,11 +508,18 @@ class Worker:
                                             self.wstep, self.wid),
                                self.wstep, self.wid)
                 self.n_groups += 1
+                raw = [x for x in self.last_raw if x is not None]
+                ps = [r["p"] for c in cand for r in c["recs"]]
                 return {"env": env.name, "reward": st.mean(rs),
                         "ce": st.mean([c["ce"] for c in cand]),
                         "writes": sum(c["n_writes"] for c in cand),
                         "turns": sum(len(c["recs"]) for c in cand),
-                        "tries": _try}
+                        "tries": _try,
+                        # grade : taux d'appels justes / de tests passés, avant
+                        # économie de think. None pour les envs denses.
+                        "grade": st.mean(raw) if raw else None,
+                        "p_write": st.mean(ps) if ps else None,
+                        "pending": self.store.pending()}
         return None                            # degenerate after resamples
 
     # ── probes (log-only) ────────────────────────────────────────────────────
@@ -549,6 +563,7 @@ class Worker:
         lives_every = int(dg.get("lives_save_every", 20))
         xdom_every = int(dg.get("xdom_every", 50))
         t0 = time.time()
+        n_degen = 0
         while not os.path.exists(os.path.join(self.root, "STOP")):
             if max_groups and self.n_groups >= max_groups:
                 break
@@ -559,10 +574,14 @@ class Worker:
             self.refresh()
             line = self.one_group()
             if line is None:
+                # un groupe dégénéré est du calcul jeté : le compter, sinon la
+                # perte de débit ne se voit que dans le stdout, que personne ne lit
+                n_degen += 1
                 print(f"worker {self.wid}: degenerate group (all resamples)",
                       flush=True)
                 continue
-            line.update(n=self.n_groups, wstep=self.wstep,
+            line.update(n=self.n_groups, wstep=self.wstep, degen=n_degen,
+                        t=time.time(),
                         s_per_group=(time.time() - t0) / max(self.n_groups, 1))
             with open(self.mfile, "a") as fh:
                 fh.write(json.dumps(line) + "\n")
@@ -654,6 +673,19 @@ class Learner:
             self.step = ck["step"]
             print(f"learner: resumed step {self.step}", flush=True)
         self.hub.publish(self.model.state_dict(), self.step)
+        # Carte d'identité du run pour qui le regarde de l'extérieur : sans
+        # elle, un lecteur des JSONL voit un step sans savoir vers quoi il va,
+        # ni à partir de quel lag un groupe part à la poubelle.
+        _atomic_write(json.dumps({
+            "steps": int(r["steps"]), "group_size": self.G,
+            "groups_per_step": self.gps, "max_lag": self.max_lag,
+            "publish_every": self.publish_every, "lr": float(r.get("lr", 5.0e-6)),
+            "kl_coef": self.kl_coef, "started": time.time(),
+            # poids VISÉS du mix : de quoi juger si le mix observé (env_mix)
+            # dérive parce qu'un env est plus lent que les autres
+            "envs": {e["name"]: e.get("weight")
+                     for e in raw.get("data", {}).get("envs", [])},
+        }, indent=1), os.path.join(self.root, "meta.json"))
 
     def archive(self, groups) -> None:
         """Trajectoires → traces.jsonl, AVANT consommation. Matière première du
@@ -681,9 +713,10 @@ class Learner:
         self.opt.zero_grad(set_to_none=True)
         p0 = next(self.model.parameters())
         m = {"reward": [], "ce": [], "writes": 0, "turns": 0, "loss": [],
-             "kl": [], "env": {}}
+             "kl": [], "env": {}, "p": [], "lag": []}
         rolls_flat = []
         for g in groups:
+            m["lag"].append(self.step - g["weights_step"])
             rolls = group_to_device(g, self.device, p0.dtype)
             rs = [ro["reward"] for ro in rolls]
             mu, sd_r = st.mean(rs), st.pstdev(rs)
@@ -699,6 +732,7 @@ class Learner:
             m["ce"] += [ro["ce"] for ro in rolls]
             m["writes"] += sum(ro["n_writes"] for ro in rolls)
             m["turns"] += sum(len(ro["recs"]) for ro in rolls)
+            m["p"] += [rec["p"] for ro in rolls for rec in ro["recs"]]
             m["env"][g["env"]] = m["env"].get(g["env"], 0) + 1
         torch.nn.utils.clip_grad_norm_(self.model.parameters(),
                                        float(self.r.get("grad_clip", 1.0)))
@@ -709,8 +743,12 @@ class Learner:
         return {"step": self.step, "reward": st.mean(m["reward"]),
                 "ce": st.mean(m["ce"]),
                 "write_rate": m["writes"] / max(m["turns"], 1),
+                # p_write = la POLITIQUE (la Bernoulli), write_rate = ce qu'elle
+                # a tiré. Les deux divergent quand explore_floor porte le write.
+                "p_write": st.mean(m["p"]) if m["p"] else None,
                 "kl": st.mean(m["kl"]), "loss": sum(m["loss"]),
                 "pos_corr": pos_write_corr(rolls_flat),
+                "lag": st.mean(m["lag"]) if m["lag"] else None,
                 "groups": len(groups), "env_mix": m["env"]}
 
     def run(self):
@@ -731,11 +769,17 @@ class Learner:
             self.archive(groups)
             line = self.step_once(groups)
             line["stale"] = n_stale_tot
+            line["pending"] = self.store.pending()
+            line["t"] = time.time()
             line["s_per_step"] = (time.time() - t0) / max(self.step, 1)
+            pw = line["p_write"]
             print(f"step {line['step']:4d}  r {line['reward']:+.3f}  "
-                  f"ce {line['ce']:.3f}  write% {line['write_rate']:.2f}  "
+                  f"ce {line['ce']:.3f}  "
+                  f"p(w) {'—' if pw is None else f'{pw:.2f}'}  "
+                  f"write% {line['write_rate']:.2f}  "
                   f"kl {line['kl']:.2e}  groups {line['groups']}  "
-                  f"stale {n_stale_tot}  {line['env_mix']}  "
+                  f"lag {line['lag']:.1f}  stale {n_stale_tot}  "
+                  f"{line['env_mix']}  "
                   f"{line['s_per_step']:.1f}s/step", flush=True)
             with open(self.mfile, "a") as fh:
                 fh.write(json.dumps(line) + "\n")
@@ -875,6 +919,9 @@ def _self_test():
     learner = Learner(raw, model=copy.deepcopy(model),
                       device=torch.device("cpu"))
     assert hub.latest_step() == 0
+    meta = json.load(open(os.path.join(root, "meta.json")))
+    assert meta["steps"] == 3 and meta["max_lag"] == 2
+    assert set(meta["envs"]) == {"code", "tools", "exec"}
 
     # 3. worker: envs injected, produces groups against published weights
     tok = _Tok(_random.Random(3))
@@ -899,6 +946,17 @@ def _self_test():
     assert w.store.pending() == len(lines)
     envs_seen = {ln["env"] for ln in lines}    # all three reward paths
     assert lines[0]["turns"] > 0
+    # le succès BRUT remonte pour les envs à rubrique et reste absent des envs
+    # denses : sans lui, un reward bas ne dit pas si l'appel est faux ou le
+    # think trop long
+    for ln in lines:
+        assert 0.0 <= ln["p_write"] <= 1.0 and ln["pending"] >= 0
+        if ln["env"] in ("tools", "exec"):
+            assert 0.0 <= ln["grade"] <= 1.0, ln
+        else:
+            assert ln["grade"] is None, ln
+    assert any(ln["grade"] for ln in lines if ln["env"] == "tools"), \
+        "le stub renvoie parfois l'appel gold : au moins un grade non nul"
 
     # 4. staleness: a group tagged far behind gets quarantined
     g_old = torch.load(os.path.join(w.store.inc,
@@ -911,6 +969,8 @@ def _self_test():
     assert n_stale == 1 and len(groups) == len(lines)
     line = learner.step_once(groups)
     assert line["step"] == 1 and line["groups"] == len(lines)
+    # lag = retard des poids qui ont produit les groupes (0 ici : tout frais)
+    assert line["lag"] == 0.0 and 0.0 <= line["p_write"] <= 1.0
     assert hub.latest_step() == 1
     assert w.refresh() and w.wstep == 1
 

@@ -200,9 +200,12 @@ def make_tool_reward(n_max: int, floor: float = 0.4
     episode's gold calls, then applies think economy. Ignores ce (the dense
     fallback) — this is the rubric path of the rl_lives hook.
 
-    info: {"text": str, "gold_calls": [..], "n_think": int}"""
+    info: {"text": str, "gold_calls": [..], "n_think": int}
+    Écrit en retour info["raw"] = le succès AVANT économie de think (voir
+    make_exec_reward pour le pourquoi)."""
     def fn(ce, info):
         s = grade_calls(info["text"], info["gold_calls"])
+        info["raw"] = s
         return think_economy(s, int(info.get("n_think", 0)), n_max, floor)
     return fn
 
@@ -213,12 +216,19 @@ def make_exec_reward(n_max: int, floor: float = 0.4, timeout: float = 6.0
     rollout text, run the episode's unit tests in the sandbox, success =
     fraction passed, then the same think economy as tool envs.
 
-    info: {"text": str, "tests": [assert-str, ...], "n_think": int}"""
+    info: {"text": str, "tests": [assert-str, ...], "n_think": int}
+
+    Écrit en retour info["raw"] = la fraction de tests passés, AVANT économie
+    de think. Le produit seul est ambigu : un reward de 0,3 peut être un code
+    juste noyé sous les writes ou un code à moitié faux et économe, et ces deux
+    diagnostics n'appellent pas la même correction. C'est aussi le taux que le
+    suivi RL regarde (toolcall / pass-rate), pas le reward composite."""
     from .exec_sandbox import pass_frac
 
     def fn(ce, info):
         s = pass_frac(extract_code(info["text"]), info["tests"],
                       timeout=timeout)
+        info["raw"] = s
         return think_economy(s, int(info.get("n_think", 0)), n_max, floor)
     return fn
 
@@ -272,8 +282,14 @@ def _self_test() -> None:
 
     # EnvSpec hook end-to-end
     fn = make_tool_reward(n_max=8)
-    r = fn(None, {"text": t, "gold_calls": [g], "n_think": 4})
+    info = {"text": t, "gold_calls": [g], "n_think": 4}
+    r = fn(None, info)
     assert abs(r - think_economy(1.0, 4, 8)) < 1e-9
+    # le succès brut ressort par info["raw"] : c'est LUI le taux de toolcall,
+    # le reward retourné le mélange déjà à l'économie de think
+    assert info["raw"] == 1.0 and r < 1.0
+    bad = {"text": "pas d'appel", "gold_calls": [g], "n_think": 0}
+    assert fn(None, bad) == 0.0 and bad["raw"] == 0.0
 
     # code extraction: fenced python, generic fence with code, bare, none
     body = "def add(a, b):\n    return a + b"
@@ -291,9 +307,15 @@ def _self_test() -> None:
     ts = ["assert add(1, 2) == 3", "assert add(0, 0) == 0"]
     assert abs(fx(None, {"text": txt, "tests": ts, "n_think": 2})
                - think_economy(1.0, 2, 8)) < 1e-9
-    half = fx(None, {"text": txt, "tests": ts + ["assert add(1, 1) == 3"] * 2,
-                     "n_think": 0})
+    ih = {"text": txt, "tests": ts + ["assert add(1, 1) == 3"] * 2,
+          "n_think": 0}
+    half = fx(None, ih)
     assert abs(half - 0.5) < 1e-9              # 2/4 tests, eff=1 at n_think 0
+    assert ih["raw"] == 0.5                    # pass-rate brut, même sans think
+    # reward identique, diagnostics opposés : code juste noyé sous les writes
+    # vs code à moitié faux et économe. Seul raw les sépare.
+    noisy = {"text": txt, "tests": ts, "n_think": 8}
+    assert abs(fx(None, noisy) - 0.4) < 1e-9 and noisy["raw"] == 1.0
     assert fx(None, {"text": "no code", "tests": ts, "n_think": 0}) == 0.0
     assert fx(None, {"text": txt, "tests": ts, "n_think": 9}) == 0.0
 

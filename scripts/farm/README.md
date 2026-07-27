@@ -23,7 +23,10 @@ sudo reboot
 # après reboot :
 nvidia-smi                # les 6 cartes doivent apparaître
 for i in 0 1 2 3 4 5; do sudo systemctl enable --now tb-worker@$i; done
+systemctl status tb-agent # activé par setup_rig.sh : alimente le dashboard
 ```
+
+Côté VM data, une fois : `sudo /opt/thought-bank/scripts/farm/setup_dashboard.sh`.
 
 ## 3. Lancer des jobs
 
@@ -47,11 +50,42 @@ EOF
 
 Cycle de vie : `queue/*.job` → `queue/running/<worker>__nom.job` →
 `queue/done/` ou `queue/failed/`. Log worker : `runs/<nom>.workerlog`.
-
-Surveiller : `ls /mnt/tb/queue/running/` et `tail -f /mnt/tb/runs/*.workerlog`.
 Rejouer un échec : `mv queue/failed/x.job queue/`.
 
-## 4. Pré-tokenisation (VM `data`, CPU, sans GPU)
+## 4. Surveiller
+
+Dashboard : `http://<IP_VM_DATA>:8787` (service `tb-dashboard`, installé par
+`setup_dashboard.sh`). Il agrège les `status/*.json` des rigs (service
+`tb-agent`), la file de jobs, et **les runs RL de `rl/*/`**.
+
+Pretraining : dernier step, `ic`, s/step, et le dernier GAP par domaine.
+
+RL désagrégé : le learner ne passe pas par la file (il tourne à la main sur la
+3090) — il est lu via ses JSONL, pas via un log. Sont affichés le step et la
+progression, reward/kl/write%/p(w) avec micro-courbe et flèche de tendance, le
+lag de politique par worker, le débit, la file de rollouts, et le **découpage
+par environnement** — dont le `grade` (taux d'appels justes, pass-rate exec)
+qui est le vrai suivi, le reward agrégé mélangeant des échelles incompatibles.
+
+Un worker RL n'imprime quasiment rien sur stdout : ne pas juger sa santé à son
+`.workerlog`. Son horloge, c'est son JSONL, et le seuil de silence est calé sur
+son débit (un step learner 350M dure ~13 min : le seuil fixe de 300 s des jobs
+de pretraining y voyait une panne permanente).
+
+En terminal, même lecture sans navigateur :
+
+```bash
+python scripts/farm/rl_status.py --tb /mnt/tb          # tous les runs
+python scripts/farm/rl_status.py --tb /mnt/tb 350m     # un seul
+```
+
+Déployer une modif du dashboard (jamais de copie hors du repo) :
+
+```bash
+ssh <VM_DATA> 'git -C /opt/thought-bank pull && sudo systemctl restart tb-dashboard'
+```
+
+## 5. Pré-tokenisation (VM `data`, CPU, sans GPU)
 
 VM Debian dédiée : NFS monté, venv `/opt/tb-venv` (torch CPU), repo
 `/opt/thought-bank`, `HF_HOME=/mnt/tb/data/hf_cache`, SSH par clé uniquement.

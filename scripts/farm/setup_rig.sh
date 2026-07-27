@@ -94,8 +94,27 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
+echo "== Agent de statut (alimente le dashboard) =="
+# Ce service existait UNIQUEMENT sur les rigs déployés, écrit à la main et
+# jamais commité : exactement la dérive décrite au-dessus. Il est ici pour que
+# `setup_rig.sh` remonte un rig complet, dashboard compris.
+cat > /etc/systemd/system/tb-agent.service <<'EOF'
+[Unit]
+Description=thought-bank agent de statut (GPU/RAM vers le share)
+After=remote-fs.target
+Requires=remote-fs.target
+StartLimitIntervalSec=0
+[Service]
+Environment=TB_MNT=/mnt/tb
+ExecStart=/opt/thought-bank/scripts/farm/node_agent.sh
+Restart=always
+RestartSec=30
+User=root
+[Install]
+WantedBy=multi-user.target
+EOF
 systemctl daemon-reload
-systemctl enable gpu-powerlimit.service
+systemctl enable gpu-powerlimit.service tb-agent.service
 
 echo
 echo "Reboot pour charger le driver, puis :"

@@ -25,6 +25,13 @@ jobs:
           python-version: "3.10"
           cache: pip
 
+      # Avant l'install de torch : ces deux-là sont stdlib pur, c'est la
+      # contrainte qui les garde déployables sur la VM data sans venv.
+      - name: Outils de la ferme (dashboard + lecteur RL)
+        run: |
+          python scripts/farm/rl_status.py
+          python scripts/farm/farm_dashboard.py --selftest
+
       - name: Dépendances (torch CPU — les tests ne touchent pas au GPU)
         run: |
           python -m pip install --upgrade pip
