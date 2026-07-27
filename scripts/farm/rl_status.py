@@ -239,20 +239,28 @@ def _envs(workers):
     """
     by = {}
     for w in workers:
-        for ln in w["groups"][-WINDOW:]:
+        for ln in w["groups"]:
             env = ln.get("env")
             if env:
                 by.setdefault(env, []).append(ln)
     out = {}
     for env, lns in sorted(by.items()):
-        turns = sum(ln.get("turns", 0) for ln in lns)
+        # fusion chronologique multi-workers : sans le tri par horodatage, la
+        # sparkline concatène les workers l'un après l'autre et dessine des
+        # allers-retours qui n'existent pas (les lignes d'avant la clé `t`
+        # tombent en tête, ordre intra-worker préservé — acceptable).
+        lns.sort(key=lambda ln: ln.get("t", 0.0))
+        win = lns[-WINDOW:]
+        turns = sum(ln.get("turns", 0) for ln in win)
         out[env] = {
-            "n": len(lns),
-            "reward": _mean([ln.get("reward") for ln in lns]),
-            "grade": _mean([ln.get("grade") for ln in lns]),
-            "p_write": _mean([ln.get("p_write") for ln in lns]),
-            "write_rate": (sum(ln.get("writes", 0) for ln in lns) / turns
+            "n": len(win),
+            "reward": _mean([ln.get("reward") for ln in win]),
+            "grade": _mean([ln.get("grade") for ln in win]),
+            "p_write": _mean([ln.get("p_write") for ln in win]),
+            "write_rate": (sum(ln.get("writes", 0) for ln in win) / turns
                            if turns else None),
+            "spark": {"reward": _spark(lns, "reward"),
+                      "grade": _spark(lns, "grade")},
         }
     return out
 

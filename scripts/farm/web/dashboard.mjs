@@ -141,7 +141,8 @@ const EnvTable = ({ envs }) => {
     <h3>par environnement</h3>
     <div class="scroll"><table>
       <thead><tr><th>env</th><th class="n">groupes</th><th class="n">reward</th>
-        <th class="n">grade</th><th class="n">write%</th><th class="n">p(w)</th></tr></thead>
+        <th class="n">grade</th><th class="n">write%</th><th class="n">p(w)</th>
+        <th>courbe</th></tr></thead>
       <tbody>${rows.map(([e, v]) => html`
         <tr key=${e}>
           <td class="num">${e}</td>
@@ -150,6 +151,10 @@ const EnvTable = ({ envs }) => {
           <td class="n" style="color:var(--accent)">${nf(v.grade, 2)}</td>
           <td class="n">${nf(v.write_rate, 2)}</td>
           <td class="n">${nf(v.p_write, 2)}</td>
+          ${/* LA courbe par env — le spark du learner mélange les échelles.
+                grade [0,1] quand l'env en a un (rubrique), reward (−ce) sinon. */''}
+          <td><${Spark} pts=${v.spark?.grade?.length > 1 ? v.spark.grade : v.spark?.reward}
+                col=${v.spark?.grade?.length > 1 ? 'var(--accent)' : undefined} /></td>
         </tr>`)}
       </tbody>
     </table></div>
