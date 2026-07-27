@@ -200,3 +200,140 @@ class ThoughtStream(nn.Module):
         if not self.cfg.mem_write_gate:
             return m.unsqueeze(1)               # ungated: pure normalised thought
         return (alpha * p * m).unsqueeze(1)                       # [B, 1, mem_dim]
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _selftest() -> None:
+    """Invariants du write : FIFO, seeding, précédence des gates, pad-safety.
+
+    Tout ce qui est testé ici a déjà coûté du temps de debug au moins une fois.
+    CPU, quelques dizaines de ms.
+    """
+    torch.manual_seed(0)
+    D, M, B, T, DM = 8, 4, 2, 6, 16
+
+    def _cfg(**kw):
+        return ThoughtBankConfig(d_model=DM, mem_dim=D, max_mem=M,
+                                 mem_seed_slots=2, **kw)
+
+    def _stream(**kw):
+        torch.manual_seed(1234)                 # mêmes poids d'une variante à l'autre
+        return ThoughtStream(_cfg(**kw))
+
+    H = torch.randn(B, T, DM)
+
+    # ── seeding ──────────────────────────────────────────────────────────────
+    ts = _stream()
+    for init, check in (("uniform01", lambda x: (x >= 0).all() and (x <= 1).all()),
+                        ("pm1", lambda x: (x >= -1).all() and (x <= 1).all()),
+                        ("zeros", lambda x: (x == 0).all())):
+        ts.cfg.mem_seed_init = init
+        bk = ts.seed_bank(B, torch.device("cpu"), torch.float32)
+        assert bk.shape == (B, 2, D), (init, bk.shape)
+        assert check(bk), init
+    ts.cfg.mem_seed_init = "jamais-vu"
+    try:
+        ts.seed_bank(B, torch.device("cpu"), torch.float32)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mem_seed_init inconnu : aurait dû lever")
+    ts.cfg.mem_seed_init = "uniform01"
+    # mem_seed_slots=0 ⇒ au moins un slot (une banque vide casserait le read)
+    ts.cfg.mem_seed_slots = 0
+    assert ts.seed_bank(B, torch.device("cpu"), torch.float32).size(1) == 1
+    ts.cfg.mem_seed_slots = 2
+
+    # ── FIFO : croissance puis éviction du DOYEN, ordre préservé ─────────────
+    ts = _stream(mem_write_gate=False)
+    bank = torch.randn(B, M - 1, D)
+    grown = ts._write(H, bank)
+    assert grown.shape == (B, M, D), grown.shape
+    assert torch.equal(grown[:, :M - 1], bank), "croissance : l'existant a bougé"
+
+    full = torch.randn(B, M, D)
+    out = ts._write(H, full)
+    assert out.shape == (B, M, D), out.shape
+    assert torch.equal(out[:, :M - 1], full[:, 1:]), \
+        "FIFO : le doyen doit partir et l'ordre rester"
+    # au-delà de max_mem la banque ne grossit jamais, même en écrivant longtemps
+    b = torch.randn(B, M, D)
+    for _ in range(3 * M):
+        b = ts._write(H, b)
+        assert b.size(1) == M
+
+    # ── le write est bien de dimension mem_dim et fini ───────────────────────
+    m = ts._new_thought(H, None)
+    assert m.shape == (B, 1, D) and torch.isfinite(m).all()
+
+    # ── ligne entièrement pad : le pool ne doit pas produire de NaN ──────────
+    pad = torch.ones(B, T, dtype=torch.bool)
+    pad[1] = False                                    # ligne 1 : que du padding
+    m_pad = ts._new_thought(H, None, pad)
+    assert torch.isfinite(m_pad).all(), "ligne all-pad : softmax(-inf partout) = NaN"
+
+    # ── gates : chacun sur son comportement propre ───────────────────────────
+    # Référence : le thought BRUT, gates coupés (les gates s'appliquent après).
+    raw = _stream(mem_write_gate=False)._new_thought(H, None)      # [B,1,D]
+    dup = raw.expand(B, M, D).contiguous()            # banque = M copies exactes
+
+    nov = _stream(mem_write_gate_novelty=True)._new_thought(H, dup)
+    assert nov.norm() < 1e-5, f"novelty : un doublon exact doit être écrémé ({nov.norm():.3e})"
+
+    dlt = _stream(mem_write_gate_delta=True)._new_thought(H, dup)
+    assert dlt.norm() < 1e-5, f"delta : un doublon exact doit s'annuler ({dlt.norm():.3e})"
+
+    # …et laissent passer une écriture NOUVELLE (banque orthogonale au write)
+    orth = torch.zeros(B, M, D)
+    orth[:, :, 0] = 1.0
+    r2 = _stream(mem_write_gate=False)._new_thought(H, orth)
+    for flag in ("mem_write_gate_novelty", "mem_write_gate_delta"):
+        got = _stream(**{flag: True})._new_thought(H, orth)
+        assert got.norm() > 0.5 * r2.norm(), f"{flag} : une écriture neuve est passée à la trappe"
+
+    # merge (v2c) : le doublon REMPLACE son jumeau — le doyen DISTINCT survit
+    ts_m = _stream(mem_write_gate=False, mem_write_gate_merge=True,
+                   mem_write_merge_tau=0.5)
+    old = torch.randn(B, M, D)
+    old[:, 2] = raw.squeeze(1)                        # le jumeau est en position 2
+    got = ts_m._write(H, old)
+    assert got.size(1) == M
+    assert torch.equal(got[:, 0], old[:, 0]), \
+        "merge : le doyen distinct ne doit PAS payer pour un doublon"
+    assert float(ts_m.last_merge_rate) == 1.0
+
+    # précédence documentée : merge > delta > novelty > gate scalaire
+    both = _stream(mem_write_gate_delta=True, mem_write_gate_novelty=True)
+    only_delta = _stream(mem_write_gate_delta=True)
+    half = torch.zeros(B, M, D)
+    half[:, 0] = raw.squeeze(1) + torch.randn(B, D) * 0.5     # voisin partiel
+    assert torch.allclose(both._new_thought(H, half),
+                          only_delta._new_thought(H, half)), \
+        "précédence : delta doit primer sur novelty"
+
+    # ── télémétrie : les champs que le trainer logue sont peuplés ────────────
+    ts = _stream()
+    _ = ts._new_thought(H, torch.randn(B, M, D))
+    for name in ("last_write_alpha", "last_write_penalty", "last_write_alpha_mean",
+                 "last_write_redundancy"):
+        v = getattr(ts, name)
+        assert v is not None and torch.isfinite(v).all(), name
+    # banque vide : la redondance est définie (0), pas None
+    _ = ts._new_thought(H, None)
+    assert float(ts.last_write_redundancy) == 0.0
+
+    # ── le gradient atteint la tête de write (sinon elle n'apprend jamais) ───
+    ts = _stream()
+    H2 = torch.randn(B, T, DM, requires_grad=True)
+    ts._write(H2, torch.randn(B, M, D)).sum().backward()
+    assert ts.thought_head.weight.grad is not None
+    assert ts.thought_head.weight.grad.abs().sum() > 0, "write head sans gradient"
+
+    print("memory self-test: OK (FIFO + ordre, 3 seedings + init inconnu, "
+          "gates novelty/delta/merge + précédence, ligne all-pad finie, "
+          "télémétrie, gradient du write)")
+
+
+if __name__ == "__main__":
+    _selftest()

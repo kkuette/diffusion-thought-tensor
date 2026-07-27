@@ -209,7 +209,8 @@ def pos_write_corr(rollouts):
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main(cfg_path: str) -> None:
-    raw = load_yaml(cfg_path); r = raw["rl"]; d = raw["data"]
+    raw = load_yaml(cfg_path); check_cfg(raw, "rl_defer_grpo")
+    r = raw["rl"]; d = raw["data"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(r.get("seed", 0)))
     import random as _random

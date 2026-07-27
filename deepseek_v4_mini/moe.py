@@ -125,3 +125,90 @@ class DeepSeekMoE(nn.Module):
 
         out = (shared_out + routed_out).view(B, T, d)
         return out, balance_loss
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _selftest() -> None:
+    """Routage, loss d'équilibrage, et le garde-fou NaN du sqrt(softplus).
+
+    Le clamp_min(1e-12) n'a l'air de rien : sans lui, un logit très négatif fait
+    softplus→0 en bf16, sqrt'(0)=inf, et le gradient (nul) des experts non
+    sélectionnés devient 0*inf = NaN. C'est silencieux jusqu'à ce que la loss
+    parte en NaN quelques milliers de steps plus loin.
+    """
+    torch.manual_seed(0)
+    B, T, D, E, K, FF = 2, 6, 8, 4, 2, 16
+
+    moe = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K, d_ff=FF)
+    x = torch.randn(B, T, D)
+    out, bal = moe(x)
+    assert out.shape == x.shape and out.dtype == x.dtype
+    assert bal.ndim == 0 and float(bal) >= 0.0, "la loss d'équilibrage est un scalaire ≥ 0"
+    assert torch.isfinite(out).all() and torch.isfinite(bal)
+
+    # ── la loss d'équilibrage mesure bien le DÉSÉQUILIBRE ────────────────────
+    # Tout vers les mêmes experts : W_gate constant ⇒ topk identique partout.
+    concentrated = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1,
+                               top_k_experts=K, d_ff=FF)
+    with torch.no_grad():
+        concentrated.W_gate.weight.zero_()
+        concentrated.W_gate.weight[0].fill_(1.0)      # l'expert 0 domine partout
+    _, bal_bad = concentrated(x.abs())
+    # Routage parfaitement uniforme : chaque expert reçoit exactement K/E.
+    balanced = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1,
+                           top_k_experts=E, d_ff=FF)   # top_k = E ⇒ tous servis
+    _, bal_ok = balanced(x)
+    assert float(bal_ok) < 1e-12, f"routage uniforme ⇒ loss nulle (vu {float(bal_ok):.2e})"
+    assert float(bal_bad) > float(bal_ok), "un routage concentré doit coûter plus cher"
+
+    # ── top_k respecté, poids normalisés ────────────────────────────────────
+    scores = torch.sqrt(F.softplus(moe.W_gate(x.reshape(B * T, D))).clamp_min(1e-12))
+    top_s, top_i = scores.topk(K, dim=-1)
+    w = top_s / (top_s.sum(-1, keepdim=True) + 1e-8)
+    assert top_i.shape == (B * T, K)
+    assert torch.allclose(w.sum(-1), torch.ones(B * T), atol=1e-5), \
+        "les poids du set sélectionné doivent sommer à 1"
+    assert (top_i.max() < E).all()
+
+    # ── garde-fou NaN : logits très négatifs, en bf16 comme en fp32 ──────────
+    for dtype in (torch.float32, torch.bfloat16):
+        m = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K,
+                        d_ff=FF).to(dtype)
+        with torch.no_grad():
+            m.W_gate.weight.fill_(-50.0)              # softplus sous-déborde à 0
+        xi = torch.randn(B, T, D, dtype=dtype, requires_grad=True)
+        o, bl = m(xi)
+        (o.float().sum() + bl.float()).backward()
+        assert torch.isfinite(xi.grad).all(), \
+            f"gradient NaN en {dtype} — le clamp_min(1e-12) du sqrt(softplus) a sauté"
+        assert torch.isfinite(m.W_gate.weight.grad).all(), dtype
+
+    # ── les experts partagés sont TOUJOURS actifs ───────────────────────────
+    m = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K, d_ff=FF)
+    y, _ = m(x)
+    y.sum().backward()
+    assert m.shared[0].w3.weight.grad.abs().sum() > 0, "expert partagé sans gradient"
+    # …et au moins un routé a reçu du gradient (le dispatch fait quelque chose)
+    assert any(e.w3.weight.grad is not None and e.w3.weight.grad.abs().sum() > 0
+               for e in m.experts), "aucun expert routé n'a reçu de gradient"
+
+    # ── SwiGLU : clamps annoncés en §4.2.3 ──────────────────────────────────
+    sg = SwiGLU(D, FF)
+    with torch.no_grad():
+        sg.w12.weight.fill_(50.0)                     # force la saturation
+    big = sg(torch.randn(B, T, D) * 10.0)
+    assert torch.isfinite(big).all(), "SwiGLU non clampé : sortie non finie"
+
+    # plusieurs experts partagés : moyenne, pas somme (sinon l'échelle dérive)
+    m2 = DeepSeekMoE(d_model=D, n_experts=E, n_shared=3, top_k_experts=K, d_ff=FF)
+    assert len(m2.shared) == 3
+    assert torch.isfinite(m2(x)[0]).all()
+
+    print("moe self-test: OK (formes, loss d'équilibrage nulle si uniforme et "
+          "positive si concentrée, top_k + poids normalisés, garde-fou NaN "
+          "sqrt(softplus) en fp32 ET bf16, partagés toujours actifs, clamps SwiGLU)")
+
+
+if __name__ == "__main__":
+    _selftest()

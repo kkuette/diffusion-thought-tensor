@@ -39,6 +39,7 @@ from transformers import AutoTokenizer
 
 from .cascade import CascadeMemory
 from .config import ThoughtBankConfig
+from .decode import generate
 from .model import ThoughtBankLM
 from .paths import load_yaml
 
@@ -118,32 +119,13 @@ class Session:
                 self.casc.push_slot(pre0)
 
 
-def _pick(logits, temp, top_p):
-    """Next token from the last-position logits: greedy if temp == 0, else
-    temperature + nucleus (top-p) sampling."""
-    if temp <= 0:
-        return logits.argmax(-1, keepdim=True)
-    probs = torch.softmax(logits.float() / temp, dim=-1)
-    if top_p < 1.0:
-        sp, si = probs.sort(dim=-1, descending=True)
-        keep = sp.cumsum(-1) - sp < top_p           # keep at least the top token
-        sp = sp * keep
-        idx = torch.multinomial(sp / sp.sum(-1, keepdim=True), 1)
-        return si.gather(-1, idx)
-    return torch.multinomial(probs, 1)
-
-
-@torch.no_grad()
 def _decode(model, prefix, bank, lb, max_new, stop_id, amp, temp=0.0, top_p=0.9):
-    out = prefix
-    for _ in range(max_new):
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-            o = model(out, init_mem=bank, layer_banks=lb)
-        nt = _pick(o["logits"][:, -1], temp, top_p)
-        out = torch.cat([out, nt], dim=1)
-        if int(nt) == stop_id:
-            break
-    return out[:, prefix.size(1):]
+    """Un tour de la session interactive. La boucle (et l'échantillonnage
+    température/top-p) vit dans decode.generate."""
+    gen, lens = generate(model, prefix, bank=bank, layer_banks=lb,
+                         max_new=max_new, stop_id=stop_id, amp=amp,
+                         temp=temp, top_p=top_p)
+    return gen[:, :int(lens[0])]
 
 
 def main():

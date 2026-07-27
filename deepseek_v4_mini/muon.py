@@ -167,3 +167,108 @@ def _split_muon_params(model: nn.Module):
         else:
             adam.append(p)
     return muon, adam
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _selftest() -> None:
+    """Newton-Schulz, le piège √cols, et le tri des paramètres.
+
+    Le cœur du test est `rms_match` : avec le scaling historique √cols, une
+    matrice carrée reçoit un update de RMS ~1 et un hypernet haut (fw_A/fw_B) de
+    RMS ~0.1 — le read apprend alors ~8x plus lentement que le backbone, sans
+    que rien dans la loss ne le signale.
+    """
+    torch.manual_seed(0)
+
+    # ── Newton-Schulz : les valeurs singulières convergent vers 1 ───────────
+    for shape in ((8, 8), (8, 32), (32, 8), (1, 16)):
+        G = torch.randn(*shape)
+        X = _zeropower_via_newtonschulz(G, steps=10)
+        assert X.shape == G.shape, shape
+        sv = torch.linalg.svdvals(X)
+        assert torch.allclose(sv, torch.ones_like(sv), atol=0.05), \
+            f"{shape}: valeurs singulières {sv.tolist()}"
+        # l'orthogonalisation garde la direction dominante de G
+        assert (torch.linalg.svdvals(G) > 0).all()
+    # une matrice déjà orthogonale est un point fixe
+    Q = torch.linalg.qr(torch.randn(16, 16))[0]
+    assert torch.allclose(_zeropower_via_newtonschulz(Q, steps=10).abs(),
+                          Q.abs(), atol=0.05)
+    # échelle indifférente : le premier geste est une normalisation
+    G = torch.randn(8, 16)
+    assert torch.allclose(_zeropower_via_newtonschulz(G, steps=10),
+                          _zeropower_via_newtonschulz(G * 1e3, steps=10), atol=1e-4)
+
+    # ── rms_match : MÊME RMS d'update quelle que soit la forme ──────────────
+    def _update_rms(shape, rms_match, lr=0.1):
+        p = nn.Parameter(torch.zeros(*shape))
+        p.grad = torch.randn(*shape)
+        opt = Muon([p], lr=lr, momentum=0.0, nesterov=False, ns_steps=10,
+                   rms_match=rms_match)
+        opt.step()
+        return float((p.detach() / -lr).pow(2).mean().sqrt())
+
+    square, tall = (64, 64), (512, 32)
+    r_sq, r_tall = _update_rms(square, True), _update_rms(tall, True)
+    for r, shape in ((r_sq, square), (r_tall, tall)):
+        assert abs(r - 0.2) < 0.02, f"rms_match {shape}: RMS {r:.3f} ≠ 0.2"
+    assert abs(r_sq - r_tall) < 0.02, \
+        f"rms_match doit égaliser les formes ({r_sq:.3f} vs {r_tall:.3f})"
+
+    # …et le scaling historique, lui, ne les égalise PAS — c'est le piège,
+    # gardé sous test pour qu'on ne « simplifie » pas rms_match par erreur.
+    l_sq, l_tall = _update_rms(square, False), _update_rms(tall, False)
+    assert l_sq / l_tall > 1.3, \
+        (f"le scaling √cols devrait désavantager les matrices hautes "
+         f"(carré {l_sq:.3f} vs haute {l_tall:.3f}) — si cette assertion tombe, "
+         f"le piège a changé de forme, pas disparu")
+
+    # ── weight decay et AdamW embarqué ──────────────────────────────────────
+    p = nn.Parameter(torch.ones(4, 4))
+    p.grad = torch.zeros(4, 4)
+    Muon([p], lr=0.1, wd=0.5, ns_steps=5).step()
+    assert torch.allclose(p.detach(), torch.full((4, 4), 0.95)), "wd = p *= 1 - lr*wd"
+
+    m2 = nn.Parameter(torch.zeros(4, 4)); m2.grad = torch.randn(4, 4)
+    a2 = nn.Parameter(torch.zeros(4));    a2.grad = torch.randn(4)
+    opt = Muon([m2], lr=0.1, adam_params=[a2], adam_lr=0.1)
+    opt.step()
+    assert a2.detach().abs().sum() > 0, "les params 1-D doivent bouger via AdamW"
+    opt.zero_grad()
+    assert m2.grad is None and a2.grad is None, "zero_grad doit couvrir les DEUX groupes"
+
+    # un param sans gradient est simplement ignoré (pas d'exception)
+    p3 = nn.Parameter(torch.ones(4, 4))
+    Muon([p3], lr=0.1).step()
+    assert torch.equal(p3.detach(), torch.ones(4, 4))
+
+    # ── tri des paramètres : embeddings et statiques mHC chez AdamW ─────────
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(10, 4)      # 2-D mais lookup ⇒ AdamW
+            self.lin = nn.Linear(4, 4, bias=True)  # weight ⇒ Muon, bias ⇒ AdamW
+            self.norm = nn.LayerNorm(4)            # 1-D ⇒ AdamW
+            self.S_pre = nn.Parameter(torch.zeros(4, 4))     # statique mHC ⇒ AdamW
+            self.alpha_res = nn.Parameter(torch.zeros(4, 4))  # idem
+
+    toy = Toy()
+    mu, ad = _split_muon_params(toy)
+    assert [tuple(p.shape) for p in mu] == [(4, 4)], "seul lin.weight va chez Muon"
+    assert mu[0] is toy.lin.weight
+    for p in (toy.embed.weight, toy.lin.bias, toy.norm.weight, toy.S_pre,
+              toy.alpha_res):
+        assert any(p is q for q in ad), "paramètre attendu chez AdamW"
+    assert len(mu) + len(ad) == len(list(toy.parameters()))
+    # un paramètre gelé n'est dans aucun des deux groupes
+    toy.lin.weight.requires_grad_(False)
+    assert _split_muon_params(toy)[0] == []
+
+    print("muon self-test: OK (Newton-Schulz → σ=1 sur 4 formes + point fixe + "
+          "invariance d'échelle, rms_match égalise carré/haute à 0.2 alors que "
+          "√cols ne le fait pas, wd, AdamW embarqué + zero_grad, split params)")
+
+
+if __name__ == "__main__":
+    _selftest()

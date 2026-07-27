@@ -20,6 +20,18 @@ TIMEOUT=${TIMEOUT:-900}
 
 MODULES=(
   paths               # expansion ${TB_ROOT} dans les configs
+  sched               # schedules LR/β : identiques au calcul historique
+  runtime             # ddp/tf32/compile/grad_checkpoint (grads identiques)
+  ckpt                # save atomique + resume : les RNG reprennent la SUITE
+  mhc                 # RMSNorm + Sinkhorn : les deux garde-fous NaN du stack
+  moe                 # routage, loss d'équilibrage, garde-fou sqrt(softplus)
+  muon                # Newton-Schulz + le piège √cols du rms_match
+  memory              # write : FIFO, gates, pad-safety
+  cascade             # débordement en 2 temps, read sans dilution d'init
+  attention           # cache KV incrémental = recompute complet (float64)
+  model               # forward, portage de banque, mem_read_layers
+  decode              # génération unique : batch B>1 == ligne-à-ligne
+  code_defer_native   # ALIGNEMENT DES CIBLES (loaders ne décalent pas, la loss si)
   streams             # registre nom→classe : tout résout, alias RL compris
   exec_sandbox        # bac à sable d'exécution (le juge de l'env code)
   rl_rewards          # extraction + grading des récompenses RL
@@ -27,7 +39,9 @@ MODULES=(
   rl_disagg           # GRPO désagrégé : hub, staleness, groupes de workers
   math_school_data    # stream leçons/drills
   persona_chat_data   # stream persona (recall, octaves d'âge)
+  cfg_schema          # schéma des configs : clé inconnue = arrêt (anti-dérive ast)
   chat_mix            # mix pondéré de streams derrière le contrat mono-stream
+  chat_batch          # B lanes chat en lockstep par tour (padding, pas de ligne vide)
 )
 
 [ $# -gt 0 ] && MODULES=("$@")

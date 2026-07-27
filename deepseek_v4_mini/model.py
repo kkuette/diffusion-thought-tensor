@@ -106,8 +106,9 @@ class TrunkBlock(nn.Module):
 
         self.norm_attn = RMSNorm(cfg.d_model)
         self.norm_moe  = RMSNorm(cfg.d_model)
-        self.mhc_attn = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
-        self.mhc_moe  = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
+        _cf = bool(getattr(cfg, "sinkhorn_closed_form", False))
+        self.mhc_attn = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters, _cf)
+        self.mhc_moe  = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters, _cf)
         self._attn = attn
         self._moe  = moe
 
@@ -270,8 +271,9 @@ class DualModalBlock(nn.Module):
 
         self.norm_attn = RMSNorm(d)
         self.norm_moe  = RMSNorm(d)
-        self.mhc_attn  = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters)
-        self.mhc_moe   = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters)
+        _cf = bool(getattr(cfg, "sinkhorn_closed_form", False))
+        self.mhc_attn  = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters, _cf)
+        self.mhc_moe   = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters, _cf)
         self._attn = attn
         self._moe  = moe
 
@@ -329,14 +331,19 @@ class DualModalBlock(nn.Module):
             y   = y + self.fw_drop(upd)
         return h + self.fw_o(y - y0)
 
-    def forward(self, X: torch.Tensor, bank: Optional[torch.Tensor]):
+    def forward(self, X: torch.Tensor, bank: Optional[torch.Tensor], cache=None):
         """
-        X    : [B, T, n_hc, d_model]
-        bank : [B, M, mem_dim] or None
+        X     : [B, T, n_hc, d_model]
+        bank  : [B, M, mem_dim] or None
+        cache : AttnCache de CETTE couche (décodage incrémental) ou None
         Returns (X_new, balance_loss)
         """
-        # 1. Text self-attention (mHC wrapped)
-        X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
+        # 1. Text self-attention (mHC wrapped). Seule l'attention a besoin du
+        #    passé : mHC, MoE et le read fast-weight sont positionwise, donc en
+        #    décodage un token ne traverse le stack qu'une fois.
+        X = self.mhc_attn(X, (lambda h: self._attn(self.norm_attn(h)))
+                          if cache is None else
+                          (lambda h: self._attn.forward_cached(self.norm_attn(h), cache)))
 
         # 2. Fast-weight read (thought bank → text)
         if self.read_bank and bank is not None and bank.size(1) > 0:
@@ -406,6 +413,8 @@ class ThoughtBankLM(nn.Module):
         compute_logits: bool = True,
         pad_mask: Optional[torch.Tensor] = None,
         layer_banks: Optional[list] = None,
+        write: bool = True,
+        cache: Optional[list] = None,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -426,7 +435,8 @@ class ThoughtBankLM(nn.Module):
         # Cascade v3: layer_banks[i] = banque lue par la couche i (None = pas de
         # read). La banque VIVE (init_mem) reste seule sur le chemin d'écriture.
         for li, block in enumerate(self.blocks):
-            X, bal = block(X, bank if layer_banks is None else layer_banks[li])
+            X, bal = block(X, bank if layer_banks is None else layer_banks[li],
+                           cache=None if cache is None else cache[li])
             total_bal = total_bal + bal
         total_bal = total_bal / cfg.n_layers
 
@@ -437,16 +447,27 @@ class ThoughtBankLM(nn.Module):
         H_text = self.norm_out(H_text)
 
         # ── Step 5: gated thought write + FIFO eviction ───────────────────────
-        mem_bank = self.thought_stream._write(H_text, bank, pad_mask)
+        # write=False : le décodage jette de toute façon la banque écrite (il ne
+        # garde que les logits), et le write est un pool attentionnel sur TOUTE
+        # la séquence — donc le seul morceau du forward qui ne soit pas
+        # cachable de manière incrémentale. Ne pas le calculer économise ce
+        # pool à chaque token généré, et la banque ressort telle quelle.
+        if write:
+            mem_bank = self.thought_stream._write(H_text, bank, pad_mask)
+        else:
+            mem_bank = bank
 
         # ── Step 6: outputs ───────────────────────────────────────────────────
+        # sans write, la télémétrie est explicitement None : rendre celle du
+        # forward PRÉCÉDENT ferait passer une valeur périmée pour une mesure.
+        ts = self.thought_stream
         out = {
             "balance_loss":     total_bal,
             "mem_bank":         mem_bank,
-            "write_alpha":      self.thought_stream.last_write_alpha,       # mean α (telemetry)
-            "write_penalty":    self.thought_stream.last_write_penalty,     # diff E[-log(1-α)]
-            "write_alpha_mean": self.thought_stream.last_write_alpha_mean,  # diff E[α]
-            "write_redundancy": self.thought_stream.last_write_redundancy,  # diff E[max cos]
+            "write_alpha":      ts.last_write_alpha if write else None,       # mean α (telemetry)
+            "write_penalty":    ts.last_write_penalty if write else None,     # diff E[-log(1-α)]
+            "write_alpha_mean": ts.last_write_alpha_mean if write else None,  # diff E[α]
+            "write_redundancy": ts.last_write_redundancy if write else None,  # diff E[max cos]
         }
         if compute_logits:
             out["logits"] = self.lm_head(H_text)                           # [B,T,V]
@@ -458,7 +479,124 @@ class ThoughtBankLM(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def make_cache(self) -> list:
+        """Un cache d'attention vide par couche, à passer à `forward(cache=…)`
+        pour décoder de façon incrémentale (voir attention.AttnCache)."""
+        from .attention import AttnCache
+        return [AttnCache() for _ in self.blocks]
+
 
 # Legacy aliases (pre-rename scripts)
 DeepSeekV4Mini = TrunkLM
 DualModalDeepSeekV4Mini = ThoughtBankLM
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _selftest() -> None:
+    """Contrat du forward : formes, portage de banque, et surtout `mem_read_layers`.
+
+    Le test qui compte est celui du read restreint : `mem_read_layers` est un
+    levier d'architecture (lire à chaque bloc compose les transformées en
+    profondeur), et rien dans une loss ne dit qu'il a été pris en compte. Ici on
+    vérifie que le bloc non désigné est LITTÉRALEMENT insensible à la banque.
+    """
+    torch.manual_seed(0)
+    V, B, T = 40, 2, 12
+
+    def _cfg(**kw):
+        base = dict(vocab_size=V, d_model=32, n_layers=4, n_heads=2, d_head=8,
+                    csa_m=2, hca_m=4, top_k_csa=2, n_win=4, d_latent_q=8,
+                    n_groups=1, n_experts=4, n_shared=1, top_k_experts=2, d_ff=32,
+                    mem_dim=16, max_mem=4, mem_seed_slots=2, mem_read_rank=4,
+                    sinkhorn_iters=5)
+        base.update(kw)
+        return ThoughtBankConfig(**base)
+
+    ids = torch.randint(0, V, (B, T))
+
+    # ── formes et sorties ───────────────────────────────────────────────────
+    m = ThoughtBankLM(_cfg())
+    o = m(ids)
+    assert o["logits"].shape == (B, T, V)
+    assert o["mem_bank"].shape == (B, 3, 16), \
+        f"banque fraîche = mem_seed_slots + 1 write, vu {tuple(o['mem_bank'].shape)}"
+    assert torch.isfinite(o["logits"]).all() and torch.isfinite(o["balance_loss"])
+    for k in ("write_alpha", "write_penalty", "write_alpha_mean", "write_redundancy"):
+        assert o[k] is not None, k
+    # compute_logits=False : le head est rendu pour une CE fusionnée hors modèle
+    o2 = m(ids, compute_logits=False)
+    assert "logits" not in o2 and o2["hidden"].shape == (B, T, 32)
+    assert o2["lm_head_weight"] is m.lm_head.weight
+
+    # ── portage de banque : entrée → sortie = +1 write, plafonné à max_mem ──
+    bank = torch.randn(B, 2, 16)
+    assert m(ids, init_mem=bank)["mem_bank"].shape == (B, 3, 16)
+    full = torch.randn(B, 4, 16)                      # déjà à max_mem
+    assert m(ids, init_mem=full)["mem_bank"].shape == (B, 4, 16)
+    # une banque vide est traitée comme absente (seedée), jamais comme une erreur
+    assert m(ids, init_mem=torch.zeros(B, 0, 16))["mem_bank"].shape == (B, 3, 16)
+
+    # ── la banque INFLUENCE la sortie (sinon tout le programme est vide) ────
+    torch.manual_seed(7)
+    b1, b2 = torch.randn(B, 4, 16), torch.randn(B, 4, 16)
+    l1 = m(ids, init_mem=b1)["logits"]
+    l2 = m(ids, init_mem=b2)["logits"]
+    assert not torch.allclose(l1, l2, atol=1e-6), \
+        "deux banques différentes donnent la même sortie : le read est mort"
+    # …et le gradient remonte jusqu'à la banque (le read est entraînable)
+    b3 = b1.clone().requires_grad_(True)
+    m(ids, init_mem=b3)["logits"].sum().backward()
+    assert b3.grad is not None and b3.grad.abs().sum() > 0
+
+    # ── mem_read_layers : seuls les blocs désignés lisent ───────────────────
+    mr = ThoughtBankLM(_cfg(mem_read_layers=[3]))
+    assert [blk.read_bank for blk in mr.blocks] == [False, False, False, True]
+    # le bloc non lecteur est insensible à la banque, exactement
+    X = torch.randn(B, T, 2, 32)
+    with torch.no_grad():
+        a = mr.blocks[0](X, b1)[0]
+        c = mr.blocks[0](X, b2)[0]
+    assert torch.equal(a, c), "un bloc read_bank=False lit encore la banque"
+    with torch.no_grad():
+        d1 = mr.blocks[3](X, b1)[0]
+        d2 = mr.blocks[3](X, b2)[0]
+    assert not torch.equal(d1, d2), "le bloc désigné ne lit pas la banque"
+    # liste vide = tous les blocs (comportement historique)
+    assert all(blk.read_bank for blk in ThoughtBankLM(_cfg()).blocks)
+
+    # ── layer_banks (cascade) : chaque couche lit la banque qu'on lui donne ─
+    lb = [b1, None, b2, b1]
+    assert torch.isfinite(m(ids, layer_banks=lb)["logits"]).all()
+    # None sur une couche = pas de read, pas un plantage
+    assert torch.isfinite(m(ids, layer_banks=[None] * 4)["logits"]).all()
+
+    # ── déterminisme en eval (dropout coupé) ────────────────────────────────
+    me = ThoughtBankLM(_cfg(dropout=0.1)).eval()
+    with torch.no_grad():
+        assert torch.equal(me(ids, init_mem=b1)["logits"],
+                           me(ids, init_mem=b1)["logits"])
+
+    # ── pad_mask : une ligne entièrement pad ne contamine pas le write ──────
+    pm = torch.ones(B, T, dtype=torch.bool)
+    pm[1] = False
+    assert torch.isfinite(m(ids, pad_mask=pm)["mem_bank"]).all()
+
+    # ── variantes de read : swiglu, spectral norm ───────────────────────────
+    for kw in ({"mem_read_swiglu": True}, {"mem_read_spectral_norm": True}):
+        mv = ThoughtBankLM(_cfg(**kw))
+        ov = mv(ids, init_mem=b1)
+        assert torch.isfinite(ov["logits"]).all(), kw
+        ov["logits"].sum().backward()
+
+    # ── poids liés embed/lm_head (économie de params assumée) ───────────────
+    assert m.lm_head.weight is m.embed.weight
+
+    print("model self-test: OK (formes + compute_logits, portage de banque "
+          "plafonné, la banque influence la sortie et reçoit du gradient, "
+          "mem_read_layers restreint LITTÉRALEMENT, layer_banks + None, "
+          "déterminisme eval, pad_mask, read swiglu/SN, poids liés)")
+
+
+if __name__ == "__main__":
+    _selftest()

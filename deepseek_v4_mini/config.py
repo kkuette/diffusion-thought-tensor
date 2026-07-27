@@ -21,6 +21,13 @@ class ThoughtBankConfig:
     # ── mHC: Manifold-Constrained Hyper-Connections (§2.2) ───────────────────
     n_hc: int = 2              # residual stream expansion factor
     sinkhorn_iters: int = 20   # Sinkhorn-Knopp iterations (paper uses t_max=20)
+    # À n_hc == 2, la projection de Birkhoff a une forme CLOSE : la boucle de 20
+    # itérations approche un point fixe qu'on sait écrire exactement (voir
+    # mhc._sinkhorn). Elle coûte 26 % des ops du forward pour un résultat qui
+    # n'est doublement stochastique qu'à 2.5e-2 près. OFF par défaut : le contrat
+    # de non-régression du dépôt veut qu'une config existante reproduise à
+    # l'identique. À poser dans toute config neuve (n_hc vaut 2 partout).
+    sinkhorn_closed_form: bool = False
 
     # ── Attention (§2.3) ──────────────────────────────────────────────────────
     csa_m: int = 4             # CSA: compress every m tokens (overlapping)
@@ -207,9 +214,28 @@ class ThoughtBankConfig:
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ThoughtBankConfig":
+        """Config au format PLAT (arc dsv4mini) : les clés modèle sont à la racine.
+
+        Le filtrage silencieux des clés inconnues est volontaire — une config
+        plate porte aussi ses clés d'entraînement à la racine, et `repro/run_all.sh`
+        en dépend. Ce qui n'est PAS acceptable, c'est de rendre un config
+        entièrement par défaut sans le dire : appelée sur une config IMBRIQUÉE
+        (format actif, bloc `model:`), cette méthode ne matchait aucune clé et
+        renvoyait les valeurs d'usine — un modèle silencieusement faux. Les deux
+        cas se lèvent maintenant.
+        """
         with open(path) as f:
             data = expand(yaml.safe_load(f)) or {}
+        if "model" in data:
+            raise ValueError(
+                f"{path}: config imbriquée (bloc `model:`) — from_yaml lit le "
+                f"format PLAT et rendrait un config tout par défaut. "
+                f"Utiliser ThoughtBankConfig(**raw['model']).")
         fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        if not fields:
+            raise ValueError(
+                f"{path}: aucune clé modèle reconnue à la racine — from_yaml "
+                f"rendrait un config tout par défaut.")
         return cls(**fields)
 
 

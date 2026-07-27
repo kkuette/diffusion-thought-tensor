@@ -27,6 +27,8 @@ CHAT_STREAMS: dict[str, tuple[str, str]] = {
     "persona":      ("persona_chat_data", "PersonaChatStream"),
     "math_school":  ("math_school_data",  "MathSchoolStream"),
     "chat_mix":     ("chat_mix",          "ChatMixStream"),
+    # enveloppe : B lanes du stream qu'il enveloppe, en lockstep par tour
+    "chat_batch":   ("chat_batch",        "ChatBatchStream"),
 }
 
 # rl_disagg nomme ses envs par `kind:` (historique, et les configs RL déjà

@@ -6,8 +6,8 @@ chez quelqu'un d'autre, alors que le but du dépôt est que les claims soient
 reproductibles. Elles s'écrivent désormais relativement à `${TB_ROOT}`, qui
 vaut `.` par défaut : sans rien configurer, un run écrit dans le dépôt.
 
-    data:    {cache_dir: ${TB_ROOT}/data_cache}
-    logging: {save_dir: ${TB_ROOT}/checkpoints/v350_phase1}
+    data:     {cache_dir: ${TB_ROOT}/data_cache}
+    training: {save_dir: ${TB_ROOT}/checkpoints/v350_phase1}
 
     $ python -m deepseek_v4_mini.code_defer_native cfg.yaml      # → ./data_cache
     $ TB_ROOT=/mnt/big_volume python -m deepseek_v4_mini.code_defer_native cfg.yaml

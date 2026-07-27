@@ -274,6 +274,111 @@ class CompressedSparseAttention(nn.Module):
 
         return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
 
+    # ── décodage incrémental ─────────────────────────────────────────────────
+
+    def _fill_cache(self, H: torch.Tensor, cache) -> None:
+        """Remplit le cache après un forward complet sur le préfixe."""
+        B, T, _ = H.shape
+        m = self.m
+        nb = T // m                               # blocs FERMÉS par ce préfixe
+        cache.comp = (self._compress_kv(H[:, :nb * m]) if nb
+                      else H.new_zeros(B, 0, self.d_head))
+        cache.hist = H[:, max(0, (nb - 1) * m):]  # de quoi fermer le bloc suivant
+        cache.wk = _win_init(self.kv_norm(self.W_wk(H)), self.n_win)
+        cache.wv = _win_init(self.W_wv(H), self.n_win)
+        cache.pos = T
+
+    def forward_cached(self, H_new: torch.Tensor, cache) -> torch.Tensor:
+        """Un pas de décodage : H_new est [B, 1, d], le préfixe vit dans `cache`.
+
+        Le premier appel (cache vide) délègue au forward COMPLET — même code,
+        donc mêmes activations que l'entraînement — puis remplit le cache.
+        """
+        B, S, _ = H_new.shape
+        if cache.pos == 0:
+            out = self.forward(H_new)
+            self._fill_cache(H_new, cache)
+            return out
+        assert S == 1, "après le préfixe, le cache avance token par token"
+
+        m, n_win = self.m, self.n_win
+        p = cache.pos                              # position ABSOLUE du token
+        h = H_new
+
+        # 1. requête à la position absolue p (RoPE décalé)
+        cQ = self.W_dq(h)
+        q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
+        cos, sin = _rope_at(p, 1, self.d_head, h.device)
+        q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
+        q = self.q_norm(q)
+
+        # 2. indexeur + top-k. Le cache ne détient QUE les blocs fermés, mais on
+        #    présente au top-k le même nombre de candidats que le chemin
+        #    complet (les blocs interdits par la causalité à -inf) : sur des
+        #    scores ex æquo — le cas d'un indexeur encore plat en début
+        #    d'entraînement, où le ReLU renvoie 0 partout — `topk` départage par
+        #    l'INDICE, donc offrir moins de candidats change la sélection. Les
+        #    entrées invalides sont ensuite masquées comme dans le chemin
+        #    complet, et leur poids d'attention est exactement nul.
+        comp = cache.comp                          # [B, nb_vis, d_head]
+        nb = comp.size(1)
+        nbf = -(-(p + 1) // m)                     # n_blocks vu par le forward
+        n_ih = self.n_idx_heads
+        qI = self.W_iq(cQ).view(B, 1, n_ih, self.d_head)
+        w_h = self.W_w(h)
+        k = min(self.top_k, nbf)
+        if k > 0:
+            if nb > 0:
+                sc_h = F.relu(torch.einsum("bthd,bnd->bthn", qI, comp)
+                              / math.sqrt(self.d_head))
+                sc = torch.einsum("bth,bthn->btn", w_h, sc_h)      # [B,1,nb]
+            else:
+                sc = h.new_zeros(B, 1, 0)
+            if nbf > nb:                           # blocs causalement interdits
+                sc = F.pad(sc, (0, nbf - nb), value=float("-inf"))
+            top_scores, top_idx = sc.topk(k, dim=-1)
+            valid = top_scores > -1e9                              # [B,1,k]
+            if nb > 0:
+                exp = top_idx.clamp(max=nb - 1).unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+                KV_sel = self.kv_norm(
+                    comp.unsqueeze(1).expand(-1, 1, -1, -1).gather(2, exp))
+            else:
+                KV_sel = h.new_zeros(B, 1, k, self.d_head)
+        else:
+            valid = h.new_zeros(B, 1, 0, dtype=torch.bool)
+            KV_sel = h.new_zeros(B, 1, 0, self.d_head)
+
+        # 3. fenêtre glissante : les n_win tokens qui PRÉCÈDENT p (le chemin
+        #    complet n'inclut pas le token courant dans sa propre fenêtre)
+        K_all = torch.cat([KV_sel, cache.wk.unsqueeze(1)], dim=2)
+        V_all = torch.cat([KV_sel, cache.wv.unsqueeze(1)], dim=2)
+        n_kv = k + n_win
+
+        q_bt = q.reshape(B, self.n_heads, self.d_head)
+        logits = torch.einsum("bhd,bnd->bhn", q_bt,
+                              K_all.reshape(B, n_kv, self.d_head)) / math.sqrt(self.d_head)
+        if k > 0:
+            vb = valid.reshape(B, k).unsqueeze(1).expand(-1, self.n_heads, -1)
+            logits[:, :, :k] = logits[:, :, :k].masked_fill(~vb, float("-inf"))
+        attn_w = _attn_sink_softmax(logits, self.sink_logits, self.drop)
+        out = torch.einsum("bhn,bnd->bhd", attn_w,
+                           V_all.reshape(B, n_kv, self.d_head)
+                           ).view(B, 1, self.n_heads, self.d_head)
+
+        # 4. avancer le cache — APRÈS l'attention : le bloc que ce token vient
+        #    de fermer le contient, et le masque causal l'interdit à lui-même.
+        hist = torch.cat([cache.hist, h], dim=1)
+        if (p + 1) % m == 0:
+            newc = self._compress_kv(hist[:, -2 * m:])[:, -1:]
+            cache.comp = torch.cat([cache.comp, newc], dim=1)
+            hist = hist[:, -m:]
+        cache.hist = hist[:, -2 * m:]
+        cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
+        cache.wv = _win_push(cache.wv, self.W_wv(h), n_win)
+        cache.pos = p + 1
+
+        return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
+
 
 # ── Heavily Compressed Attention (HCA) ───────────────────────────────────────
 
@@ -390,3 +495,222 @@ class HeavilyCompressedAttention(nn.Module):
         out    = torch.einsum("bhn,bnd->bhd", attn_w, V_all_bt).view(B, T, self.n_heads, self.d_head)
 
         return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
+
+    # ── décodage incrémental (même principe que CSA, sans top-k) ─────────────
+
+    def _fill_cache(self, H: torch.Tensor, cache) -> None:
+        B, T, _ = H.shape
+        m = self.m_prime
+        nb = T // m
+        cache.comp = (self.kv_norm(self._compress_kv(H[:, :nb * m])) if nb
+                      else H.new_zeros(B, 0, self.d_head))
+        cache.hist = H[:, max(0, (nb - 1) * m):]
+        cache.wk = _win_init(self.kv_norm(self.W_wk(H)), self.n_win)
+        cache.wv = _win_init(self.W_wv(H), self.n_win)
+        cache.pos = T
+
+    def forward_cached(self, H_new: torch.Tensor, cache) -> torch.Tensor:
+        B, S, _ = H_new.shape
+        if cache.pos == 0:
+            out = self.forward(H_new)
+            self._fill_cache(H_new, cache)
+            return out
+        assert S == 1, "après le préfixe, le cache avance token par token"
+
+        m, n_win = self.m_prime, self.n_win
+        p = cache.pos
+        h = H_new
+
+        cQ = self.W_dq(h)
+        q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
+        cos, sin = _rope_at(p, 1, self.d_head, h.device)
+        q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
+        q = self.q_norm(q)
+        q_bt = q.reshape(B, self.n_heads, self.d_head)
+
+        # mêmes formes que le chemin complet : les blocs interdits par la
+        # causalité sont présentés à -inf (poids exactement nul), plutôt
+        # qu'omis — c'est ce qui rend la comparaison bit à bit possible.
+        comp = cache.comp                          # blocs fermés (= visibles)
+        nb = comp.size(1)
+        nbf = -(-(p + 1) // m)
+        K_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
+                           cache.wk], dim=1)
+        V_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
+                           cache.wv], dim=1)
+        logits = torch.einsum("bhd,bnd->bhn", q_bt, K_all) / math.sqrt(self.d_head)
+        if nbf > nb:
+            logits[:, :, nb:nbf] = float("-inf")
+        attn_w = _attn_sink_softmax(logits, self.sink_logits, self.drop)
+        out = torch.einsum("bhn,bnd->bhd", attn_w, V_all
+                           ).view(B, 1, self.n_heads, self.d_head)
+
+        hist = torch.cat([cache.hist, h], dim=1)
+        if (p + 1) % m == 0:
+            newc = self.kv_norm(self._compress_kv(hist[:, -m:]))
+            cache.comp = torch.cat([cache.comp, newc], dim=1)
+            hist = hist[:, -m:]
+        cache.hist = hist[:, -2 * m:]
+        cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
+        cache.wv = _win_push(cache.wv, self.W_wv(h), n_win)
+        cache.pos = p + 1
+
+        return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
+
+
+# ── Cache KV incrémental ─────────────────────────────────────────────────────
+#
+# Sans cache, générer un token coûte un forward complet sur TOUT le préfixe :
+# à max_new=240 (tour de l'env code-exec) un seul tour paie ~125k tokens-forward
+# là où le travail réel en demande 640. Comme le décodage est le goulot déclaré
+# de rl_disagg, c'est deux ordres de grandeur jetés dans la phase RL.
+#
+# Ce qui rend le cache possible ici tient à un détail du masque causal : un token
+# t ne voit un bloc compressé j que si j < t // m — donc uniquement des blocs
+# COMPLETS, dont le contenu ne dépend que de tokens déjà vus. Le bloc en cours
+# (celui qui contient t, et le rembourrage de fin de séquence) n'est JAMAIS lu.
+# Un bloc, une fois fermé, est donc définitif : on le calcule une fois.
+#
+# Le reste suit : la fenêtre glissante garde ses n_win dernières entrées (avec
+# les zéros à gauche du début de séquence, que le chemin complet produit aussi
+# via son F.pad), et tout ce qui n'est pas l'attention — mHC, MoE, read
+# fast-weight — est déjà positionwise.
+
+class AttnCache:
+    """État porté par UNE couche d'attention entre deux tokens décodés.
+
+    `comp` ne contient que des blocs fermés — ceux que le masque causal autorise.
+    `hist` garde juste assez de H brut pour fermer le bloc suivant (2m pour la
+    compression chevauchante de CSA, qui fusionne le bloc courant et son
+    prédécesseur ; m suffirait à HCA, on ne complique pas).
+    """
+    __slots__ = ("pos", "comp", "hist", "wk", "wv")
+
+    def __init__(self) -> None:
+        self.pos = 0            # tokens déjà consommés
+        self.comp = None        # [B, nb, d_head] blocs compressés FERMÉS
+        self.hist = None        # [B, ≤2m, d_model] queue de H
+        self.wk = None          # [B, n_win, d_head] fenêtre (zéros à gauche)
+        self.wv = None
+
+
+def _rope_at(pos: int, n: int, dim: int, device: torch.device):
+    """cos/sin de RoPE aux positions ABSOLUES [pos, pos+n).
+
+    Élément par élément, `p * inv_freq` vaut la même chose qu'on le calcule dans
+    un tenseur de longueur T ou de longueur 1 : le cache incrémental retrouve
+    donc au bit près les angles du chemin complet.
+    """
+    half = dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, device=device).float() / half))
+    t = torch.arange(pos, pos + n, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    return freqs.cos(), freqs.sin()
+
+
+def _win_push(buf, new, n_win):
+    """Fait glisser la fenêtre d'un token. `buf` est [B, n_win, d]."""
+    return torch.cat([buf[:, 1:], new], dim=1) if n_win > 0 else buf
+
+
+def _win_init(vals, n_win):
+    """Les n_win dernières entrées, complétées à GAUCHE par des zéros — la même
+    convention que le F.pad(..., n_win, 0) du chemin complet."""
+    B, T, d = vals.shape
+    if n_win == 0:
+        return vals.new_zeros(B, 0, d)
+    if T >= n_win:
+        return vals[:, T - n_win:]
+    return torch.cat([vals.new_zeros(B, n_win - T, d), vals], dim=1)
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _mk(cls, dtype, **kw):
+    """Un module de test dont l'indexeur n'est PAS dégénéré.
+
+    À l'init par défaut les scores de l'indexeur passent par un ReLU qui rend 0
+    partout : tous les blocs sont ex æquo, `topk` départage par l'indice, et un
+    cache faux passerait le test sans qu'on voie rien. On rend donc les poids
+    non triviaux — c'est le seul régime où la sélection top-k discrimine.
+    """
+    import torch.nn as nn
+    m = cls(d_model=24, n_heads=4, d_head=8, n_win=5, d_latent_q=8,
+            n_groups=2, **kw)
+    for p in m.parameters():
+        if p.dim() >= 2:
+            nn.init.normal_(p, std=0.5)
+    return m.to(dtype).eval()
+
+
+def _selftest() -> None:
+    """Le garde-fou du cache : décoder token par token doit rendre EXACTEMENT ce
+    que rend un recompute complet — y compris (surtout) aux longueurs qui
+    TRAVERSENT une frontière de bloc `csa_m` / `hca_m`.
+
+    « Exactement » se mesure en float64, pas au bit près en float32 : le chemin
+    complet contracte ses matmuls sur B*T lignes, le cache sur B — c'est une
+    autre réduction BLAS, donc quelques ULP d'écart, sans rapport avec la
+    correction de l'algorithme. En float64 l'écart tombe à l'epsilon machine
+    (~1e-16) : toute VRAIE erreur (bloc fermé un token trop tôt, fenêtre
+    décalée, RoPE à la mauvaise position absolue) est en O(1) et ne peut pas s'y
+    cacher. C'est un test plus dur qu'une égalité bit à bit en float32, qui
+    aurait dû tolérer ces mêmes ULP.
+    """
+    torch.manual_seed(0)
+    M, MP, NW = 4, 6, 5
+
+    for dtype, tol in ((torch.float64, 1e-13), (torch.float32, 1e-5)):
+        for name, mod, m in (("CSA", _mk(CompressedSparseAttention, dtype,
+                                         csa_m=M, top_k=3), M),
+                             ("HCA", _mk(HeavilyCompressedAttention, dtype,
+                                         hca_m=MP), MP)):
+            H = torch.randn(2, 3 * m + 8, 24, dtype=dtype)
+            worst = 0.0
+            with torch.no_grad():
+                # préfixes autour des frontières : avant, pile dessus, après —
+                # plus un préfixe plus court que la fenêtre glissante
+                for T0 in (1, 2, m - 1, m, m + 1, 2 * m, NW + 1):
+                    cache = AttnCache()
+                    out = mod.forward_cached(H[:, :T0], cache)
+                    assert torch.equal(out, mod.forward(H[:, :T0])), \
+                        f"{name}: le préfixe doit passer par le forward COMPLET"
+                    assert cache.pos == T0
+                    for i in range(T0, H.size(1)):
+                        assert cache.comp.size(1) == cache.pos // m, \
+                            (f"{name}: {cache.comp.size(1)} blocs fermés pour "
+                             f"pos {cache.pos} (attendu {cache.pos // m})")
+                        step = mod.forward_cached(H[:, i:i + 1], cache)
+                        full = mod.forward(H[:, :i + 1])[:, -1:]
+                        assert step.shape == full.shape
+                        err = (step - full).abs().max().item()
+                        rel = err / (full.abs().max().item() or 1.0)
+                        worst = max(worst, rel)
+                        assert rel <= tol, (
+                            f"{name}/{dtype}: cache ≠ recompute à la position "
+                            f"{i} (préfixe {T0}, m={m}, ferme un bloc="
+                            f"{(i + 1) % m == 0}) — écart relatif {rel:.3e}")
+            if dtype is torch.float64:
+                assert worst < 1e-13, worst
+                _worst64 = worst
+
+    # ── la fenêtre glissante n'inclut PAS le token courant, et démarre sur des
+    #    zéros — c'est la convention du F.pad du chemin complet, pas un choix ─
+    mod = _mk(CompressedSparseAttention, torch.float64, csa_m=M, top_k=3)
+    cache = AttnCache()
+    H = torch.randn(1, 2, 24, dtype=torch.float64)
+    with torch.no_grad():
+        mod.forward_cached(H[:, :1], cache)
+    assert cache.wk.shape == (1, NW, 8)
+    assert float(cache.wk[:, :NW - 1].abs().max()) == 0.0, \
+        "la fenêtre doit être remplie de zéros À GAUCHE au début de séquence"
+    assert float(cache.wk[:, -1:].abs().max()) > 0.0, "le token 0 manque"
+
+    print(f"attention self-test: OK (CSA+HCA, cache incrémental exact au "
+          f"recompute complet — float64 ≤1e-13, float32 ≤1e-5 (ULP BLAS) — "
+          f"7 longueurs de préfixe, franchissements csa_m={M}/hca_m={MP} "
+          f"inclus, blocs fermés = pos//m, fenêtre zéro-paddée à gauche)")
+
+
+if __name__ == "__main__":
+    _selftest()

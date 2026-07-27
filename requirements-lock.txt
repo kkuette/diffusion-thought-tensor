@@ -1,0 +1,37 @@
+# Versions EXACTES de l'environnement qui produit les résultats du dépôt
+# (conda env `diffusion-thought`, python 3.10.20, RTX 3090 / WSL2 + pods A100).
+#
+# `requirements.txt` garde des bornes lâches pour une install humaine ; ce
+# fichier-ci existe parce que le livrable du dépôt est « un lecteur reproduit
+# des claims » : sans versions figées, un `torch>=2.1.0` de 2028 ne reproduit
+# rien. C'est la photo de l'env, pas une contrainte d'install.
+#
+#   pip install -r requirements-lock.txt
+#
+# torch est épinglé SANS suffixe CUDA : la roue CUDA se choisit à l'install
+# (`--index-url https://download.pytorch.org/whl/cu130` pour la build de l'env
+# de référence, +cu130 ; l'index par défaut donne la roue CPU, suffisante pour
+# les self-tests). Le reste vient de PyPI tel quel.
+
+torch==2.12.1
+
+transformers==5.12.1
+tokenizers==0.22.2
+datasets==2.16.0
+safetensors==0.8.0
+# sentencepiece : listé en filet dans requirements.txt, ABSENT de l'env de
+# référence — le tokenizer SmolLM2 n'en a pas besoin. Non épinglé exprès.
+
+numpy==1.26.4
+pyarrow==24.0.0
+dill==0.3.7
+fsspec==2023.10.0
+filelock==3.29.4
+regex==2026.6.28
+requests==2.34.2
+packaging==26.0
+protobuf==4.23.4
+
+PyYAML==6.0.3
+tqdm==4.68.3
+tensorboard==2.15.0

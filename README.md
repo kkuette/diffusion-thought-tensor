@@ -327,6 +327,12 @@ slot count identical:
   receives gradient and the bank is filled by an untrained projection.
 - **NaN stability**: `muon_lr ≈ 0.003` and `sinkhorn_iters = 20` (the bigger
   levers); RMSNorm variance in fp32; Sinkhorn with per-matrix max-subtract.
+- **Sinkhorn at `n_hc = 2`**: the Birkhoff projection has a *closed form* —
+  `p = sigmoid((l₀₀+l₁₁−l₀₁−l₁₀)/2)`, `M = [[p,1−p],[1−p,p]]` — so the iteration
+  count stops mattering: `model.sinkhorn_closed_form: true` is exact, makes
+  `‖B‖₂ ≤ 1` unconditional, drops the `exp` entirely, and removes 26% of the
+  forward's aten ops. Every config here runs `n_hc = 2`. Opt-in (default off) so
+  existing runs still reproduce; see `mhc._sinkhorn_2x2` for the derivation.
 
 ---
 

@@ -1,0 +1,44 @@
+name: ci
+
+# Tout ce qui peut être vérifié sans GPU ni données. Les self-tests du paquet
+# sont hermétiques (vérifié : cache HF vide + HF_HUB_OFFLINE=1), donc la CI ne
+# télécharge aucun modèle et ne dépend pas de la disponibilité de HF.
+#
+# Ce qui N'EST PAS ici et reste manuel sur la 3090 : le smoke d'entraînement et
+# le test de resume bit-identique (ils veulent un GPU et le cache de chunks).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Dépendances (torch CPU — les tests ne touchent pas au GPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Smoke d'import (tout le paquet)
+        run: python scripts/import_smoke.py
+
+      - name: Self-tests hermétiques
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: bash scripts/selftest.sh
+
+      - name: Configs actives valides (schéma)
+        run: python -m deepseek_v4_mini.cfg_schema
