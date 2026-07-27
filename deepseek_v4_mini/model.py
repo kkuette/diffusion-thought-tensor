@@ -303,6 +303,41 @@ class DualModalBlock(nn.Module):
         # Dynamic mHC collapse for the read: same principle as A_out_net.
         self.A_cross_net = nn.Linear(d, n_hc, bias=False)
 
+        # decode_fuse : mémo (banque → A, Bm), voir _fw_maps.
+        self.decode_fuse = bool(getattr(cfg, "decode_fuse", False))
+        self._fw_memo = None
+
+    def _fw_maps(self, bank: torch.Tensor):
+        """Projette la banque en poids fast-weight (A, Bm) — voir _cross_modal.
+
+        A et Bm ne dépendent QUE de la banque, et la banque est constante entre
+        deux writes (invariant du projet : sa seule modification est l'append
+        d'un write au `<think>`, un torch.cat ⇒ NOUVEAU tenseur). Le décodage
+        les reprojetait pourtant à chaque token — 2 Linear × 12 couches/token
+        pour un résultat identique. Sous decode_fuse et no-grad, mémo par
+        IDENTITÉ d'objet (`is`, pas data_ptr : l'allocateur réutilise les
+        adresses) + compteur d'in-place `_version` (une mutation en place
+        garderait l'identité mais changerait le contenu — jamais le cas dans le
+        dépôt, la garde coûte une lecture d'attribut). Un write ⇒ nouvel objet
+        ⇒ miss ⇒ recalcul ; le bras ablaté (seed_bank tire un tenseur NEUF par
+        token) rate le `is` à chaque fois ⇒ comportement inchangé.
+        """
+        memo_ok = self.decode_fuse and not torch.is_grad_enabled()
+        if memo_ok and self._fw_memo is not None:
+            mb, mv, A, Bm = self._fw_memo
+            if mb is bank and mv == bank._version:
+                return A, Bm
+        B, M, _ = bank.shape
+        r = self.read_rank
+        _na = 2 if self.fw_swiglu else 1
+        d = self.fw_B.out_features // r
+        A = self.fw_A(bank).view(B, M, _na, r, d)   # [B, M, 1|2, r, d]
+        Bm = self.fw_B(bank).view(B, M, d, r)       # [B, M, d, r]
+        # sous gradient le mémo est purgé : l'entraînement DOIT reprojeter à
+        # chaque forward pour que le gradient traverse fw_A/fw_B vers la banque
+        self._fw_memo = (bank, bank._version, A, Bm) if memo_ok else None
+        return A, Bm
+
     def _cross_modal(self, h: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
         """
         h    : [B, T, d]         – current text representations
@@ -313,9 +348,7 @@ class DualModalBlock(nn.Module):
         d = h.size(-1)
         r = self.read_rank
 
-        _na = 2 if self.fw_swiglu else 1
-        A = self.fw_A(bank).view(B, M, _na, r, d)  # [B, M, 1|2, r, d]
-        Bm = self.fw_B(bank).view(B, M, d, r)      # [B, M, d, r]
+        A, Bm = self._fw_maps(bank)                # [B,M,1|2,r,d], [B,M,d,r]
 
         ds = d ** -0.5
         rs = r ** -0.5
@@ -593,10 +626,64 @@ def _selftest() -> None:
     # ── poids liés embed/lm_head (économie de params assumée) ───────────────
     assert m.lm_head.weight is m.embed.weight
 
+    # ── decode_fuse : hoisting fw_A/fw_B — mêmes bits, et le mémo n'est
+    #    JAMAIS servi périmé (write = nouvel objet ; mutation = _version) ─────
+    from .decode import generate
+    torch.manual_seed(11)
+    m_off = ThoughtBankLM(_cfg()).double().eval()
+    m_on = ThoughtBankLM(_cfg(decode_fuse=True)).double().eval()
+    m_on.load_state_dict(m_off.state_dict())
+    bank64 = torch.randn(B, 4, 16, dtype=torch.float64)
+    pr = torch.randint(0, V, (B, 5))
+    for use_cache in (False, True):
+        g1, l1_ = generate(m_off, pr, bank=bank64, max_new=10, use_cache=use_cache)
+        g2, l2_ = generate(m_on, pr, bank=bank64, max_new=10, use_cache=use_cache)
+        assert torch.equal(g1, g2) and torch.equal(l1_, l2_), \
+            f"decode_fuse change le décodage (cache={use_cache})"
+    # le mémo est bien SERVI (fw_A ne tourne qu'une fois pour une banque
+    # donnée — y compris À TRAVERS les generate, tant qu'aucun write ne l'a
+    # remplacée ; banque fraîche ici pour partir d'un mémo froid)
+    calls = {"n": 0}
+    orig = m_on.blocks[0].fw_A.forward
+    m_on.blocks[0].fw_A.forward = lambda x: (calls.__setitem__("n", calls["n"] + 1),
+                                             orig(x))[1]
+    bank_c = bank64.clone()
+    generate(m_on, pr, bank=bank_c, max_new=6, use_cache=True)
+    assert calls["n"] == 1, f"fw_A appelé {calls['n']}× pour un generate (mémo mort)"
+    generate(m_on, pr, bank=bank_c, max_new=4, use_cache=True)
+    assert calls["n"] == 1, "même banque, second generate : le mémo doit tenir"
+    # …un write (append via cat, comme au <think>) invalide par identité…
+    calls["n"] = 0
+    bank_w = torch.cat([bank64, torch.randn(B, 1, 16, dtype=torch.float64)], dim=1)
+    with torch.no_grad():
+        la = m_on(pr, init_mem=bank_w, write=False)["logits"]
+        lb = m_off(pr, init_mem=bank_w, write=False)["logits"]
+    assert calls["n"] == 1 and torch.equal(la, lb), "miss sur nouvelle banque cassé"
+    # …et une mutation EN PLACE invalide par _version (même objet, autre
+    # contenu ; le mémo de bank_w est encore chaud depuis le bloc précédent,
+    # donc le SEUL appel attendu est le recalcul post-mutation)
+    calls["n"] = 0
+    with torch.no_grad():
+        m_on(pr, init_mem=bank_w, write=False)          # hit (mémo chaud)
+        bank_w[:, 0] = 0.0
+        lc = m_on(pr, init_mem=bank_w, write=False)["logits"]
+        ld = m_off(pr, init_mem=bank_w, write=False)["logits"]
+    assert calls["n"] == 1 and torch.equal(lc, ld), \
+        "banque mutée en place : le mémo a servi des poids périmés"
+    m_on.blocks[0].fw_A.forward = orig
+    # sous gradient, le mémo est purgé : l'entraînement reprojette à chaque pas
+    bg = bank64.clone().requires_grad_(True)
+    m_on.train()
+    m_on(pr, init_mem=bg)["logits"].sum().backward()
+    assert m_on.blocks[0]._fw_memo is None and bg.grad is not None
+
     print("model self-test: OK (formes + compute_logits, portage de banque "
           "plafonné, la banque influence la sortie et reçoit du gradient, "
           "mem_read_layers restreint LITTÉRALEMENT, layer_banks + None, "
-          "déterminisme eval, pad_mask, read swiglu/SN, poids liés)")
+          "déterminisme eval, pad_mask, read swiglu/SN, poids liés, "
+          "decode_fuse : fw_A/fw_B hoistés BIT-identiques — mémo servi 1×/"
+          "generate, invalidé par write (identité) ET mutation (_version), "
+          "purgé sous gradient)")
 
 
 if __name__ == "__main__":
