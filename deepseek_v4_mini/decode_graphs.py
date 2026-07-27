@@ -159,8 +159,13 @@ class GraphDecodeRunner:
         self._rope_bufs[1].copy_(sin)
 
     def _capture(self, phase, fed):
-        """Capture le graph de cette phase — et rend la sortie du pas (la
-        capture EXÉCUTE le pas). Échec ⇒ fallback eager définitif, bruyant."""
+        """Capture le graph de cette phase, puis le REJOUE aussitôt.
+
+        La capture ENREGISTRE sans exécuter (sémantique cudaStreamBeginCapture) :
+        sans le replay immédiat, la sortie rendue serait de la mémoire jamais
+        écrite et — bien pire — les mutations de cache de ce pas (fenêtres,
+        fermetures de bloc) n'auraient jamais lieu. Échec ⇒ fallback eager
+        définitif, bruyant."""
         try:
             in_buf = fed.clone()
             self._fill_rope()
@@ -173,6 +178,7 @@ class GraphDecodeRunner:
             pool = getattr(self, "_pool", None)
             with torch.cuda.graph(g, pool=pool):
                 out = self._eager(in_buf)
+            g.replay()                  # exécuter RÉELLEMENT le pas capturé
             torch.cuda.synchronize()    # faire surfacer ICI toute erreur de
             self._pool = g.pool() if pool is None else pool   # capture différée
             self.graphs[phase] = (g, in_buf, out)
