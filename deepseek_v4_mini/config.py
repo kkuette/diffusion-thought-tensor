@@ -58,6 +58,19 @@ class ThoughtBankConfig:
     # self-test moe). Le décodage BATCHÉ (rollouts RL) garde la boucle.
     # Prérequis de la capture CUDA graphs (shapes fixes, plus de data-dependent).
     decode_dense_moe: bool = False
+    # decode_static_cache : le `comp` de chaque AttnCache devient un buffer
+    # PRÉALLOUÉ à capacité fixe (ceil(max_seq_len / m) blocs par couche, zéros
+    # au-delà des blocs fermés) écrit en place — plus un seul cat qui
+    # réalloue en grossissant. Les LARGEURS DE CALCUL restent les largeurs
+    # historiques (narrow du buffer) : c'est mesuré, pas prudent — présenter
+    # le buffer plein au top-k CSA change ses ex æquo (relu ⇒ 0.0 exacts en
+    # régime permanent, départagés par une règle qui dépend de la largeur ⇒
+    # décodage divergent O(1)), et élargir le softmax HCA change l'arbre de
+    # sommation (~5e-15). Bit-identique au cache historique (torch.equal
+    # float64, self-tests attention + decode). Les shapes PLEINES fixes — la
+    # condition de capture CUDA graph — sont l'affaire du runner decode_graphs
+    # (opt-in, classe ULP, comme decode_cache), qui s'appuie sur ces buffers.
+    decode_static_cache: bool = False
 
     # ── Attention (§2.3) ──────────────────────────────────────────────────────
     csa_m: int = 4             # CSA: compress every m tokens (overlapping)

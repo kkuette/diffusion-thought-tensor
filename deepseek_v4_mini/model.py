@@ -519,9 +519,18 @@ class ThoughtBankLM(nn.Module):
 
     def make_cache(self) -> list:
         """Un cache d'attention vide par couche, à passer à `forward(cache=…)`
-        pour décoder de façon incrémentale (voir attention.AttnCache)."""
+        pour décoder de façon incrémentale (voir attention.AttnCache).
+
+        Sous decode_static_cache, chaque cache est préalloué à sa capacité
+        maximale (ceil(max_seq_len / m) blocs, m selon la parité CSA/HCA de la
+        couche) : shapes fixes à chaque pas, prérequis CUDA graphs."""
         from .attention import AttnCache
-        return [AttnCache() for _ in self.blocks]
+        if not bool(getattr(self.cfg, "decode_static_cache", False)):
+            return [AttnCache() for _ in self.blocks]
+        caps = [-(-int(self.cfg.max_seq_len)
+                  // int(self.cfg.csa_m if i % 2 == 0 else self.cfg.hca_m))
+                for i in range(len(self.blocks))]
+        return [AttnCache(cap=c) for c in caps]
 
 
 # Legacy aliases (pre-rename scripts)

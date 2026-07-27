@@ -251,11 +251,37 @@ def _selftest() -> None:
             f"cache ≠ recompute pour un préfixe de {T0} (float64)\n"
             f"  sans cache : {no_c}\n  avec cache : {wi_c}")
 
+    # ── les flags perf (decode_fuse / decode_dense_moe / decode_static_cache)
+    # ne changent RIEN au décodage : mêmes tokens, mêmes longueurs — top-k
+    # neutralisés (la config ci-dessus) ET top-k DURS (celle-ci) : les
+    # refactors étant bit-identiques, le routage reçoit les mêmes bits et
+    # tranche pareil. B=1 exerce le MoE dense (gate BT==1), B=2 la boucle.
+    from dataclasses import replace
+    for base in (cfg, replace(cfg, top_k_csa=2, top_k_experts=1)):
+        torch.manual_seed(0)
+        m_off = ThoughtBankLM(base).double().eval()
+        m_on = ThoughtBankLM(replace(base, decode_fuse=True,
+                                     decode_dense_moe=True,
+                                     decode_static_cache=True)).double().eval()
+        m_on.load_state_dict(m_off.state_dict())
+        for B_ in (1, 2):
+            bk = torch.randn(B_, 3, 16, dtype=torch.float64)
+            for T0 in (1, 3, 6):
+                pr = torch.randint(0, 61, (B_, T0))
+                for uc in (False, True):
+                    a, la = generate(m_off, pr, bank=bk, max_new=13, use_cache=uc)
+                    b, lb = generate(m_on, pr, bank=bk, max_new=13, use_cache=uc)
+                    assert torch.equal(a, b) and torch.equal(la, lb), (
+                        f"flags perf ≠ OFF (topk_dur={base is not cfg}, B={B_}, "
+                        f"T0={T0}, cache={uc})\n  OFF: {a}\n  ON : {b}")
+
     print("decode self-test: OK (batch B=4 IDENTIQUE au ligne-à-ligne, arrêt "
           "par ligne + lens incluant le stop, plafond sans stop, greedy "
           "déterministe et échantillonnage reproductible, write=False par "
           "défaut, amp inerte sur CPU, cache KV = recompute complet en float64 "
-          "sur le vrai stack pour 6 longueurs de préfixe)")
+          "sur le vrai stack pour 6 longueurs de préfixe, flags perf "
+          "decode_fuse+dense_moe+static_cache == OFF au token près — top-k "
+          "neutralisés ET durs, B∈{1,2}, cache on/off)")
 
 
 if __name__ == "__main__":

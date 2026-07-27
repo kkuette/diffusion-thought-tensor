@@ -283,8 +283,9 @@ class CompressedSparseAttention(nn.Module):
         B, T, _ = H.shape
         m = self.m
         nb = T // m                               # blocs FERMÉS par ce préfixe
-        cache.comp = (self._compress_kv(H[:, :nb * m]) if nb
-                      else H.new_zeros(B, 0, self.d_head))
+        comp = (self._compress_kv(H[:, :nb * m]) if nb
+                else H.new_zeros(B, 0, self.d_head))
+        _cache_store_comp(cache, comp, H)
         cache.hist = H[:, max(0, (nb - 1) * m):]  # de quoi fermer le bloc suivant
         cache.wk = _win_init(self.kv_norm(self.W_wk(H)), self.n_win)
         cache.wv = _win_init(self.W_wv(H), self.n_win)
@@ -323,33 +324,65 @@ class CompressedSparseAttention(nn.Module):
         #    l'INDICE, donc offrir moins de candidats change la sélection. Les
         #    entrées invalides sont ensuite masquées comme dans le chemin
         #    complet, et leur poids d'attention est exactement nul.
-        comp = cache.comp                          # [B, nb_vis, d_head]
-        nb = comp.size(1)
-        nbf = -(-(p + 1) // m)                     # n_blocks vu par le forward
+        comp = cache.comp                          # [B, nb_vis|cap, d_head]
         n_ih = self.n_idx_heads
         qI = self.W_iq(cQ).view(B, 1, n_ih, self.d_head)
         w_h = self.W_w(h)
-        k = min(self.top_k, nbf)
-        if k > 0:
-            if nb > 0:
-                sc_h = F.relu(torch.einsum("bthd,bnd->bthn", qI, comp)
-                              / math.sqrt(self.d_head))
-                sc = torch.einsum("bth,bthn->btn", w_h, sc_h)      # [B,1,nb]
-            else:
-                sc = h.new_zeros(B, 1, 0)
-            if nbf > nb:                           # blocs causalement interdits
-                sc = F.pad(sc, (0, nbf - nb), value=float("-inf"))
+        if cache.cap is not None:
+            # ── mode statique : les scores se calculent sur le buffer ENTIER
+            # (shape fixe, dot par ligne ⇒ mêmes bits pour les slots vivants),
+            # slots morts à -inf, puis NARROW à nbf candidats : le top-k doit
+            # recevoir EXACTEMENT l'entrée historique. Indispensable et mesuré :
+            # ses ex æquo (relu ⇒ scores 0.0 EXACTS dès qu'un bloc n'excite
+            # aucune tête d'indexeur — un régime permanent, pas un artefact
+            # d'init) se départagent par une règle interne qui DÉPEND de la
+            # largeur du candidat set — présenté à `cap`, le décodage divergeait
+            # de O(1). La largeur pleine fixe est l'affaire du runner CUDA
+            # graphs (classe ULP, opt-in, comme decode_cache).
+            nb = cache.count
+            nbf = -(-(p + 1) // m)
+            assert nbf <= cache.cap, (
+                f"cache statique plein ({cache.cap} blocs) — la génération "
+                f"dépasse max_seq_len, augmenter max_seq_len ou couper "
+                f"decode_static_cache")
+            k = min(self.top_k, nbf)
+            sc_h = F.relu(torch.einsum("bthd,bnd->bthn", qI, comp)
+                          / math.sqrt(self.d_head))
+            sc = torch.einsum("bth,bthn->btn", w_h, sc_h)          # [B,1,cap]
+            sc = sc.masked_fill(cache.dead.view(1, 1, -1),
+                                float("-inf"))[:, :, :nbf]
             top_scores, top_idx = sc.topk(k, dim=-1)
             valid = top_scores > -1e9                              # [B,1,k]
-            if nb > 0:
-                exp = top_idx.clamp(max=nb - 1).unsqueeze(-1).expand(-1, -1, -1, self.d_head)
-                KV_sel = self.kv_norm(
-                    comp.unsqueeze(1).expand(-1, 1, -1, -1).gather(2, exp))
-            else:
-                KV_sel = h.new_zeros(B, 1, k, self.d_head)
+            # les slots morts sont des ZÉROS : gather direct (pas de clamp),
+            # kv_norm(0) = 0, et leur logit est masqué à -inf via `valid` —
+            # même poids exactement nul que le clamp+masque historique
+            exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+            KV_sel = self.kv_norm(
+                comp.unsqueeze(1).expand(-1, 1, -1, -1).gather(2, exp))
         else:
-            valid = h.new_zeros(B, 1, 0, dtype=torch.bool)
-            KV_sel = h.new_zeros(B, 1, 0, self.d_head)
+            nb = comp.size(1)
+            nbf = -(-(p + 1) // m)                 # n_blocks vu par le forward
+            k = min(self.top_k, nbf)
+            if k > 0:
+                if nb > 0:
+                    sc_h = F.relu(torch.einsum("bthd,bnd->bthn", qI, comp)
+                                  / math.sqrt(self.d_head))
+                    sc = torch.einsum("bth,bthn->btn", w_h, sc_h)  # [B,1,nb]
+                else:
+                    sc = h.new_zeros(B, 1, 0)
+                if nbf > nb:                       # blocs causalement interdits
+                    sc = F.pad(sc, (0, nbf - nb), value=float("-inf"))
+                top_scores, top_idx = sc.topk(k, dim=-1)
+                valid = top_scores > -1e9                          # [B,1,k]
+                if nb > 0:
+                    exp = top_idx.clamp(max=nb - 1).unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+                    KV_sel = self.kv_norm(
+                        comp.unsqueeze(1).expand(-1, 1, -1, -1).gather(2, exp))
+                else:
+                    KV_sel = h.new_zeros(B, 1, k, self.d_head)
+            else:
+                valid = h.new_zeros(B, 1, 0, dtype=torch.bool)
+                KV_sel = h.new_zeros(B, 1, 0, self.d_head)
 
         # 3. fenêtre glissante : les n_win tokens qui PRÉCÈDENT p (le chemin
         #    complet n'inclut pas le token courant dans sa propre fenêtre)
@@ -373,7 +406,10 @@ class CompressedSparseAttention(nn.Module):
         hist = torch.cat([cache.hist, h], dim=1)
         if (p + 1) % m == 0:
             newc = self._compress_kv(hist[:, -2 * m:])[:, -1:]
-            cache.comp = torch.cat([cache.comp, newc], dim=1)
+            if cache.cap is not None:
+                cache._close_block(newc)
+            else:
+                cache.comp = torch.cat([cache.comp, newc], dim=1)
             hist = hist[:, -m:]
         cache.hist = hist[:, -2 * m:]
         cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
@@ -507,8 +543,9 @@ class HeavilyCompressedAttention(nn.Module):
         B, T, _ = H.shape
         m = self.m_prime
         nb = T // m
-        cache.comp = (self.kv_norm(self._compress_kv(H[:, :nb * m])) if nb
-                      else H.new_zeros(B, 0, self.d_head))
+        comp = (self.kv_norm(self._compress_kv(H[:, :nb * m])) if nb
+                else H.new_zeros(B, 0, self.d_head))
+        _cache_store_comp(cache, comp, H)
         cache.hist = H[:, max(0, (nb - 1) * m):]
         cache.wk = _win_init(self.kv_norm(self.W_wk(H)), self.n_win)
         cache.wv = _win_init(self.W_wv(H), self.n_win)
@@ -538,15 +575,36 @@ class HeavilyCompressedAttention(nn.Module):
         # causalité sont présentés à -inf (poids exactement nul), plutôt
         # qu'omis — c'est ce qui rend la comparaison bit à bit possible.
         comp = cache.comp                          # blocs fermés (= visibles)
-        nb = comp.size(1)
-        nbf = -(-(p + 1) // m)
-        K_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
-                           cache.wk], dim=1)
-        V_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
-                           cache.wv], dim=1)
-        logits = torch.einsum("bhd,bnd->bhn", q_bt, K_all) / math.sqrt(self.d_head)
-        if nbf > nb:
-            logits[:, :, nb:nbf] = float("-inf")
+        if cache.cap is not None:
+            # ── mode statique : NARROW du buffer préalloué aux nbf blocs que
+            # le chemin historique présente — les slots [nb, nbf) sont déjà des
+            # zéros dans le buffer (le new_zeros du chemin historique, sans
+            # l'allouer), masqués à -inf pareil. Largeur nbf+n_win IDENTIQUE ⇒
+            # mêmes bits jusque dans l'arbre de sommation du softmax (mesuré :
+            # la largeur pleine `cap` décalait la sortie de ~5e-15 — l'ULP
+            # d'une réduction associée autrement). La largeur pleine fixe est
+            # l'affaire du runner CUDA graphs (classe ULP, opt-in).
+            nb = cache.count
+            nbf = -(-(p + 1) // m)
+            assert nbf <= cache.cap, (
+                f"cache statique plein ({cache.cap} blocs) — la génération "
+                f"dépasse max_seq_len, augmenter max_seq_len ou couper "
+                f"decode_static_cache")
+            K_all = torch.cat([comp[:, :nbf], cache.wk], dim=1)
+            V_all = torch.cat([comp[:, :nbf], cache.wv], dim=1)
+            logits = torch.einsum("bhd,bnd->bhn", q_bt, K_all) / math.sqrt(self.d_head)
+            if nbf > nb:
+                logits[:, :, nb:nbf] = float("-inf")
+        else:
+            nb = comp.size(1)
+            nbf = -(-(p + 1) // m)
+            K_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
+                               cache.wk], dim=1)
+            V_all = torch.cat([comp, comp.new_zeros(B, nbf - nb, self.d_head),
+                               cache.wv], dim=1)
+            logits = torch.einsum("bhd,bnd->bhn", q_bt, K_all) / math.sqrt(self.d_head)
+            if nbf > nb:
+                logits[:, :, nb:nbf] = float("-inf")
         attn_w = _attn_sink_softmax(logits, self.sink_logits, self.drop)
         out = torch.einsum("bhn,bnd->bhd", attn_w, V_all
                            ).view(B, 1, self.n_heads, self.d_head)
@@ -554,7 +612,10 @@ class HeavilyCompressedAttention(nn.Module):
         hist = torch.cat([cache.hist, h], dim=1)
         if (p + 1) % m == 0:
             newc = self.kv_norm(self._compress_kv(hist[:, -m:]))
-            cache.comp = torch.cat([cache.comp, newc], dim=1)
+            if cache.cap is not None:
+                cache._close_block(newc)
+            else:
+                cache.comp = torch.cat([cache.comp, newc], dim=1)
             hist = hist[:, -m:]
         cache.hist = hist[:, -2 * m:]
         cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
@@ -589,15 +650,54 @@ class AttnCache:
     `hist` garde juste assez de H brut pour fermer le bloc suivant (2m pour la
     compression chevauchante de CSA, qui fusionne le bloc courant et son
     prédécesseur ; m suffirait à HCA, on ne complique pas).
-    """
-    __slots__ = ("pos", "comp", "hist", "wk", "wv")
 
-    def __init__(self) -> None:
+    decode_static_cache (`cap` non None) : `comp` devient un buffer PRÉALLOUÉ
+    de `cap` blocs (zéros au-delà de `count`), et `dead` marque les slots pas
+    encore fermés — présentés à -inf, poids d'attention EXACTEMENT nul, comme
+    le chemin historique le fait déjà pour les blocs causalement interdits.
+    Les shapes de chaque pas deviennent FIXES sur toute la génération : la
+    condition de capture d'un CUDA graph, et plus un seul cat qui grossit.
+    """
+    __slots__ = ("pos", "comp", "hist", "wk", "wv", "cap", "count", "dead")
+
+    def __init__(self, cap: int | None = None) -> None:
         self.pos = 0            # tokens déjà consommés
-        self.comp = None        # [B, nb, d_head] blocs compressés FERMÉS
+        self.comp = None        # [B, nb|cap, d_head] blocs compressés FERMÉS
         self.hist = None        # [B, ≤2m, d_model] queue de H
         self.wk = None          # [B, n_win, d_head] fenêtre (zéros à gauche)
         self.wv = None
+        self.cap = cap          # None = chemin historique (comp qui grossit)
+        self.count = 0          # blocs fermés (≤ cap) — mode statique
+        self.dead = None        # [cap] bool : True = slot pas encore fermé
+
+    def _close_block(self, newc: torch.Tensor) -> None:
+        """Range un bloc fermé dans le buffer statique (mode cap)."""
+        assert self.count < self.cap, (
+            f"cache statique plein ({self.cap} blocs) — la génération dépasse "
+            f"max_seq_len, augmenter max_seq_len ou couper decode_static_cache")
+        self.comp[:, self.count:self.count + 1] = newc
+        self.dead[self.count] = False
+        self.count += 1
+
+
+def _cache_store_comp(cache, comp: torch.Tensor, H: torch.Tensor) -> None:
+    """Pose les blocs fermés du préfixe dans le cache — buffer statique
+    préalloué à `cap` blocs (zéros + masque `dead`) si le mode statique est
+    demandé, l'objet tel quel sinon."""
+    if cache.cap is None:
+        cache.comp = comp
+        return
+    B, nb, dh = comp.shape
+    assert nb <= cache.cap, (
+        f"préfixe de {nb} blocs > capacité statique {cache.cap} — "
+        f"max_seq_len trop court pour ce décodage")
+    buf = H.new_zeros(B, cache.cap, dh)
+    if nb:
+        buf[:, :nb] = comp
+    cache.comp = buf
+    cache.count = nb
+    cache.dead = torch.ones(cache.cap, dtype=torch.bool, device=H.device)
+    cache.dead[:nb] = False
 
 
 def _rope_at(pos: int, n: int, dim: int, device: torch.device):
@@ -749,6 +849,39 @@ def _selftest() -> None:
                 assert torch.equal(o1, o2), \
                     f"{cls.__name__}: fuse_rope change les bits à pos {i}"
 
+    # ── decode_static_cache : buffer préalloué == cache historique, AU BIT —
+    #    y compris aux fermetures de bloc et sur plusieurs paliers ────────────
+    for cls, kw, m in ((CompressedSparseAttention, {"csa_m": M, "top_k": 3}, M),
+                       (HeavilyCompressedAttention, {"hca_m": MP}, MP)):
+        torch.manual_seed(5)
+        mod = _mk(cls, torch.float64, **kw)
+        H = torch.randn(2, 4 * m + 9, 24, dtype=torch.float64)
+        cap = -(-H.size(1) // m) + 2
+        with torch.no_grad():
+            for T0 in (1, m, 2 * m + 1):
+                cd, cs = AttnCache(), AttnCache(cap=cap)
+                assert torch.equal(mod.forward_cached(H[:, :T0], cd),
+                                   mod.forward_cached(H[:, :T0], cs)), \
+                    f"{cls.__name__}: préfixe statique ≠ historique (T0={T0})"
+                for i in range(T0, H.size(1)):
+                    a = mod.forward_cached(H[:, i:i + 1], cd)
+                    b = mod.forward_cached(H[:, i:i + 1], cs)
+                    assert torch.equal(a, b), \
+                        f"{cls.__name__}: statique ≠ historique à pos {i} (T0={T0})"
+                assert cs.count == cd.comp.size(1), "compte de blocs désynchronisé"
+        # déborder la capacité = erreur PARLANTE (assert en tête de branche),
+        # jamais un débordement silencieux ni un RuntimeError cryptique
+        small = AttnCache(cap=1)
+        raised = False
+        with torch.no_grad():
+            mod.forward_cached(H[:, :1], small)
+            try:
+                for i in range(1, 3 * m):
+                    mod.forward_cached(H[:, i:i + 1], small)
+            except AssertionError as e:
+                raised = "statique plein" in str(e)
+        assert raised, "déborder la capacité statique doit lever, pas corrompre"
+
     # ── la fenêtre glissante n'inclut PAS le token courant, et démarre sur des
     #    zéros — c'est la convention du F.pad du chemin complet, pas un choix ─
     mod = _mk(CompressedSparseAttention, torch.float64, csa_m=M, top_k=3)
@@ -765,7 +898,9 @@ def _selftest() -> None:
           f"recompute complet — float64 ≤1e-13, float32 ≤1e-5 (ULP BLAS) — "
           f"7 longueurs de préfixe, franchissements csa_m={M}/hca_m={MP} "
           f"inclus, blocs fermés = pos//m, fenêtre zéro-paddée à gauche, "
-          f"fuse_rope BIT-identique — tranche et décodage entier)")
+          f"fuse_rope BIT-identique — tranche et décodage entier, cache "
+          f"STATIQUE == historique au bit sur 3 préfixes × toutes positions + "
+          f"débordement de capacité qui lève)")
 
 
 if __name__ == "__main__":
