@@ -76,10 +76,15 @@ class DeepSeekMoE(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, need_balance: bool = True):
         """
         x: [B, T, d_model]
         Returns: (output [B, T, d_model], balance_loss scalar)
+
+        need_balance=False (decode_fuse) : la balance_loss est de la télémétrie
+        d'ENTRAÎNEMENT — one_hot/mean/pow calculés à chaque token décodé sous
+        no_grad pour un scalaire que personne ne lit. Rend 0 à la place ; la
+        SORTIE est inchangée au bit (le routage n'en dépend pas).
         """
         B, T, d = x.shape
         flat = x.reshape(B * T, d)
@@ -118,10 +123,13 @@ class DeepSeekMoE(nn.Module):
 
         # ── Sequence-wise load balance loss ───────────────────────────────────
         # Penalise deviation from uniform expert usage within the batch
-        usage = F.one_hot(top_idx, self.n_routed).float().sum(dim=1)  # [BT, n_routed]
-        usage_frac    = usage.mean(dim=0)                              # [n_routed]
-        expected_frac = torch.full_like(usage_frac, self.top_k / self.n_routed)
-        balance_loss  = ((usage_frac - expected_frac) ** 2).mean()
+        if need_balance:
+            usage = F.one_hot(top_idx, self.n_routed).float().sum(dim=1)  # [BT, n_routed]
+            usage_frac    = usage.mean(dim=0)                              # [n_routed]
+            expected_frac = torch.full_like(usage_frac, self.top_k / self.n_routed)
+            balance_loss  = ((usage_frac - expected_frac) ** 2).mean()
+        else:
+            balance_loss = flat.new_zeros(())
 
         out = (shared_out + routed_out).view(B, T, d)
         return out, balance_loss
@@ -205,9 +213,21 @@ def _selftest() -> None:
     assert len(m2.shared) == 3
     assert torch.isfinite(m2(x)[0]).all()
 
+    # ── need_balance=False : SORTIE au bit près, balance rendue à zéro ──────
+    x64 = torch.randn(B, T, D, dtype=torch.float64)
+    m64 = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K,
+                      d_ff=FF).double()
+    with torch.no_grad():
+        o_with, b_with = m64(x64)
+        o_wout, b_wout = m64(x64, need_balance=False)
+    assert torch.equal(o_with, o_wout), "need_balance change la sortie"
+    assert float(b_wout) == 0.0 and b_wout.dtype == o_wout.dtype
+    assert float(b_with) != 0.0, "témoin : la vraie balance n'est pas nulle ici"
+
     print("moe self-test: OK (formes, loss d'équilibrage nulle si uniforme et "
           "positive si concentrée, top_k + poids normalisés, garde-fou NaN "
-          "sqrt(softplus) en fp32 ET bf16, partagés toujours actifs, clamps SwiGLU)")
+          "sqrt(softplus) en fp32 ET bf16, partagés toujours actifs, clamps "
+          "SwiGLU, need_balance=False : sortie au bit près + balance à 0)")
 
 
 if __name__ == "__main__":

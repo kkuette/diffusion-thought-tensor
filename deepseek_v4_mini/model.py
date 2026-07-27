@@ -388,10 +388,13 @@ class DualModalBlock(nn.Module):
 
         # 3. MoE (mHC wrapped)
         bal = torch.zeros((), device=X.device)
+        # decode_fuse + no-grad : la balance_loss (télémétrie d'entraînement)
+        # n'est pas calculée — `bal` reste ce zéro, la sortie est inchangée.
+        nb = not (self.decode_fuse and not torch.is_grad_enabled())
 
         def _moe_fn(h: torch.Tensor) -> torch.Tensor:
             nonlocal bal
-            out, bl = self._moe(self.norm_moe(h))
+            out, bl = self._moe(self.norm_moe(h), need_balance=nb)
             bal = bl
             return out
 
