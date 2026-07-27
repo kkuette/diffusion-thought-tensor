@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import random as _random
 import statistics as st
@@ -500,6 +501,14 @@ class Worker:
             for c, rw in zip(cand, self._rewards(env, cand, lam, info)):
                 c["reward"] = rw
             rs = [c["reward"] for c in cand]
+            if not all(math.isfinite(x) for x in rs):
+                # ce non-fini sur un épisode pathologique : pstdev (py3.13)
+                # crashe dessus ('float' object has no attribute 'numerator',
+                # worker 3 le 07-27) et le learner recevrait des avantages
+                # NaN — on jette le tirage comme dégénéré.
+                print(f"worker {self.wid}: reward non-fini ({env.name}) — "
+                      f"resample", flush=True)
+                continue
             if st.pstdev(rs) >= self.min_std:
                 keep = cand[self.rng.randrange(self.G)]
                 life.bank, life.casc = keep["bank"], keep["casc"]
