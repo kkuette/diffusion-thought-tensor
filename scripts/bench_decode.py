@@ -363,6 +363,38 @@ def run_time(raw, a):
     arms = {"both": (False, True), "off": (False,), "on": (True,)}[a.cache]
     print(f"\n== chrono {a.device} ({'toy' if a.toy else 'réel'}, "
           f"B={a.batch}, {a.tokens} tokens, flags={flags or 'aucun'}) ==")
+
+    if a.cuda_graphs:
+        # bras CUDA graphs : GraphDecodeRunner (B=1, greedy). Sur CPU il
+        # dégrade en eager et le dit — c'est le « préparé, pas lancé ».
+        from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+        if a.batch != 1:
+            sys.exit("[bench] --cuda-graphs : B == 1 requis (gate MoE dense)")
+        runner = GraphDecodeRunner(model, bank)
+        if runner.eager_only:
+            print("[bench] --cuda-graphs sur CPU : dégradation eager annoncée "
+                  "(la capture attend un GPU libre)")
+        runner.step(prefix)                                 # préfixe + warmup
+        fed = prefix[:, -1:]
+        t0 = time.perf_counter()
+        if a.device == "cuda":
+            torch.cuda.synchronize()
+            e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+            e0.record()
+        for _ in range(a.tokens):
+            o = runner.step(fed)
+            fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+        if a.device == "cuda":
+            e1.record()
+            torch.cuda.synchronize()
+            dt = e0.elapsed_time(e1) / 1e3
+        else:
+            dt = time.perf_counter() - t0
+        runner.close()
+        print(f"graphs     {a.tokens / dt:.2f} tok/s  "
+              f"({1e3 * dt / a.tokens:.1f} ms/token)"
+              + ("  [eager fallback]" if runner.eager_only else ""))
+
     for use_cache in arms:
         generate(model, prefix, bank=bank, max_new=4, stop_id=None,
                  use_cache=use_cache)                       # warmup
@@ -410,6 +442,8 @@ def main(argv=None):
                    help="none | all | liste: decode_fuse,decode_dense_moe,…")
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--time", action="store_true", help="chrono (GPU gardé)")
+    p.add_argument("--cuda-graphs", dest="cuda_graphs", action="store_true",
+                   help="bras GraphDecodeRunner dans --time (eager sur CPU)")
     p.add_argument("--force", action="store_true")
     p.add_argument("--fingerprint", action="store_true")
     p.add_argument("--ab-check", dest="ab_check", action="store_true")

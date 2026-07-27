@@ -311,8 +311,9 @@ class CompressedSparseAttention(nn.Module):
         # 1. requête à la position absolue p (RoPE décalé)
         cQ = self.W_dq(h)
         q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
-        cos, sin = (_rope_at_cached if self.fuse_rope else _rope_at)(
-            p, 1, self.d_head, h.device)
+        cos, sin = (_ROPE_OVERRIDE if _ROPE_OVERRIDE is not None else
+                    (_rope_at_cached if self.fuse_rope else _rope_at)(
+                        p, 1, self.d_head, h.device))
         q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
         q = self.q_norm(q)
 
@@ -328,7 +329,21 @@ class CompressedSparseAttention(nn.Module):
         n_ih = self.n_idx_heads
         qI = self.W_iq(cQ).view(B, 1, n_ih, self.d_head)
         w_h = self.W_w(h)
-        if cache.cap is not None:
+        if cache.cap is not None and cache.full:
+            # ── largeur PLEINE (GraphDecodeRunner) : shapes constantes du
+            # premier au dernier token, aucune valeur python dans les tenseurs.
+            # Classe ULP assumée : le top-k reçoit cap candidats.
+            k = min(self.top_k, cache.cap)
+            sc_h = F.relu(torch.einsum("bthd,bnd->bthn", qI, comp)
+                          / math.sqrt(self.d_head))
+            sc = torch.einsum("bth,bthn->btn", w_h, sc_h)          # [B,1,cap]
+            sc = sc.masked_fill(cache.dead.view(1, 1, -1), float("-inf"))
+            top_scores, top_idx = sc.topk(k, dim=-1)
+            valid = top_scores > -1e9                              # [B,1,k]
+            exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+            KV_sel = self.kv_norm(
+                comp.unsqueeze(1).expand(-1, 1, -1, -1).gather(2, exp))
+        elif cache.cap is not None:
             # ── mode statique : les scores se calculent sur le buffer ENTIER
             # (shape fixe, dot par ligne ⇒ mêmes bits pour les slots vivants),
             # slots morts à -inf, puis NARROW à nbf candidats : le top-k doit
@@ -565,8 +580,9 @@ class HeavilyCompressedAttention(nn.Module):
 
         cQ = self.W_dq(h)
         q = self.W_uq(cQ).view(B, 1, self.n_heads, self.d_head)
-        cos, sin = (_rope_at_cached if self.fuse_rope else _rope_at)(
-            p, 1, self.d_head, h.device)
+        cos, sin = (_ROPE_OVERRIDE if _ROPE_OVERRIDE is not None else
+                    (_rope_at_cached if self.fuse_rope else _rope_at)(
+                        p, 1, self.d_head, h.device))
         q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
         q = self.q_norm(q)
         q_bt = q.reshape(B, self.n_heads, self.d_head)
@@ -575,7 +591,16 @@ class HeavilyCompressedAttention(nn.Module):
         # causalité sont présentés à -inf (poids exactement nul), plutôt
         # qu'omis — c'est ce qui rend la comparaison bit à bit possible.
         comp = cache.comp                          # blocs fermés (= visibles)
-        if cache.cap is not None:
+        if cache.cap is not None and cache.full:
+            # ── largeur PLEINE (GraphDecodeRunner) : K_all = cap+n_win du
+            # premier au dernier token — c'était la seule shape non bornée du
+            # décodage. Classe ULP assumée (softmax élargi, ~5e-15).
+            K_all = torch.cat([comp, cache.wk], dim=1)
+            V_all = torch.cat([comp, cache.wv], dim=1)
+            logits = torch.einsum("bhd,bnd->bhn", q_bt, K_all) / math.sqrt(self.d_head)
+            logits[:, :, :cache.cap].masked_fill_(
+                cache.dead.view(1, 1, -1), float("-inf"))
+        elif cache.cap is not None:
             # ── mode statique : NARROW du buffer préalloué aux nbf blocs que
             # le chemin historique présente — les slots [nb, nbf) sont déjà des
             # zéros dans le buffer (le new_zeros du chemin historique, sans
@@ -658,7 +683,8 @@ class AttnCache:
     Les shapes de chaque pas deviennent FIXES sur toute la génération : la
     condition de capture d'un CUDA graph, et plus un seul cat qui grossit.
     """
-    __slots__ = ("pos", "comp", "hist", "wk", "wv", "cap", "count", "dead")
+    __slots__ = ("pos", "comp", "hist", "wk", "wv", "cap", "count", "dead",
+                 "full", "idx")
 
     def __init__(self, cap: int | None = None) -> None:
         self.pos = 0            # tokens déjà consommés
@@ -669,15 +695,39 @@ class AttnCache:
         self.cap = cap          # None = chemin historique (comp qui grossit)
         self.count = 0          # blocs fermés (≤ cap) — mode statique
         self.dead = None        # [cap] bool : True = slot pas encore fermé
+        # Mode LARGEUR PLEINE (runner decode_graphs UNIQUEMENT, jamais posé par
+        # le décodage normal) : toutes les largeurs de calcul = cap, la
+        # comptabilité des blocs passe par des tenseurs device (idx) pour être
+        # capturable/rejouable par un CUDA graph — le python ne tourne pas au
+        # replay. Classe ULP, comme decode_cache : le top-k CSA sur candidat
+        # set élargi départage ses ex æquo autrement, le softmax HCA élargi
+        # s'associe autrement (~5e-15). Opt-in via GraphDecodeRunner.
+        self.full = False
+        self.idx = None         # LongTensor [1] device : prochain slot à écrire
 
     def _close_block(self, newc: torch.Tensor) -> None:
         """Range un bloc fermé dans le buffer statique (mode cap)."""
+        if self.full:
+            # tout en tenseurs device : capturé une fois, rejoué tel quel
+            self.comp.index_copy_(1, self.idx, newc)
+            self.dead.index_fill_(0, self.idx, False)
+            self.idx.add_(1)
+            self.count += 1     # miroir python — jamais lu en mode full
+            return
         assert self.count < self.cap, (
             f"cache statique plein ({self.cap} blocs) — la génération dépasse "
             f"max_seq_len, augmenter max_seq_len ou couper decode_static_cache")
         self.comp[:, self.count:self.count + 1] = newc
         self.dead[self.count] = False
         self.count += 1
+
+    def enter_full_width(self) -> None:
+        """Bascule ce cache en mode largeur pleine (voir GraphDecodeRunner)."""
+        assert self.cap is not None and self.comp is not None, \
+            "enter_full_width : après le forward de préfixe, mode statique requis"
+        self.full = True
+        self.idx = torch.full((1,), self.count, dtype=torch.long,
+                              device=self.comp.device)
 
 
 def _cache_store_comp(cache, comp: torch.Tensor, H: torch.Tensor) -> None:
@@ -723,6 +773,14 @@ def _rope_at(pos: int, n: int, dim: int, device: torch.device):
 # Toujours float32 — comme `_rope_at`, même sous un modèle float64 : c'est ce
 # float32 partagé qui rend les deux chemins comparables par torch.equal.
 _ROPE_TABLES: dict = {}
+
+# Injection RoPE (GraphDecodeRunner) : pendant une capture CUDA graph, la
+# position est un int PYTHON — tranchée ici, elle serait bakée dans le graph et
+# fausse à chaque replay. Le runner pose (cos, sin) = deux buffers statiques
+# [1, dim//2] qu'il remplit AVANT chaque replay ; None = chemin normal.
+# Bit-identique quand les buffers contiennent la tranche de la position
+# courante (prouvé au self-test decode_graphs).
+_ROPE_OVERRIDE = None
 
 
 def _rope_at_cached(pos: int, n: int, dim: int, device: torch.device):

@@ -31,6 +31,7 @@ MODULES=(
   attention           # cache KV incrémental = recompute complet (float64)
   model               # forward, portage de banque, mem_read_layers
   decode              # génération unique : batch B>1 == ligne-à-ligne
+  decode_graphs       # runner CUDA graphs : eager CPU == generate, capturabilité
   code_defer_native   # ALIGNEMENT DES CIBLES (loaders ne décalent pas, la loss si)
   streams             # registre nom→classe : tout résout, alias RL compris
   exec_sandbox        # bac à sable d'exécution (le juge de l'env code)
