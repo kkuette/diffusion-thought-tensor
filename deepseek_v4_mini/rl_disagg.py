@@ -34,7 +34,8 @@ Split of rl_defer_grpo_lives across the share (root = rl.disagg.root):
     dsv6-grpo-recence-feature) + always/never anchors on the own bank.
 
 Files: weights/step_%06d.pt + LATEST | rollouts/{incoming,stale}/ |
-w{N}_lives.pt (auto-resumed) | STOP kills everyone politely.
+w{N}_lives.pt (auto-resumed) | STOP kills everyone politely;
+STOP_LEARNER / STOP_WORKERS n'arrêtent qu'un côté (redémarrages ciblés).
 
   learner:  python -m deepseek_v4_mini.rl_disagg learner <cfg.yaml>
   worker:   python -m deepseek_v4_mini.rl_disagg worker  <cfg.yaml> [--worker N]
@@ -564,7 +565,11 @@ class Worker:
         xdom_every = int(dg.get("xdom_every", 50))
         t0 = time.time()
         n_degen = 0
-        while not os.path.exists(os.path.join(self.root, "STOP")):
+        # STOP = arrêt global ; STOP_WORKERS = seulement la ferme. Morsure du
+        # 07-27 : STOP posé pour redémarrer le learner a aussi éteint les
+        # workers (jobs "done" propres, production stoppée en silence).
+        while not (os.path.exists(os.path.join(self.root, "STOP"))
+                   or os.path.exists(os.path.join(self.root, "STOP_WORKERS"))):
             if max_groups and self.n_groups >= max_groups:
                 break
             if self.store.pending() >= self.max_pending:
@@ -758,7 +763,10 @@ class Learner:
         t0 = time.time()
         n_stale_tot = 0
         while self.step < steps:
-            if os.path.exists(os.path.join(self.root, "STOP")):
+            # STOP = global ; STOP_LEARNER = seulement moi (les workers
+            # continuent de produire pendant un redémarrage du learner)
+            if (os.path.exists(os.path.join(self.root, "STOP"))
+                    or os.path.exists(os.path.join(self.root, "STOP_LEARNER"))):
                 break
             groups, n_stale = self.store.take(self.gps,
                                               self.step - self.max_lag)
