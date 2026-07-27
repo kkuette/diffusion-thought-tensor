@@ -41,7 +41,9 @@ while true; do
     # Cache HF PARTAGÉ sur le NAS. Sans lui, chaque worker streame les
     # datasets depuis HF dans son ~/.cache local, SANS token (rate-limité) —
     # constaté 2026-07-27 : 6 inits simultanées à télécharger codeparrot sur
-    # 3,5 Go de RAM = tempête de swap puis crash du rig (3e du mois).
+    # les 3,5 Go de RAM du rig = tempête de swap, ~50 min sans un step, reboot
+    # manuel. Règle d'exploitation : démarrer les workers EN ESCALIER (un à la
+    # fois jusqu'au régime), jamais 6 inits de front sur ce rig.
     export HF_HOME="$TB_MNT/data/hf_cache"
     source "$TB_VENV/bin/activate"
     cd "$TB_REPO"
