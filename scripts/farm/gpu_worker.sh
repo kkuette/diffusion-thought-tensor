@@ -38,6 +38,11 @@ while true; do
     # c'est le montage NFS, donc les .job n'ont rien à déclarer.
     export CUDA_VISIBLE_DEVICES="$GPU_ID" TB_MNT TB_REPO WORKER
     export TB_ROOT="$TB_MNT"
+    # Cache HF PARTAGÉ sur le NAS. Sans lui, chaque worker streame les
+    # datasets depuis HF dans son ~/.cache local, SANS token (rate-limité) —
+    # constaté 2026-07-27 : 6 inits simultanées à télécharger codeparrot sur
+    # 3,5 Go de RAM = tempête de swap puis crash du rig (3e du mois).
+    export HF_HOME="$TB_MNT/data/hf_cache"
     source "$TB_VENV/bin/activate"
     cd "$TB_REPO"
     bash "$job"
