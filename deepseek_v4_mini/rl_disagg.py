@@ -644,6 +644,7 @@ class Learner:
         self.G = int(r.get("group_size", 8))
         self.step = 0
         self.mfile = os.path.join(self.root, "learner_metrics.jsonl")
+        self.trace_path = os.path.join(self.root, "traces.jsonl")
         self.ck_path = os.path.join(self.root, "learner_last.pt")
         if os.path.exists(self.ck_path):
             ck = torch.load(self.ck_path, map_location="cpu",
@@ -653,6 +654,26 @@ class Learner:
             self.step = ck["step"]
             print(f"learner: resumed step {self.step}", flush=True)
         self.hub.publish(self.model.state_dict(), self.step)
+
+    def archive(self, groups) -> None:
+        """Trajectoires → traces.jsonl, AVANT consommation. Matière première du
+        cliquet (SFT sur trajectoires positives) : tokens + actions + rewards
+        suffisent — les banques (le gros du .pt) se recomputent par forward,
+        on ne les stocke pas. Tout est gardé, y compris les groupes plats :
+        contraste négatif + stats de touchabilité."""
+        with open(self.trace_path, "a") as fh:
+            for g in groups:
+                fh.write(json.dumps({
+                    "learner_step": self.step, "env": g["env"],
+                    "worker": g["worker"], "weights_step": g["weights_step"],
+                    "chunks": [c.reshape(-1).tolist() for c in g["chunks"]],
+                    "rollouts": [{
+                        "reward": ro["reward"], "ce": ro["ce"],
+                        "n_writes": ro["n_writes"],
+                        "actions": [r["a"] for r in ro["recs"]],
+                        "p": [round(float(r["p"]), 4) for r in ro["recs"]],
+                    } for ro in g["rollouts"]],
+                }) + "\n")
 
     def step_once(self, groups) -> dict:
         """One GRPO update from consumed groups (advantages in-group)."""
@@ -707,6 +728,7 @@ class Learner:
             if not groups:
                 time.sleep(self.poll_s)
                 continue
+            self.archive(groups)
             line = self.step_once(groups)
             line["stale"] = n_stale_tot
             line["s_per_step"] = (time.time() - t0) / max(self.step, 1)
