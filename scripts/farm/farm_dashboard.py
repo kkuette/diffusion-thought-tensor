@@ -199,8 +199,10 @@ async function r(){
   for(const g of n.gpus||[]) h+=`<tr><td>${g.i}</td><td>${bar(g.util,100)}</td><td>${bar(g.vram,g.vram_tot)} <span class=dim>${g.vram} Mo</span></td><td>${g.w}</td><td class="${g.temp>80?'bad':g.temp>70?'warn':''}">${g.temp}</td></tr>`;
   h+='</table>';}
  for(const R of d.rl||[]){
-  const L=R.learner, cls=R.state=='ok'?'ok':R.state=='stop'?'dim':'warn';
-  const lbl=R.state=='ok'?'en cours':R.state=='stop'?'STOP':'muet';
+  const L=R.learner, cls=R.state=='ok'?'ok':R.state=='stop'?'dim':R.state=='sec'?'warn':'bad';
+  // « à sec » = le learner attend, aucun rollout ne rentre : regarder les
+  // workers. « muet » = il a des groupes en attente et ne les prend pas.
+  const lbl={ok:'en cours',stop:'STOP',sec:'à sec — aucun rollout'}[R.state]||'MUET';
   let hd=`<h2>RL ${R.run} <span class=${cls}>[${lbl}]</span>`;
   if(L&&L.step!=null) hd+=` <span class=dim>step ${L.step}${R.steps?'/'+R.steps+' '+bar(L.step,R.steps):''}${R.eta_s?' · eta '+dur(R.eta_s):''}</span>`;
   h+=hd+'</h2>';

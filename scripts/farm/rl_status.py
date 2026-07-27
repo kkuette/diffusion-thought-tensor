@@ -282,20 +282,26 @@ def run_status(root, now=None):
     steps = meta.get("steps")
     sps = learner.get("s_per_step") if learner else None
     stopped = os.path.exists(os.path.join(root, "STOP"))
+    inc = _count(os.path.join(root, "rollouts", "incoming"))
+    # Un learner silencieux n'est pas forcément planté : sans groupe à
+    # consommer il attend, et le vrai coupable est du côté des workers. Les
+    # deux cas n'appellent pas le même geste, le monitor doit les séparer.
+    state = ("stop" if stopped else
+             "ok" if learner and learner["alive"] else
+             "sec" if inc == 0 else "muet")
     return {
         "run": os.path.basename(root.rstrip("/")),
         "root": root,
         "meta": meta,
         "steps": steps,
         "stopped": stopped,
-        "state": ("stop" if stopped else
-                  "ok" if learner and learner["alive"] else "muet"),
+        "state": state,
         "learner": learner,
         "workers": workers,
         "envs": envs,
         "xdom": probes[-1] if probes else None,
         "queue": {
-            "incoming": _count(os.path.join(root, "rollouts", "incoming")),
+            "incoming": inc,
             "stale": _count(os.path.join(root, "rollouts", "stale")),
             "traces_mb": round(os.path.getsize(os.path.join(root, "traces.jsonl"))
                                / 1e6, 1)
@@ -479,8 +485,15 @@ def _self_test():
         assert alive_after(30.0) == STALE_FLOOR_S
         assert alive_after(765.0) > 2000
         assert alive_after(None) > 0
+        # learner muet AVEC des groupes en attente = il ne mange pas ce qu'on
+        # lui sert : c'est lui le problème.
+        open(os.path.join(root, "rollouts", "incoming", "b.pt"), "w").close()
         old = run_status(root, now=time.time() + 700)
         assert not old["learner"]["alive"] and old["state"] == "muet"
+        # file vide : il attend, le problème est chez les workers
+        for f in os.listdir(os.path.join(root, "rollouts", "incoming")):
+            os.remove(os.path.join(root, "rollouts", "incoming", f))
+        assert run_status(root, now=time.time() + 700)["state"] == "sec"
 
         # STOP l'emporte sur tout le reste
         open(os.path.join(root, "STOP"), "w").close()
@@ -508,7 +521,7 @@ def _self_test():
         assert {r["run"] for r in runs} == {"fake", "muet"}
         muet = [r for r in runs if r["run"] == "muet"][0]
         assert muet["learner"] is None and muet["weights"]["step"] is None
-        assert muet["state"] == "muet"
+        assert muet["state"] == "sec"          # rien écrit, rien en attente
 
         # le formateur avale les trous sans exploser
         assert "fake" in format_run(st) and format_run(muet)
