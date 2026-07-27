@@ -178,8 +178,10 @@ class CompressedSparseAttention(nn.Module):
         Cb_prev = torch.cat([torch.zeros_like(Cb[:, :1]), Cb[:, :-1]], dim=1)
         Zb_shift = torch.cat([Zb[:, :1], Zb[:, :-1]], dim=1)
         # block 0 gets -inf so softmax assigns zero weight to the phantom predecessor
-        inf_mask = torch.zeros(n_blocks, device=H_pad.device, dtype=torch.bool)
-        inf_mask[0] = True
+        # (arange == 0 : constructible côté device — `mask[0] = True` copiait un
+        # scalaire python host→device pageable, l'op qui CASSAIT la capture CUDA
+        # graph à la première fermeture de bloc ; mêmes booléens, mêmes bits)
+        inf_mask = torch.arange(n_blocks, device=H_pad.device) == 0
         Zb_prev = Zb_shift.masked_fill(inf_mask.view(1, n_blocks, 1, 1), float("-inf"))
 
         # Concatenate along m dimension; softmax over 2m entries per feature dim
