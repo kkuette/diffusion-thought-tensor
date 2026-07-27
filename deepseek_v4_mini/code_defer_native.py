@@ -32,7 +32,13 @@ from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .muon import Muon, _split_muon_params
 from .code_data import CodeChunkStream
-from .cascade import CascadeMemory
+from .cascade import CascadeMemory, default_layer_map
+from .cfg_schema import ConfigError, check as check_cfg
+from .ckpt import find_resume, load_bank, restore_train_state, save_bank, save_train_state
+from .decode import generate
+from .runtime import build_fwd, compile_model, enable_tf32, init_ddp
+from .sched import (STAIR_END, STAIR_N, beta_at, describe as describe_sched,
+                    lr_scale)
 from .paths import load_yaml
 
 
@@ -56,40 +62,69 @@ def _ic_loss(model, xt, bank, balw, amp, layer_banks=None):
     return loss, o["mem_bank"], float(ce.detach())
 
 
-def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None):
+def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None,
+               pad_mask=None, m_any=None):
     """Chat-templated segment: next-token CE restricted to supervised positions
     (loss_mask marks the assistant answer + closing <|im_end|>; template/user
     tokens are masked). No <think> append — the template carries its own stop.
-    Returns (loss, new_bank, ce_detached_or_None). User segs (mask all-zero)
-    still forward (their WRITE is the point) but contribute no CE."""
+    Returns (loss, new_bank, ce_detached_or_None, ce_lane_or_None). User segs
+    (mask all-zero) still forward (their WRITE is the point) but contribute no CE.
+
+    `pad_mask` (True = position réelle) n'existe qu'au batch chat : il ne sert
+    qu'au write, dont le pooling attentionnel doit ignorer les pads.
+
+    `m_any` remplace un `float(m.sum()) > 0` qui SYNCHRONISAIT le device au
+    milieu du forward — l'appelant le sait déjà côté CPU (loss_mask est un
+    tenseur CPU avant son .to(device)), et à ~40 segs/step ces synchros
+    empêchaient tout recouvrement CPU/GPU dans un régime déjà launch-bound.
+    Laissé à None, le test se fait ici comme avant (au prix de la synchro) :
+    seul le chemin chaud du trainer passe la valeur.
+
+    Les deux CE retournées sont des TENSEURS détachés, pas des floats : les
+    convertir ici coûtait une synchro par seg. L'appelant les accumule et ne
+    matérialise qu'au log.
+    """
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-        o = model(x, init_mem=bank, layer_banks=layer_banks)
+        o = model(x, init_mem=bank, layer_banks=layer_banks, pad_mask=pad_mask)
     lg = o["logits"].float()
-    m = lmask[:, 1:].reshape(-1)                        # targets = positions 1..T-1
     loss = balw * o["balance_loss"].float()
-    ce_f = None
-    if float(m.sum()) > 0:
+    ce_t = ce_lane = None
+    m2 = lmask[:, 1:]                                   # targets = positions 1..T-1
+    if m_any is None:
+        m_any = bool(m2.any())
+    if m_any:
+        m = m2.reshape(-1)
         ce_tok = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
                                  x[:, 1:].reshape(-1), reduction="none")
-        ce = (ce_tok * m).sum() / m.sum()
+        # Normalisation GLOBALE au batch (décision user 2026-07-25) : le poids
+        # d'une lane dépend donc de sa longueur et de ses poids SIF.
+        ce = (ce_tok * m).sum() / m.sum().clamp_min(1e-6)
         loss = loss + ce
-        ce_f = float(ce.detach())
-    return loss, o["mem_bank"], ce_f
+        ce_t = ce.detach()
+        # …d'où cette diagnostique PAR LANE, hors gradient : c'est elle qui reste
+        # comparable au `chat` d'un run B=1 quand on change le batch.
+        #
+        # La moyenne ne porte que sur les lanes SUPERVISÉES. Un tour utilisateur
+        # (masque tout-zéro) donne 0/ε = 0 ; le compter aurait dilué la moyenne
+        # d'autant de zéros — mesuré, ça donnait 1.885 au lieu de ~2.96, soit
+        # exactement le tiers de lanes non supervisées de ce mix. En B=1 ces segs
+        # ne rentrent pas dans la moyenne (ce is None), donc les inclure ici
+        # aurait rendu la diagnostique NON comparable — c'est-à-dire inutile.
+        if x.size(0) > 1:
+            w_lane = m2.sum(1)                              # [B] masse supervisée
+            per = (ce_tok.view_as(m2) * m2).sum(1) / w_lane.clamp_min(1e-6)
+            has = (w_lane > 0).to(per.dtype)
+            ce_lane = ((per * has).sum() / has.sum().clamp_min(1.0)).detach()
+    return loss, o["mem_bank"], ce_t, ce_lane
 
 
-@torch.no_grad()
-def _greedy(model, prefix, bank, max_new, stop_id, amp):
+def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False):
     """Greedy-decode max_new tokens after prefix from the CURRENT bank (reads
-    only; the decode forward's write is discarded). Returns generated ids."""
-    out = prefix
-    for _ in range(max_new):
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-            o = model(out, init_mem=bank)
-        nt = o["logits"][:, -1].argmax(-1, keepdim=True)
-        out = torch.cat([out, nt], dim=1)
-        if int(nt) == stop_id:
-            break
-    return out[:, prefix.size(1):]
+    only). Une seule ligne : l'éval décode conv par conv. Voir decode.generate
+    pour la boucle (et pour le décodage batché, qui sert au RL)."""
+    gen, lens = generate(model, prefix, bank=bank, max_new=max_new,
+                         stop_id=stop_id, amp=amp, use_cache=use_cache)
+    return gen[:, :int(lens[0])]
 
 
 def _age_bucket(age):
@@ -103,7 +138,8 @@ AGE_BUCKETS = ("<=4", "5-8", "9-16", ">16")
 
 
 @torch.no_grad()
-def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
+def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
+                  use_cache=False, decode=True):
     """Chat eval (math_school | persona): canonical segments advance the bank
     (teacher-forced writes). Only the GRADED assistant turns (the last
     len(truths) — the answers to memory queries) are greedy-decoded TWICE —
@@ -115,7 +151,25 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
     sensible bien avant l'exact-match. Ventilée par âge (writes fait→réponse)
     quand le stream fournit info.ages. Bank-only (no cascade), like evaluate().
     Kinds sans truths (smalltalk) = contrôles : nll seule, pas de décodage.
-    Returns {kind: {...}} + clé "_by_age" (à pop avant itération par kind)."""
+    Returns {kind: {...}} + clé "_by_age" (à pop avant itération par kind).
+
+    LE BRAS ABLATÉ EST DÉCODÉ UNE SEULE FOIS PAR APPEL. Son décodage part d'un
+    préfixe constant (`a_open`) avec `init_mem=None`, en greedy, à poids gelés :
+    il rend donc EXACTEMENT la même sortie aux ~27 tours gradés d'un palier
+    (vérifié : 8 redécodages, une seule sortie distincte). Le recalculer coûtait
+    36 % de l'éval chat — mesuré 2026-07-25, evaluate_math 958 → 611 s sur un
+    palier de 1076 s, 4401 → 3150 forwards, dont 4242 passés dans les 54
+    décodages à 218 ms le forward d'UN token : le décodage est du pur coût de
+    lancement. Ce n'est pas une approximation : le bras ablaté est par
+    construction « ce que le modèle répond sans aucune mémoire », une réponse et
+    non une par question. Effet de bord bienvenu : il ne jitte plus d'un tour à
+    l'autre sous l'effet des ULP du top-k MoE (mémoire dsv6-topk-dur-amplifie).
+
+    `decode=False` saute les deux décodages et ne facture que la sonde Δnll (un
+    forward ablaté par tour gradé). C'est le levier de cadence : le grade
+    exact-match est aveugle tant que le canal n'existe pas, la sonde Δnll ne
+    l'est pas — voir `chat.decode_every` côté trainer. Les clés grade/grade_abl
+    sont alors normalisées par `n_dec` = 0 et le trainer ne les imprime pas."""
     from .math_school_data import A_OPEN, grade_conv
     from .persona_chat_data import grade_recall
     grade = getattr(stream, "grade_conv", grade_conv)   # persona ships its own
@@ -123,9 +177,10 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
     a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
                           dtype=torch.long, device=device).unsqueeze(0)
     stop_id = tok.convert_tokens_to_ids("<|im_end|>")
-    # kind -> [nll_sum, nll_n, gl, ga, n, ans_nll_live, ans_nll_abl, n_ans]
+    # kind -> [nll_sum, nll_n, gl, ga, n, ans_nll_live, ans_nll_abl, n_ans, n_dec]
     agg = {}
-    by_age = {}                               # bucket -> [n, dg_sum, dnll_sum]
+    by_age = {}                       # bucket -> [n, dg_sum, dnll_sum, n_dg]
+    abl_txt1 = None                   # le bras ablaté, décodé une fois (docstring)
     for _ in range(n_conv):
         conv = stream.next_conv()
         info = conv.get("info", {})
@@ -138,15 +193,18 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
         live_txt, abl_txt = [], []
         nll_s, nll_n = 0.0, 0
         qi = 0
-        a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0, 0.0, 0.0, 0])
+        a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0])
         for i, s in enumerate(conv["segs"]):
             x = s["input_ids"].to(device)
             lmask = s["loss_mask"].to(device)
-            if i in graded:
+            if i in graded and decode:
+                if abl_txt1 is None:              # constant sur tout l'appel
+                    abl_txt1 = tok.decode(_greedy(
+                        model, a_open, None, max_new, stop_id, amp,
+                        use_cache)[0].tolist())
                 live_txt.append(tok.decode(_greedy(
-                    model, a_open, bank, max_new, stop_id, amp)[0].tolist()))
-                abl_txt.append(tok.decode(_greedy(
-                    model, a_open, None, max_new, stop_id, amp)[0].tolist()))
+                    model, a_open, bank, max_new, stop_id, amp, use_cache)[0].tolist()))
+                abl_txt.append(abl_txt1)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 o = model(x, init_mem=bank)
             m = lmask[:, 1:].reshape(-1)
@@ -168,26 +226,30 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
                     a[5] += nll; a[6] += nll_a; a[7] += 1
                     if qi < len(ages):
                         b = by_age.setdefault(_age_bucket(ages[qi]),
-                                              [0, 0.0, 0.0])
+                                              [0, 0.0, 0.0, 0])
                         b[0] += 1
                         b[2] += nll_a - nll
-                        if qi < len(truths):
+                        if decode and qi < len(truths):
                             b[1] += (grade_recall([live_txt[-1]], [truths[qi]])
                                      - grade_recall([abl_txt[-1]], [truths[qi]]))
+                            b[3] += 1
                     qi += 1
             bank = o["mem_bank"]
         a[0] += nll_s; a[1] += nll_n
-        a[2] += grade(conv, live_txt)
-        a[3] += grade(conv, abl_txt)
+        if decode:
+            a[2] += grade(conv, live_txt)
+            a[3] += grade(conv, abl_txt)
+            a[8] += 1
         a[4] += 1
     model.train()
-    out = {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / v[4],
-               "grade_abl": v[3] / v[4], "n": v[4],
+    out = {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / max(v[8], 1),
+               "grade_abl": v[3] / max(v[8], 1), "n": v[4], "n_dec": v[8],
                "ans_nll": v[5] / max(v[7], 1),
                "ans_nll_abl": v[6] / max(v[7], 1), "n_ans": v[7]}
            for k, v in agg.items()}
-    out["_by_age"] = {k: {"n": v[0], "dgrade": v[1] / v[0],
-                          "dnll": v[2] / v[0]} for k, v in by_age.items()}
+    out["_by_age"] = {k: {"n": v[0], "dgrade": v[1] / max(v[3], 1),
+                          "dnll": v[2] / v[0], "n_dg": v[3]}
+                      for k, v in by_age.items()}
     return out
 
 
@@ -306,44 +368,129 @@ def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
     return out
 
 
-def main(cfg_path: str, resume: bool = False) -> None:
-    raw = load_yaml(cfg_path); t = raw["training"]; d = raw["data"]
+def dry_run(cfg_path: str) -> None:
+    """`--check` : tout ce qui peut être su d'une config SANS louer de GPU.
 
-    # DDP (opt-in via torchrun): data parallelism WITHOUT the DDP wrapper — the
-    # conv loop runs many forwards (in-context + defer + addr + reach) per single
-    # backward, which trips DDP's reducer ("marked ready twice"). Instead: each
-    # rank runs its own convs (bank/cascade/carry are rank-local state, exactly
-    # the mono-GPU semantics), gradients are all-reduced manually before
-    # opt.step(). Muon/AdamW are deterministic, so identical grads => identical
-    # weights on every rank, no sync drift. Effective batch = B * G * world_size.
-    ddp_world = int(os.environ.get("WORLD_SIZE", "1"))
-    ddp_rank = int(os.environ.get("RANK", "0"))
-    if ddp_world > 1:
-        import datetime
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)         # BEFORE init: NCCL binds the current
-        #                                           device — after, every rank also grows
-        #                                           a ~0.5GB stray context on cuda:0
-        torch.distributed.init_process_group(
-            "nccl", timeout=datetime.timedelta(hours=2))  # rank0 evals while others wait
-        device = torch.device(f"cuda:{local_rank}")
-        if ddp_rank != 0:
-            sys.stdout = open(os.devnull, "w")   # one log stream; errors keep stderr
-        print(f"ddp: world {ddp_world} (this = rank {ddp_rank}, cuda:{local_rank})",
-              flush=True)
+    Valide le schéma, construit le modèle sur CPU, puis imprime ce qu'on veut
+    relire une dernière fois avant un bring-up : les chemins APRÈS expansion de
+    ${TB_ROOT} (un cache mal pointé, c'est 25 min de re-tokenisation facturées),
+    la table de schedule, et le mix de données. N'écrit rien, ne construit aucun
+    stream, ne touche pas au réseau au-delà du tokenizer.
+    """
+    raw = load_yaml(cfg_path)
+    check_cfg(raw, "code_defer_native")
+    t, d = raw["training"], raw["data"]
+    print(f"config: {cfg_path}  →  schéma OK")
+
+    tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
+    add = [x for x in ("<think>", "<blank>") if x not in tok.get_vocab()]
+    if add:
+        tok.add_special_tokens({"additional_special_tokens": add})
+    mcfg = dict(raw["model"]); mcfg["vocab_size"] = len(tok)
+    cfg = ThoughtBankConfig(**mcfg)
+    model = ThoughtBankLM(cfg)
+    print(f"modèle: {model.num_params():,} params | d_model {cfg.d_model} "
+          f"n_layers {cfg.n_layers} n_experts {cfg.n_experts} "
+          f"mem_dim {cfg.mem_dim} max_mem {cfg.max_mem} | vocab {cfg.vocab_size}")
+
+    steps = int(t["steps"]); warmup = int(t.get("warmup_steps", 100))
+    tf = raw.get("teacher") or {}
+    tf_a0, tf_a1 = (int(v) for v in tf.get("anneal", [200, 1000]))
+    for line in describe_sched(
+            steps=steps, warmup=warmup, wsd=bool(t.get("wsd_decay", True)),
+            decay_start=int(t.get("wsd_decay_start", int(steps * 0.66))),
+            shape=str(t.get("wsd_decay_shape", "linear")),
+            floor=float(t.get("wsd_floor", 0.0)),
+            stair_n=int(t.get("wsd_stair_n", STAIR_N)),
+            stair_end=float(t.get("wsd_stair_end", STAIR_END)),
+            muon_lr=float(t.get("muon_lr", 3e-3)), lr=float(t.get("lr", 3e-4)),
+            tf_on=bool(tf.get("enabled", False)), tf_a0=tf_a0, tf_a1=tf_a1):
+        print(line)
+
+    # Les chemins sont RAPPORTÉS en entier avant de conclure : un bring-up veut
+    # voir tous les problèmes d'un coup, pas les découvrir un par un.
+    problems: list[str] = []
+    print("chemins résolus (${TB_ROOT} expansé) :")
+    for label, path in (("save_dir", t["save_dir"]),
+                        ("cache_dir", d.get("cache_dir", "data_cache")),
+                        ("metrics_file", t.get("metrics_file")),
+                        ("init_from", t.get("init_from")),
+                        ("bank_init", t.get("bank_init"))):
+        if path is None:
+            continue
+        if "${" in str(path):
+            problems.append(f"{label}: variable non résolue dans {path!r} — poser "
+                            f"la variable d'environnement, sinon le run écrit à "
+                            f"un chemin littéral")
+            print(f"  {label:<13} {path}  [VARIABLE NON RÉSOLUE]")
+            continue
+        exists = os.path.exists(path)
+        required = label in ("init_from", "bank_init")
+        note = "existe" if exists else "ABSENT" if required else "sera créé"
+        if required and not exists:
+            problems.append(f"{label}: {path} introuvable — le run échouerait "
+                            f"après avoir alloué le GPU "
+                            f"(TB_ROOT={os.environ.get('TB_ROOT', '<non posé, = .>')})")
+        extra = ""
+        if label == "cache_dir" and exists:
+            n = len([p for p in os.listdir(path) if p.startswith("chunks_")])
+            extra = f" — {n} fichier(s) de chunks en cache" if n else \
+                    " — VIDE : le run tokenisera (long)"
+        print(f"  {label:<13} {path}  [{note}]{extra}")
+
+    srcs = d.get("sources") or [{"dataset": d.get("dataset", "?"), "weight": 1.0}]
+    print(f"données: seq_len {d['seq_len']} | chunks/conv {d['chunks_per_conv']} | "
+          f"batch {d['batch_size']} | {len(srcs)} source(s)")
+    for s in srcs:
+        print(f"  - {s.get('dataset', '?'):<45} poids {s.get('weight', 1.0)}")
+    chat = raw.get("chat") or {}
+    if chat:
+        print(f"chat: stream {chat.get('stream', 'math_school')} | "
+              f"p_chat {chat.get('p_chat', 0.5)} | poids {chat.get('weight', 1.0)} "
+              f"| max_new {chat.get('max_new', 24)}")
+    depth = int(t.get("cascade_depth", 0) or 0)
+    if depth > 0:
+        cmap = ([int(v) for v in t.get("cascade_map")] if t.get("cascade_map")
+                else default_layer_map(cfg.n_layers, depth))
+        print(f"banque: max_mem {cfg.max_mem} | cascade_depth {depth} | "
+              f"map effective {cmap}"
+              + ("" if t.get("cascade_map") else "  (défaut, pas dans la config)"))
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp = bool(t.get("amp", False))            # native MoE/sinkhorn: fp32 by default
+        print(f"banque: max_mem {cfg.max_mem} | pas de cascade")
 
-    # OPT-IN speed levers (all default off => every existing config bit-identical).
-    # tf32: the biggest phase-1 win — MoE/sinkhorn run in fp32, TF32 accelerates
-    # exactly those matmuls on Ampere/Ada with a tiny precision cost. Measured in
-    # the bringup sweep before committing.
-    if bool(t.get("tf32", False)):
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("tf32: enabled (fp32 matmul -> tf32)", flush=True)
+    if problems:
+        print(f"\n--check: {len(problems)} problème(s) — le run ne partirait pas "
+              f"proprement :")
+        for p in problems:
+            print(f"  ✗ {p}")
+        raise SystemExit(1)
+    print("\n--check: OK — rien n'a été écrit.")
+
+
+def main(cfg_path: str, resume: bool = False) -> None:
+    raw = load_yaml(cfg_path)
+    check_cfg(raw, "code_defer_native")   # une clé mal orthographiée s'arrête ICI,
+    #                                       pas après N heures de GPU au mauvais schedule
+    t = raw["training"]; d = raw["data"]
+
+    # DDP (opt-in via torchrun), tf32, compile, grad-checkpoint : voir runtime.py
+    # — le CONTEXTE d'exécution, séparé de l'objectif d'entraînement. Tous ces
+    # leviers restent opt-in et OFF par défaut : une config existante produit
+    # exactement le même run.
+    ddp = init_ddp()
+    ddp_world, ddp_rank, device = ddp.world, ddp.rank, ddp.device
+    amp = bool(t.get("amp", False))            # native MoE/sinkhorn: fp32 by default
+    enable_tf32(bool(t.get("tf32", False)))
+
+    # `training.seed` pilotait les streams de données (random de Python) mais PAS
+    # torch : l'init du modèle était tirée de l'entropie de l'OS, donc deux runs
+    # de la MÊME config partaient de poids différents et aucun résultat n'était
+    # reproductible depuis sa config seule (mesuré 2026-07-25 : deux
+    # constructions du 97M donnent des poids sans rapport). Un dépôt public dont
+    # le livrable est « un lecteur reproduit des claims » ne peut pas se le
+    # permettre. Toutes les rangs partagent la graine : l'init est identique
+    # partout, et le broadcast rank0 plus bas devient une ceinture-bretelles.
+    torch.manual_seed(int(t.get("seed", 0)))
 
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     add = [x for x in ("<think>", "<blank>") if x not in tok.get_vocab()]
@@ -378,79 +525,23 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # drives it. Opt-in; graph breaks (MoE/sinkhorn/einsum) measured in the sweep.
     base = model
     if bool(t.get("compile", False)):
-        # dynamic=False : nos shapes sont statiques par construction ([B,512] et
-        # [B,16] ; m ne change que le NOMBRE d'appels) — un graphe statique par
-        # shape. Sans ça, la transition automatique statique->dynamique fait
-        # choisir au recompute du grad_checkpoint un graphe différent du forward
-        # (CheckpointError "different number of tensors", pytorch #166926).
-        # cache_size_limit relevé : le mem_bank flippe requires_grad (write on/off)
-        # => dynamo recompile a chaque flip ; la limite par defaut (8) est crevee
-        # vers step 60 (observe pod 45185048 2026-07-17) et le fallback eager
-        # desynchronise les graphes entre rangs DDP => deadlock NCCL (100% util,
-        # ~95W). On monte la limite pour que les 8 rangs recompilent en lockstep
-        # (depth_sync garantit m identique) sans jamais tomber en fallback.
-        from torch._dynamo import config as _dynamo_config
-        _dynamo_config.cache_size_limit = 256
-        _dynamo_config.accumulated_cache_size_limit = 1024
-        # compile_cache_dir (opt-in) : cache inductor+triton PERSISTANT — les
-        # kernels compilés survivent aux restarts (préemption pod, resume) au
-        # lieu de repayer la compilation à froid à chaque boot. Sur pod :
-        # pointer sous /workspace (volume persistant), tar-able vers HF avec le
-        # data cache pour réchauffer un pod NEUF (clé de cache = arch GPU +
-        # version torch : A100+même image => hits). Env lues à la PREMIÈRE
-        # compilation (premier forward), donc les poser ici suffit ; setdefault
-        # => un export shell garde la main.
-        _cc = t.get("compile_cache_dir")
-        if _cc:
-            os.makedirs(os.path.join(_cc, "triton"), exist_ok=True)
-            os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _cc)
-            os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cc, "triton"))
-            print(f"compile: cache persistant → {_cc}", flush=True)
-        model = torch.compile(model, dynamic=False)
-        print("compile: torch.compile(model, dynamic=False) enabled "
-              "(dynamo cache_size_limit=256)", flush=True)
+        model = compile_model(model, cache_dir=t.get("compile_cache_dir"))
 
-    # grad_checkpoint (opt-in): rematerialize each model forward during backward.
-    # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv
-    # backward (whole-conv TBPTT), so activation peak = O(K * B * depth-draw) —
-    # the step-to-step conv-depth variance is exactly what OOMs B>=8 on 80GB.
-    # Checkpointing stores only the inputs per forward => peak ~ one chunk's
-    # activations; gradients are EXACT (same graph, recomputed), ~+30% compute.
     grad_ckpt = bool(t.get("grad_checkpoint", False))
-    _ckpt_ctx = None
-    if grad_ckpt:
-        from torch.utils.checkpoint import checkpoint as _ckpt
-        # gc_save_topk (défaut ON) : les grads du checkpoint ne sont « exacts »
-        # que si le recompute est bit-identique au forward — faux en pratique :
-        # cuBLAS peut choisir un autre algo au recompute (workspace différent
-        # pendant le backward), les scores bougent d'un ULP, et les TOPK durs
-        # (routage MoE, sélection de blocs CSA) FLIPPENT => gradients calculés
-        # sur un autre graphe que la loss. Suspect n°1 des NaN (incident phase 1
-        # step 2520, run 5e step 33 — tous deux GC ON). Fix : selective
-        # activation checkpointing — les sorties de topk sont SAUVÉES au
-        # forward et rejouées au recompute (coût mémoire = des indices).
-        if bool(t.get("gc_save_topk", True)):
-            from torch.utils.checkpoint import (create_selective_checkpoint_contexts,
-                                                CheckpointPolicy)
-            _save_ops = {torch.ops.aten.topk.default}
+    _fwd = build_fwd(model, grad_checkpoint=grad_ckpt,
+                     save_topk=bool(t.get("gc_save_topk", True)))
 
-            def _sac_policy(ctx, op, *args, **kwargs):
-                return (CheckpointPolicy.MUST_SAVE if op in _save_ops
-                        else CheckpointPolicy.PREFER_RECOMPUTE)
-
-            _ckpt_ctx = lambda: create_selective_checkpoint_contexts(_sac_policy)
-            print("grad_checkpoint: ON + save-topk (routage figé au recompute)",
-                  flush=True)
-        else:
-            print("grad_checkpoint: ON (rematerialized forwards)", flush=True)
-
-    def _fwd(*a, **k):
-        if grad_ckpt and torch.is_grad_enabled():
-            if _ckpt_ctx is not None:
-                return _ckpt(model, *a, use_reentrant=False,
-                             context_fn=_ckpt_ctx, **k)
-            return _ckpt(model, *a, use_reentrant=False, **k)
-        return model(*a, **k)
+    # decode_cache : cache KV pour les décodages de l'ÉVAL (le seul endroit où
+    # ce trainer décode). N'accélère PAS l'entraînement — un forward
+    # d'entraînement voit la séquence entière d'un coup, il n'y a rien à
+    # cacher. Mais l'éval pèse ~21% du mur sur ce run et elle est dominée par
+    # ses décodages : ×1,6 mesuré sur le 350M au step 200. Voir decode.generate
+    # pour ce que ça change (rien en arithmétique exacte, un token ici ou là
+    # via le top-k du routage — soit le bruit que ce GPU produit déjà d'un
+    # appel à l'autre, mesuré 5/6 séquences reproductibles SANS cache).
+    decode_cache = bool(t.get("decode_cache", False))
+    if decode_cache:
+        print("decode_cache: ON (cache KV aux décodages d'éval)", flush=True)
 
     # B4 (backlog 2026-07-13) : canal DeltaNet inter-tours À LA PLACE du carry
     # de banque — modèle strictement inchangé, seul le canal inter-chunks change
@@ -466,10 +557,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
               f"({sum(p.numel() for p in delta.parameters()):,} params) — "
               f"carry inter-chunks = état delta, o['mem_bank'] ignoré", flush=True)
 
-    # DDP: model init uses the (unseeded) default RNG, so ranks start with
-    # different weights — broadcast rank0's so the manual all-reduce keeps
-    # everyone bit-identical from step 1. (tf_proj is Generator-seeded: already
-    # identical everywhere.)
+    # DDP: le seed commun ci-dessus suffit en principe à donner la même init
+    # partout ; le broadcast reste, gratuit, comme garantie dure que la
+    # all-reduce manuelle garde tous les rangs bit-identiques dès le step 1
+    # (une différence d'ordre de construction suffirait à décaler un rang).
+    # (tf_proj is Generator-seeded: already identical everywhere.)
     if ddp_world > 1:
         with torch.no_grad():
             for p in base.parameters():
@@ -493,21 +585,30 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # la nll^alpha d'un LM de référence gelé (surp_w posé par le générateur,
     # clé gen.surprisal_ref) — les tokens imprévisibles (l'information) dominent
     # la cible, les templates pèsent ~0. Marche sur tout corpus, tous les segs.
+    # (La pondération EST du SIF quand `gen.surprisal_mode: sif` : 'surprisal'
+    #  nomme le pooling, pas la formule des poids.)
+    # 'value_sif' = 'value' LÀ OÙ un val_mask existe, repli 'surprisal' partout
+    # ailleurs. Nécessaire dès que la cible discriminante ne concerne qu'une
+    # partie du mix : en 'value' pur le teacher ne tire QUE les segs porteurs, ce
+    # qui priverait ici 75 % du mix (sota + exec) de teacher. Motivation : le run
+    # `fromsif_exec_tiled` laisse toolcall à grade 0.00 aux quatre paliers gradés
+    # pendant que la nll tombe de 26 % — la sélection ne s'ouvre pas toute seule,
+    # et à 47M c'est un teacher discriminant qui l'avait ouverte (0.03 → 0.99).
     tf_target = str(tf_cfg.get("target", "chunk"))
-    assert tf_target in ("chunk", "value", "surprisal"), tf_target
+    assert tf_target in ("chunk", "value", "surprisal", "value_sif"), tf_target
     tf_proj = None
     if tf_on:
         g = torch.Generator(device="cpu").manual_seed(1789)
         tf_proj = (torch.randn(cfg.d_model, cfg.mem_dim, generator=g) / cfg.d_model ** 0.5).to(device)
         _tdesc = {"value": "proj embed valeur (discriminant)",
                   "surprisal": "proj pooling pondéré nll ref (label-free)",
+                  "value_sif": "valeur si val_mask, sinon pooling pondéré",
                   "chunk": "proj gist chunk"}[tf_target]
         print(f"teacher ON: distill_w {tf_dw}, anneal [{tf_a0},{tf_a1}], "
               f"target={tf_target} ({_tdesc})", flush=True)
 
     def _beta(s):
-        if not tf_on or s >= tf_a1: return 0.0
-        return 1.0 if s <= tf_a0 else 1.0 - (s - tf_a0) / max(1, tf_a1 - tf_a0)
+        return beta_at(s, enabled=tf_on, anneal_start=tf_a0, anneal_end=tf_a1)
 
     L, K = int(d["seq_len"]), int(d["chunks_per_conv"])
     defer_len = int(d.get("defer_len", 16))
@@ -567,10 +668,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # reach never fire on them (no defer_tgt). Absent block => bit-identical.
     chat_cfg = raw.get("chat") or {}
     chat_stream = chat_eval = None
+    chat_B = 1
     p_chat = float(chat_cfg.get("p_chat", 0.5))
     chat_w = float(chat_cfg.get("weight", 1.0))
     chat_eval_convs = int(chat_cfg.get("eval_convs", 24))
     chat_max_new = int(chat_cfg.get("max_new", 24))
+    # decode_every : le grade exact-match ne se paie qu'un palier sur N. Le
+    # décodage greedy EST l'éval (mesuré 2026-07-25 sur ce mix : 958 s des
+    # 1076 s d'un palier, 4242 forwards d'UN token à 218 ms pièce), alors que
+    # la sonde Δnll — la seule sensible tant que le canal n'est pas ouvert —
+    # coûte un forward par tour gradé. 1 (défaut) = comportement historique.
+    chat_decode_every = int(chat_cfg.get("decode_every", 1))
+    assert chat_decode_every >= 1, f"decode_every >= 1, vu {chat_decode_every}"
     if chat_cfg:
         from .streams import chat_stream_class
         sname = chat_cfg.get("stream", "math_school")
@@ -581,6 +690,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
         print(f"chat mode ON: {sname} p_chat {p_chat} weight {chat_w} "
               f"eval_convs {chat_eval_convs} (masked-CE SFT convs in the "
               f"life carry)", flush=True)
+        # chat_batch : B lanes en lockstep par tour (chat_batch.py). Le batch ne
+        # vient PAS de data.batch_size — celui-là reste le batch du stream
+        # FICHIERS, et les asserts ragged qui l'entourent (no_reset, interleave,
+        # cascade) restent donc satisfaits tels quels. Les segs arrivent en
+        # [B, L] right-padés avec un pad_mask ; l'éval reste conv par conv
+        # (chat_batch délègue next_conv).
+        chat_B = int(getattr(chat_stream, "B", 1))
+        if chat_B > 1:
+            assert delta is None, \
+                "chat batché + delta_channel : delta.init_state prend train_stream.B " \
+                "(le batch FICHIERS), il porterait un état de la mauvaise largeur"
+            print(f"chat batché: {chat_B} lanes x {chat_stream.slots} tours par "
+                  f"tirage (ops/step / {chat_B} a FLOPs quasi constants ; "
+                  f"{chat_B} vies de banque parallèles)", flush=True)
 
     # single native optimizer: Muon (2-D weights) + bundled AdamW (embed/norm/1-D)
     lr = float(t.get("lr", 3e-4)); muon_lr = float(t.get("muon_lr", 3e-3))
@@ -684,8 +807,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     if cascade_depth > 0:
         _cmap = t.get("cascade_map")
         cascade_map = ([int(v) for v in _cmap] if _cmap else
-                       [0] * (cfg.n_layers - cascade_depth)
-                       + list(range(1, cascade_depth + 1)))
+                       default_layer_map(cfg.n_layers, cascade_depth))
         assert len(cascade_map) == cfg.n_layers and max(cascade_map) <= cascade_depth
         assert not bool(getattr(cfg, "mem_write_gate_merge", False)), \
             "cascade: gate_merge réordonne les slots, la capture d'éviction suppose FIFO pur"
@@ -771,7 +893,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
     #            Leaves the read-destroying full-LR zone in ONE step.
     #   1-sqrt : Hägele et al. 2024 WSD-cooldown winner — fast early drop, long low tail
     #   cosine : Chinchilla/LLaMA classic
+    #   stair  : `wsd_stair_n` paliers géométriques jusqu'à `wsd_stair_end`. Le
+    #            run `fromsif_exec_tiled` n'a rien vu bouger AVANT le decay ; on
+    #            donne donc plusieurs baisses au lieu d'une rampe, chaque palier
+    #            assez long pour recevoir ses évals — l'escalier n'est pas qu'un
+    #            schedule, c'est la mesure « à quel LR le canal s'ouvre ».
     decay_shape = str(t.get("wsd_decay_shape", "linear"))
+    stair_n = int(t.get("wsd_stair_n", STAIR_N))
+    stair_end = float(t.get("wsd_stair_end", STAIR_END))
     log_every, eval_every = int(t.get("log_every", 20)), int(t.get("eval_every", 200))
     eval_depths = list(t.get("eval_depths", []) or [])   # [] => depth-stratified eval OFF
     eval_depth_convs = int(t.get("eval_depth_convs", 8))
@@ -790,63 +919,32 @@ def main(cfg_path: str, resume: bool = False) -> None:
         writer = SummaryWriter(tb_dir); print(f"tensorboard → {tb_dir}", flush=True)
 
     def set_lr(step):
-        scale = min(1.0, step / max(1, warmup))
-        decay = 1.0
-        if wsd and step > decay_start:
-            p = (step - decay_start) / max(1, steps - decay_start)   # window progress 0->1
-            if decay_shape == "step":
-                decay = 0.316 if p <= 0.75 else 0.1
-            elif decay_shape == "1-sqrt":
-                decay = wsd_floor + (1.0 - wsd_floor) * (1.0 - p ** 0.5)
-            elif decay_shape == "cosine":
-                decay = wsd_floor + (1.0 - wsd_floor) * 0.5 * (1.0 + math.cos(math.pi * p))
-            else:                                                    # linear (legacy)
-                decay = wsd_floor + (1.0 - wsd_floor) * (1.0 - p)
+        # Le calcul vit dans sched.py (mêmes valeurs, self-test à l'appui) : le
+        # dry-run --check imprime la table depuis la MÊME source que le trainer.
+        f = lr_scale(step, steps=steps, warmup=warmup, wsd=wsd,
+                     decay_start=decay_start, shape=decay_shape, floor=wsd_floor,
+                     stair_n=stair_n, stair_end=stair_end)
         for gp in opt.param_groups:
-            gp["lr"] = muon_lr * scale * decay * gp.get("lr_scale", 1.0)
+            gp["lr"] = muon_lr * f * gp.get("lr_scale", 1.0)
         ad = getattr(opt, "_adam", None)
         if ad:
-            for gp in ad.param_groups: gp["lr"] = lr * scale * decay
-        return muon_lr * scale * decay
+            for gp in ad.param_groups: gp["lr"] = lr * f
+        return muon_lr * f
 
+    # Sauvegarde / reprise : voir ckpt.py (écriture atomique, RNG des streams,
+    # la banque comme artefact séparé).
     def _save_ck(step, path):
-        """Full training state: preemption-safe resume on rented/spot GPUs."""
-        tmp = path + ".tmp"
-        torch.save({"step": step, "model": base.state_dict(), "cfg": cfg.__dict__,
-                    "opt": opt.state_dict(),
-                    "adam": opt._adam.state_dict() if opt._adam else None,
-                    "delta": delta.state_dict() if delta is not None else None,
-                    "ema_ic": ema_ic, "ema_d": ema_d,
-                    "rng_torch": torch.get_rng_state(),
-                    "rng_cuda": (torch.cuda.get_rng_state_all()
-                                 if torch.cuda.is_available() else None),
-                    "rng_train_stream": train_stream.rng.getstate(),
-                    "rng_eval_stream": eval_stream.rng.getstate(),
-                    "rng_chat_stream": (chat_stream.rng.getstate()
-                                        if chat_stream is not None else None)}, tmp)
-        os.replace(tmp, path)                        # atomic: no torn file on preemption
+        save_train_state(path, step=step, model=base, cfg=cfg, opt=opt,
+                         delta=delta, ema_ic=ema_ic, ema_d=ema_d,
+                         train_stream=train_stream, eval_stream=eval_stream,
+                         chat_stream=chat_stream)
 
     def _save_bank(step, path):
-        """La banque COMPLÈTE (vive + cascade) : artefact autonome — rechargeable
-        au resume, échangeable entre runs (bank_init), inspectable hors trainer."""
-        if bank_carry is None:
-            return
-        tmp = path + ".tmp"
-        torch.save({"step": step, "bank": bank_carry.detach().cpu(),
-                    "casc": (casc_carry.state_dict()
-                             if casc_carry is not None else None),
-                    "n_evict": nev_carry, "w_total": wt_carry}, tmp)
-        os.replace(tmp, path)
+        save_bank(path, step=step, bank=bank_carry, casc=casc_carry,
+                  n_evict=nev_carry, w_total=wt_carry)
 
     def _load_bank(path, tag):
-        _bk = torch.load(path, map_location="cpu", weights_only=False)
-        casc_ld = (CascadeMemory.from_state(_bk["casc"], device=device)
-                   if _bk.get("casc") is not None else None)
-        print(f"{tag}: banque chargée depuis {path} (step d'origine "
-              f"{_bk.get('step')}, cascade {'oui' if casc_ld else 'non'})",
-              flush=True)
-        return (_bk["bank"].to(device), casc_ld,
-                int(_bk.get("n_evict", 0)), int(_bk.get("w_total", 0)))
+        return load_bank(path, tag, device)
 
     _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = None, None, 0, 0
     _bi = t.get("bank_init")                 # chemin explicite : seed la vie avec
@@ -854,56 +952,28 @@ def main(cfg_path: str, resume: bool = False) -> None:
         _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = \
             _load_bank(_bi, "bank_init")
 
-    start_step = 0; ema_ic = ema_d = ema_a = ema_chat = None
+    start_step = 0; ema_ic = ema_d = ema_a = ema_chat = ema_lane = None
     ema_reach = [None, None, None]              # EMA de perte par strate d'âge
     if resume:
-        import glob, re
-        cks = {}
-        for p in glob.glob(os.path.join(save_dir, "step_*.pt")):
-            mt = re.match(r"step_(\d+)\.pt$", os.path.basename(p))
-            if mt: cks[int(mt.group(1))] = p
-        fin = os.path.join(save_dir, "final.pt")
-        if os.path.exists(fin):
-            print(f"resume: {fin} exists — training already complete, nothing to do.", flush=True)
+        _rs, _rp, _done = find_resume(save_dir)
+        if _done:
+            print(f"resume: {os.path.join(save_dir, 'final.pt')} exists — "
+                  f"training already complete, nothing to do.", flush=True)
             return
-        if cks:
-            start_step = max(cks)
-            ck = torch.load(cks[start_step], map_location="cpu", weights_only=False)
-            base.load_state_dict(ck["model"])
-            if ck.get("opt") is not None: opt.load_state_dict(ck["opt"])
-            if ck.get("adam") is not None and opt._adam is not None:
-                opt._adam.load_state_dict(ck["adam"])
-            if ck.get("delta") is not None and delta is not None:
-                delta.load_state_dict(ck["delta"])
-            ema_ic, ema_d = ck.get("ema_ic"), ck.get("ema_d")
-            if ck.get("rng_torch") is not None: torch.set_rng_state(ck["rng_torch"])
-            if ck.get("rng_cuda") is not None and torch.cuda.is_available():
-                # migration de world size (ex. 8->6 GPUs) : le ck porte un état
-                # RNG par device du node d'origine — ne restaurer que les nôtres
-                torch.cuda.set_rng_state_all(ck["rng_cuda"][:torch.cuda.device_count()])
-            # DDP: the checkpoint holds rank0's stream RNG — restoring it on every
-            # rank would make them all sample the SAME convs. Rank0 resumes its
-            # exact stream; other ranks re-seed on (rank, start_step) instead.
-            if ck.get("rng_train_stream") is not None and ddp_rank == 0:
-                train_stream.rng.setstate(ck["rng_train_stream"])
-            elif ddp_rank != 0:
-                train_stream.rng.seed(train_seed + start_step)
-            # depth_sync: rng_m must stay in LOCKSTEP across ranks after resume —
-            # deterministic re-seed on (base seed, start_step), same everywhere.
-            if train_stream.rng_m is not train_stream.rng:
-                train_stream.rng_m.seed(sd["seed"] + start_step)
-            if ck.get("rng_eval_stream") is not None:
-                eval_stream.rng.setstate(ck["rng_eval_stream"])
-            if ck.get("rng_chat_stream") is not None and chat_stream is not None:
-                if ddp_rank == 0:
-                    chat_stream.rng.setstate(ck["rng_chat_stream"])
-                else:
-                    chat_stream.rng.seed(train_seed + 1 + start_step)
+        if _rp is not None:
+            start_step = _rs
+            ck = torch.load(_rp, map_location="cpu", weights_only=False)
+            ema_ic, ema_d = restore_train_state(
+                ck, model=base, opt=opt, delta=delta,
+                train_stream=train_stream, eval_stream=eval_stream,
+                chat_stream=chat_stream, ddp_rank=ddp_rank,
+                train_seed=train_seed, base_seed=sd["seed"],
+                start_step=start_step)
             _bp = os.path.join(save_dir, f"bank_step_{start_step}.pt")
             if os.path.exists(_bp):
                 _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = \
                     _load_bank(_bp, "resume")
-            print(f"resume: restored {cks[start_step]} @step {start_step} "
+            print(f"resume: restored {_rp} @step {start_step} "
                   f"(opt {'yes' if ck.get('opt') else 'NO — old-format ck'})", flush=True)
         else:
             print("resume: no checkpoint found, starting fresh.", flush=True)
@@ -950,6 +1020,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # contenu ; les deux plats = le write n'imite rien (lever distill_w/α).
         dist_c = dist_f = 0.0; dist_cn = dist_fn = 0
         chat_v = 0.0; chat_cnt = 0
+        # ce/lane : la CE normalisée DANS chaque lane puis moyennée — hors
+        # gradient, c'est la seule quantité comparable au `chat` d'un run B=1
+        # (la loss, elle, normalise globalement sur le batch).
+        lane_v = 0.0; lane_cnt = 0
         _step_convs = []                     # trace repro nan-guard (voir plus bas)
         reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
@@ -974,14 +1048,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
                              if torch.is_tensor(v) else v) for k, v in s.items()}
                         for s in _pf_q.get()]
             else:
-                segs = (chat_stream.next_conv()["segs"] if is_chat
+                segs = (chat_stream.next_conv_batch() if is_chat and chat_B > 1
+                        else chat_stream.next_conv()["segs"] if is_chat
                         else train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                         else train_stream.next_conv_interleaved(
                             interleave_files, defer_len,
                             label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
                         if ilv_on else train_stream.next_conv())
             data_t += time.time() - _t_d
-            step_chunks += len(segs)
+            # chat batché : un seg = B tours réels. On les compte tous, sinon
+            # `chunks/step` (et le tokens/step qu'on en déduit) chuterait d'un
+            # facteur B alors que le travail est identique.
+            step_chunks += len(segs) * (chat_B if (is_chat and chat_B > 1) else 1)
             # B2 : la vie se termine à la fin de la DERNIÈRE conv du groupe
             # no_reset ((_g+1) % nrf == 0 ; nrf=1 => chaque conv est une vie).
             if (ra_ids is not None and not is_chat
@@ -1030,11 +1108,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         if casc is not None and bank.size(1) >= cfg.max_mem else None)
                 lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
                 if chat_seg:
-                    loss, bank, ce = _chat_loss(_fwd, xt, s["loss_mask"].to(device),
-                                                bank, balw, amp, lb)
+                    _lm = s["loss_mask"]
+                    # décidé côté CPU, AVANT le .to(device) : cf. _chat_loss
+                    _any = bool(_lm[:, 1:].any())
+                    _pm = s.get("pad_mask")
+                    loss, bank, ce, ce_lane = _chat_loss(
+                        _fwd, xt, _lm.to(device), bank, balw, amp, lb,
+                        pad_mask=None if _pm is None else _pm.to(device),
+                        m_any=_any)
                     loss = chat_w * loss
                     if ce is not None:
-                        chat_v += ce; chat_cnt += 1
+                        chat_v = chat_v + ce; chat_cnt += 1
+                    if ce_lane is not None:
+                        lane_v = lane_v + ce_lane; lane_cnt += 1
                     ce = None
                 else:
                     loss, bank, ce = _ic_loss(_fwd, xt, bank, balw, amp, lb)
@@ -1058,20 +1144,42 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # cible = proj de l'embedding des tokens VALEUR (val_mask), code
                 # discriminant par valeur, et NE tire que les segs porteurs.
                 beta = _beta(step)
-                vmask = s.get("val_mask")
-                surpw = s.get("surp_w") if tf_target == "surprisal" else None
+                # Cible PAR SEG. 'value_sif' prend le val_mask quand le seg en
+                # porte un (ici : le span des noms d'outils déclarés) et retombe
+                # sur le pooling pondéré sinon — les deux autres modes gardent
+                # exactement leur comportement historique (bit à bit).
+                vmask = (s.get("val_mask")
+                         if tf_target in ("value", "value_sif") else None)
+                surpw = (s.get("surp_w")
+                         if tf_target in ("surprisal", "value_sif") else None)
                 fire = tf_on and beta > 0.0 and (
-                    (tf_target != "value" or vmask is not None) and
-                    (tf_target != "surprisal" or surpw is not None))
+                    tf_target == "chunk" or vmask is not None
+                    or surpw is not None)
                 if fire:
                     with torch.no_grad():
                         emb = model.embed.weight[x].float()          # [B,T,D]
-                        if tf_target == "value" and vmask is not None:
-                            vm = vmask.to(device).unsqueeze(-1).float()  # [B,T,1]
-                            pooled = (emb * vm).sum(dim=1) / vm.sum(dim=1).clamp_min(1.0)
-                        elif surpw is not None:
+                        alt = None
+                        if surpw is not None:
                             sw = surpw.to(device).unsqueeze(-1).float()  # [B,T,1]
-                            pooled = (emb * sw).sum(dim=1) / sw.sum(dim=1).clamp_min(1e-6)
+                            alt = (emb * sw).sum(dim=1) / sw.sum(dim=1).clamp_min(1e-6)
+                        if vmask is not None:
+                            vm = vmask.to(device).unsqueeze(-1).float()  # [B,T,1]
+                            vs = vm.sum(dim=1)                           # [B,1]
+                            pooled = (emb * vm).sum(dim=1) / vs.clamp_min(1.0)
+                            # LE REPLI EST PAR LANE, pas par seg : en chat batché
+                            # les lanes portent des sessions différentes, donc un
+                            # même seg peut être un schéma d'outil en lane 0 et un
+                            # tour sota en lane 2, où `val_mask` est un pad de
+                            # zéros. Sans ce `where`, ces lanes-là recevaient une
+                            # cible NULLE — cosine 0, distill 1, et le blend
+                            # tirait leur slot vers zéro. (Bug présent aussi en
+                            # 'value' pur ; il n'avait jamais mordu, ce mode
+                            # n'ayant tourné que sur un mix 100 % porteur.)
+                            pooled = torch.where(
+                                vs > 0, pooled,
+                                alt if alt is not None else emb.mean(dim=1))
+                        elif alt is not None:
+                            pooled = alt
                         else:
                             pooled = emb.mean(dim=1)
                         gist = pooled @ tf_proj.float()
@@ -1080,7 +1188,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     distill = (1.0 - F.cosine_similarity(w0.float(), gist, dim=1)).mean()
                     total = total + tf_dw * beta * distill
                     distill_v += float(distill.detach()); distill_n += 1
-                    if vmask is not None:
+                    # porteur = le val_mask a de la MASSE, pas seulement la clé :
+                    # en chat batché `_ZERO_PAD_KEYS` la crée dès qu'une lane en
+                    # a une, donc tester `is not None` compterait tout le batch
+                    # comme porteur et la ventilation ne dirait plus rien.
+                    if vmask is not None and float(vmask.sum()) > 0:
                         dist_c += float(distill.detach()); dist_cn += 1
                     else:
                         dist_f += float(distill.detach()); dist_fn += 1
@@ -1294,8 +1406,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
             a_v /= a_cnt
             ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v
         if chat_cnt:
-            chat_v /= chat_cnt
+            # UNE seule matérialisation par step (chat_v est un tenseur accumulé
+            # sur le device : le convertir par seg coûtait une synchro par seg).
+            chat_v = float(chat_v) / chat_cnt
             ema_chat = chat_v if ema_chat is None else 0.95 * ema_chat + 0.05 * chat_v
+        if lane_cnt:
+            lane_v = float(lane_v) / lane_cnt
+            ema_lane = lane_v if ema_lane is None else 0.95 * ema_lane + 0.05 * lane_v
         for _s in range(3):
             if reach_cnt[_s]:
                 rv = reach_v[_s] / reach_cnt[_s]
@@ -1305,6 +1422,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
             addr_s = f"addr {ema_a:.3f}  " if ema_a is not None else ""
             if ema_chat is not None:
                 addr_s = f"chat {ema_chat:.3f}  " + addr_s
+            if ema_lane is not None:                  # batch chat : cf. lane_v
+                addr_s = f"ce/lane {ema_lane:.3f}  " + addr_s
             if reach_prob > 0 and any(v is not None for v in ema_reach):
                 # s1 ~ page p0, s2 ~ page mergée, s3 ~ détruit (contrôle : ne
                 # doit PAS baisser si c'est bien la page qui est lue)
@@ -1402,15 +1521,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
                             writer.add_scalar(f"eval_depth/{pfx}gap_d{d}", bd[d]["gap"], step)
             if chat_eval is not None:
                 chat_eval.rng.seed(1234)          # same conv set every eval
+                dec_on = (step % (eval_every * chat_decode_every) == 0
+                          or step == steps)
                 mm = evaluate_math(model, chat_eval, tok, device, amp,
-                                   chat_eval_convs, chat_max_new)
+                                   chat_eval_convs, chat_max_new,
+                                   use_cache=decode_cache, decode=dec_on)
                 by_age = mm.pop("_by_age", {})
                 for kind in sorted(mm):
                     v = mm[kind]
                     if v["n_ans"]:
+                        gp = (f"grade {v['grade']:.2f} abl {v['grade_abl']:.2f} "
+                              f"Δg {v['grade'] - v['grade_abl']:+.2f} | "
+                              if v["n_dec"] else "grade — | ")
                         print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
-                              f"grade {v['grade']:.2f} abl {v['grade_abl']:.2f} "
-                              f"Δg {v['grade'] - v['grade_abl']:+.2f} | ans nll "
+                              f"{gp}ans nll "
                               f"{v['ans_nll']:.3f} abl {v['ans_nll_abl']:.3f} "
                               f"Δnll {v['ans_nll_abl'] - v['ans_nll']:+.3f} "
                               f"(n={v['n']})", flush=True)
@@ -1419,8 +1543,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                               f"(n={v['n']}, contrôle)", flush=True)
                 if by_age:
                     curve = "  ".join(
-                        f"{b}: Δg {by_age[b]['dgrade']:+.2f} "
-                        f"Δnll {by_age[b]['dnll']:+.3f} (n{by_age[b]['n']})"
+                        (f"{b}: Δg {by_age[b]['dgrade']:+.2f} "
+                         if by_age[b]["n_dg"] else f"{b}: ")
+                        + f"Δnll {by_age[b]['dnll']:+.3f} (n{by_age[b]['n']})"
                         for b in AGE_BUCKETS if b in by_age)
                     print(f"[math @{step}] recall par âge (writes fait→réponse)"
                           f" : {curve}", flush=True)
@@ -1431,9 +1556,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if writer is not None:
                     for kind, v in mm.items():
                         writer.add_scalar(f"eval_math/{kind}/nll", v["nll"], step)
-                        writer.add_scalar(f"eval_math/{kind}/grade", v["grade"], step)
-                        writer.add_scalar(f"eval_math/{kind}/grade_abl",
-                                          v["grade_abl"], step)
+                        if v["n_dec"]:        # sinon on écrirait un 0 factice
+                            writer.add_scalar(f"eval_math/{kind}/grade",
+                                              v["grade"], step)
+                            writer.add_scalar(f"eval_math/{kind}/grade_abl",
+                                              v["grade_abl"], step)
                         if v["n_ans"]:
                             writer.add_scalar(
                                 f"eval_math/{kind}/ans_dnll",
@@ -1451,6 +1578,145 @@ def main(cfg_path: str, resume: bool = False) -> None:
     print("done.", flush=True)
 
 
+# ── self-test ────────────────────────────────────────────────────────────────
+
+def _selftest() -> None:
+    """L'alignement des cibles, épinglé.
+
+    La convention du dépôt : les loaders NE pré-décalent PAS, c'est la loss qui
+    aligne (`logits[:, :-1]` contre `x[:, 1:]`). Un décalage en trop est
+    invisible — le modèle apprend juste une tâche décalée d'un cran et la loss
+    descend quand même. On construit donc un modèle PARFAIT sauf à une position
+    connue, et on vérifie que la loss accuse exactement celle-là.
+    """
+    V, B, T = 30, 2, 8
+    torch.manual_seed(0)
+    x = torch.randint(0, V, (B, T))
+
+    class _Oracle:
+        """Prédit le token suivant parfaitement, sauf aux positions `broken`
+        (indices de la CIBLE, donc des positions dans x)."""
+
+        def __init__(self, broken=()):
+            self.broken = set(broken)
+
+        def __call__(self, ids, init_mem=None, layer_banks=None, **kw):
+            b, t = ids.shape
+            lg = torch.full((b, t, V), -20.0)
+            for i in range(t - 1):
+                tgt = ids[:, i + 1]                    # ce que la position i doit prédire
+                if (i + 1) in self.broken:
+                    tgt = (tgt + 1) % V                # ...et qu'elle rate
+                lg[torch.arange(b), i, tgt] = 20.0
+            lg[:, -1] = 0.0                            # dernière position : hors cible
+            return {"logits": lg, "mem_bank": init_mem,
+                    "balance_loss": torch.zeros(())}
+
+    # ── _ic_loss : un oracle parfait doit coûter ~0 ─────────────────────────
+    _, _, ce = _ic_loss(_Oracle(), x, None, 0.0, False)
+    assert ce < 1e-3, (f"oracle parfait, CE {ce:.4f} — la loss ne s'aligne pas sur "
+                       f"logits[:, :-1] vs x[:, 1:]")
+    # …et un oracle cassé partout doit coûter cher (la loss regarde bien qqch)
+    _, _, ce_bad = _ic_loss(_Oracle(broken=range(1, T)), x, None, 0.0, False)
+    assert ce_bad > 10.0, ce_bad
+
+    # ── le décalage est EXACT, pas seulement cohérent ───────────────────────
+    # Casser la cible p doit se voir ; le reste doit rester propre.
+    p = 3
+    _, _, ce_p = _ic_loss(_Oracle(broken={p}), x, None, 0.0, False)
+    assert ce_p > 1.0, f"cible {p} cassée mais CE {ce_p:.4f} : la loss l'a manquée"
+    assert abs(ce_p - 40.0 / (T - 1)) < 1.0, \
+        f"CE {ce_p:.3f} : une seule position fautive sur {T - 1} attendue"
+
+    # ── la loss d'équilibrage MoE entre bien avec son poids ─────────────────
+    class _Bal(_Oracle):
+        def __call__(self, ids, **kw):
+            o = super().__call__(ids, **kw)
+            o["balance_loss"] = torch.tensor(2.0)
+            return o
+
+    loss, _, _ = _ic_loss(_Bal(), x, None, 0.5, False)
+    assert abs(float(loss) - 1.0) < 1e-2, f"CE~0 + 0.5*2.0 attendu, vu {float(loss)}"
+
+    # ── _chat_loss : le masque sélectionne les positions supervisées ────────
+    mask = torch.zeros(B, T)
+    mask[:, p] = 1.0                                   # on ne supervise QUE la cible p
+    _, _, ce_on, _ = _chat_loss(_Oracle(broken={p}), x, mask, None, 0.0, False)
+    assert ce_on > 10.0, \
+        (f"CE {ce_on:.4f} : le masque doit tomber sur la position cassée — "
+         f"c'est ici qu'un off-by-one sur lmask[:, 1:] se voit")
+    _, _, ce_off, _ = _chat_loss(_Oracle(broken={p}), x, mask, None, 0.0, False)
+    other = torch.zeros(B, T); other[:, p + 1] = 1.0
+    _, _, ce_other, _ = _chat_loss(_Oracle(broken={p}), x, other, None, 0.0, False)
+    assert ce_other < 1e-3, \
+        f"CE {ce_other:.4f} : une position saine a été facturée pour sa voisine"
+    assert ce_off == ce_on                              # déterminisme
+
+    # segment tout-masqué (tour utilisateur) : il FORWARD mais ne coûte rien
+    loss_u, _, ce_u, _ = _chat_loss(_Oracle(broken=range(1, T)), x,
+                                    torch.zeros(B, T), None, 1.0, False)
+    assert ce_u is None and float(loss_u) == 0.0, \
+        "un segment sans supervision doit passer sans CE (son write est le but)"
+    # m_any court-circuite le test (chemin chaud) SANS changer le résultat :
+    # c'est tout l'intérêt, la synchro par seg disparaît mais la CE est la même
+    _, _, ce_fast, _ = _chat_loss(_Oracle(broken={p}), x, mask, None, 0.0, False,
+                                  m_any=True)
+    assert ce_fast == ce_on, "m_any explicite doit donner la MÊME CE"
+    _, _, ce_skip, _ = _chat_loss(_Oracle(broken=range(1, T)), x,
+                                  torch.zeros(B, T), None, 0.0, False, m_any=False)
+    assert ce_skip is None, "m_any=False doit sauter la CE comme le test interne"
+
+    # ── batch chat : la CE par lane est la diagnostique, pas la loss ─────────
+    # La loss normalise GLOBALEMENT (somme des poids du batch) ; avec des lanes
+    # de longueurs différentes les deux quantités DIVERGENT, et c'est justement
+    # pourquoi on logge la seconde. Ici lane 0 a 1 position supervisée, lane 1
+    # en a 2 : la CE globale pèse la lane 1 deux fois plus, la CE par lane non.
+    xb = x[:1].repeat(2, 1)
+    mb = torch.zeros(2, T)
+    mb[0, p] = 1.0
+    mb[1, p] = 1.0; mb[1, p + 1] = 1.0
+    _, _, ce_g, ce_l = _chat_loss(_Oracle(broken={p}), xb, mb, None, 0.0, False)
+    assert ce_l is not None, "B>1 doit produire la diagnostique par lane"
+    # lane 0 : CE(p) ; lane 1 : (CE(p) + CE(p+1))/2 avec CE(p+1)~0 => moitié
+    assert abs(float(ce_l) - 0.75 * float(ce_on)) < 1e-3 * float(ce_on), \
+        f"CE par lane {float(ce_l):.3f} : moyenne des lanes attendue"
+    # une lane NON supervisée (tour utilisateur) ne doit PAS entrer dans la
+    # moyenne : sinon elle y verse un 0 et la diagnostique n'est plus comparable
+    # à un run B=1, où ces segs sont simplement absents de la moyenne.
+    mb2 = torch.zeros(2, T); mb2[0, p] = 1.0            # lane 1 = tout masquée
+    _, _, _, ce_l2 = _chat_loss(_Oracle(broken={p}), xb, mb2, None, 0.0, False)
+    assert abs(float(ce_l2) - float(ce_on)) < 1e-3 * float(ce_on), \
+        (f"CE par lane {float(ce_l2):.3f} != {float(ce_on):.3f} : une lane sans "
+         f"supervision a été comptée comme un 0")
+    assert abs(float(ce_g) - 2 / 3 * float(ce_on)) < 1e-3 * float(ce_on), \
+        f"CE globale {float(ce_g):.3f} : 2 positions sur 3 pondérées à parts égales"
+    assert float(ce_g) != float(ce_l), \
+        "si les deux normalisations coïncident, le test ne prouve rien"
+
+    # ── helpers de remplissage ──────────────────────────────────────────────
+    ref = torch.zeros(B, 3, dtype=torch.long)
+    assert _fill(ref, 7, 4).shape == (B, 4) and (_fill(ref, 7, 4) == 7).all()
+    assert _append(ref, 9).shape == (B, 4) and (_append(ref, 9)[:, -1] == 9).all()
+
+    # ── strates d'âge du reach-back ─────────────────────────────────────────
+    got = [_age_bucket(a) for a in (0, 4, 5, 8, 9, 16, 17, 1000)]
+    assert got == ["<=4", "<=4", "5-8", "5-8", "9-16", "9-16", ">16", ">16"], got
+    assert set(got) <= set(AGE_BUCKETS), "strate hors du vocabulaire déclaré"
+    # les bornes sont INCLUSIVES : c'est ce que supposent les tables de FINDINGS
+    assert _age_bucket(4) != _age_bucket(5) and _age_bucket(16) != _age_bucket(17)
+
+    print("code_defer_native self-test: OK (alignement des cibles épinglé sur "
+          "_ic_loss ET _chat_loss — position fautive localisée au bon index, "
+          "masque tout-zéro sans CE, m_any sans effet sur la CE, batch chat : "
+          "CE globale != CE par lane, poids de balance, helpers, strates d'âge)")
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--resume"]
-    main(args[0], resume="--resume" in sys.argv[1:])
+    flags = {"--resume", "--check"}
+    args = [a for a in sys.argv[1:] if a not in flags]
+    if not args:                       # contrat selftest.sh : sans argument = self-test
+        _selftest()
+    elif "--check" in sys.argv[1:]:
+        dry_run(args[0])
+    else:
+        main(args[0], resume="--resume" in sys.argv[1:])

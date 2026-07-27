@@ -1,0 +1,337 @@
+# sft_sota_350m_tools_exec_FAST — le mix `near`, au régime rapide, depuis la
+# BASE PHASE 1 SIF.
+#
+# Données, schedule et teacher = ceux du run `near` (sota .5 / tools .25 /
+# exec .25, p_near 0.5, β=1 [0,150] + rampe [150,300]) au décalage WSD près :
+# **wsd_decay_start 600** et non 300 (décision user 2026-07-25) — 300 steps de
+# croisière à LR plein APRÈS la fin de l'anneal teacher, là où la recette rearm
+# entamait le decay pile à la sortie de la rampe. Deux autres choses changent,
+# et une seule est scientifique :
+#
+#   1. LE POINT DE DÉPART (décision user 2026-07-25). init_from n'est plus
+#      `v350_sft_persona_sif_repass_rearm/step_550.pt` mais la base phase 1
+#      SIF `v350_sif_repass/final_step2500.pt`. Motif : avoir une COMPARAISON
+#      — les runs `tools_exec` (500 steps) et `near` (300 steps) partent tous
+#      deux du canal read transféré du persona, dont le 07-24 avait constaté
+#      qu'il « ne s'approfondit pas sur data réelle » (Δnll plat +0.05).
+#      Ce run est le bras « base propre », schedule identique.
+#      Les deux ckpts ont un `cfg` STRICTEMENT identique (653 tenseurs, zéro
+#      clé divergente) : l'échange d'init ne touche à rien d'autre.
+#      ⚠️ À ASSUMER : cette base n'a jamais vu de ChatML — le registre n'est
+#      pas payé, et il se paie ici SOUS teacher (β=1 dès le step 1). La
+#      variante à deux étages du 07-24 (`sft_sota_fromsif_reg.yaml` : 150
+#      steps teacher-off d'abord) a été écartée par l'utilisateur au profit
+#      d'un run unique. Si `chat` stagne au-delà de ~step 100, c'est là qu'il
+#      faut regarder.
+#   2. LE COÛT DU STEP, détaillé ci-dessous. Aucune conséquence sur la science
+#      hormis la taille du step (voir l'avertissement chunks/step).
+#
+# CE QUI CHANGE, ET CE QUE ÇA A COÛTÉ (mesuré 2026-07-25 sur la 3090, mêmes
+# seed/données, s/step cumulatif à step 6, normalisé par chunks/step) :
+#
+#   config                                 s/step   chunks   s/chunk   pic VRAM
+#   ------------------------------------   ------   ------   -------   --------
+#   near (boucle Sinkhorn + GC)             88.47      44      2.011      9.1 G
+#   + model.sinkhorn_closed_form            69.13      44      1.571      9.0 G
+#   + grad_checkpoint: false                42.85      44      0.974     20.6 G
+#   + chat_batch 4 lanes x 3 tours          15.14      36      0.421     14.7 G
+#   + les deux                              11.14      36      0.309     16.4 G
+#
+# mais ces 6.5x supposaient une fenêtre TBPTT de 3 tours — inacceptable (voir plus
+# bas). Ce fichier tourne à batch=4 / slots=32, mesuré :
+#
+#   47.2 s/step | 128 chunks/step | 0.369 s/chunk | 16.9 G de pic | 800 steps ~10h30
+#
+# soit 5.5x par chunk sur `near`, dont le run complet aurait pris ~20 h.
+#
+# LE COÛT PAR CHUNK EST PLAT EN slots (0.421 à 3 tours, 0.354 à 16, 0.369 à 32) et
+# la VRAM presque plate aussi (14.7 / 15.0 / 16.9 G) : allonger la fenêtre TBPTT
+# est donc quasi gratuit par unité de travail. Ce que slots change, c'est la
+# TAILLE du step — chunks/step = batch x slots x grad_accum, et grad_accum >= 1.
+# À schedule constant, la couverture se paie donc en temps de MUR, pas en mémoire :
+#   slots 16 -> 64 chunks/step,  5.0 h, 75.7% de survie du gradient
+#   slots 24 -> 96 chunks/step,  7.7 h, 83.8%
+#   slots 32 -> 128 chunks/step, 10.5 h, 87.8%   <- choix user 2026-07-25
+#
+# ATTENTION : 128 chunks/step contre ~44 en moyenne pour `near`. Le schedule
+# (anneal [150,300], wsd_decay_start 600) est en STEPS, donc il couvre ~3x plus de
+# tokens qu'à l'origine. C'est assumé : la recette rearm validée est en steps, on
+# ne la redescend PAS (400x128 ferait le même budget de tokens en 5 h, mais avec
+# la moitié des updates pour un batch effectif double — écart à la recette).
+#
+# POURQUOI PAS PLUS DE BATCH. La banque est DÉTACHÉE à chaque pull
+# (code_defer_native, `the carried bank is data, not gradient path`), donc
+# `slots` EST la fenêtre TBPTT : un write ne reçoit de gradient que des réponses
+# du même pull. En B=1 un pull = une session, la fenêtre est ALIGNÉE sur la
+# session et 100% des couples write->réponse sont couverts. Mesuré sur ce mix :
+# sessions 9 tours en médiane (p90 15, max 32), et âge write->réponse sota
+# médian 6, p90 12, max 22. Un couple d'âge a survit avec probabilité exactement
+# max(0, 1-a/s) (offset uniforme dans la fenêtre). Survie MOYENNE sur la vraie
+# distribution d'âges (1416 couples échantillonnés, pondérés par sous-stream) :
+#   slots  3 -> 25.4%   |  slots 16 -> 75.7%  (1.2% des couples hors de portée)
+#   slots  8 -> 55.7%   |  slots 24 -> 83.8%  (0.2%)
+#                       |  slots 32 -> 87.8%  (0.0% : plus AUCUN couple hors de portée)
+# Référence batch=1 : la fenêtre EST la session, donc 100% partout.
+# La vitesse va en 1/batch, la VRAM suit surtout batch, la couverture suit slots.
+#
+# Pourquoi ça marche : le step était à ~250x du régime compute-bound (386M sur
+# ~150 tokens = ~0.5 TFLOP = ~10 ms de 3090, payés 2.7 s). Il est limité par le
+# NOMBRE D'OPS ÉMISES, et le compte d'ops aten ne dépend pas du batch (11 462 à
+# B=1 contre 11 486 à B=4). Voir chat_batch.py et mhc._sinkhorn_2x2.
+#
+# grad_checkpoint RESTE ON. Il coûte un forward de recompute (-26% d'ops), mais
+# le 15.0 G mesuré ci-dessus l'inclut : à batch=4 x slots=16 le graphe fait 64
+# seg-équivalents et le couper ferait très probablement OOM au step 1. Le couper
+# n'a été mesuré sûr qu'à batch=1 (20.6 G, et encore : le pic y suivait la
+# longueur de la conv, jusqu'à 66 chunks pour 3 G de marge). Ne pas le rouvrir
+# sans remesurer À CETTE largeur.
+#
+# ATTENTION à la lecture des logs : `chat` normalise la CE globalement sur le
+# batch, donc sa valeur n'est PAS comparable à celle d'un run B=1. La colonne
+# comparable est `ce/lane` (CE normalisée dans chaque lane, moyennée sur les
+# lanes supervisées) — hors gradient, elle ne sert qu'à ça.
+#
+# LANCEMENT :
+#   TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_sota_350m_tools_exec_fast.yaml
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+  sinkhorn_closed_form: true
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.2
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.1
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 1
+  amp: true
+  # Base = phase 1 SIF repass (canal WRITE natif, zéro registre, zéro persona).
+  # Poids seuls, optim frais, step→0, banque fraîche. Voir l'en-tête.
+  init_from: ${TB_ROOT}/checkpoints/v350_sif_repass/final_step2500.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  no_reset_files: 0
+  cascade_depth: 4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_decay_start: 600                     # décision user 2026-07-25 : LR plein
+                                           # jusqu'à 600 (300 de croisière APRÈS
+                                           # la fin de l'anneal, contre 0 avant),
+                                           # decay linéaire 600→800.
+  wsd_decay_shape: linear
+  decode_cache: true                       # cache KV aux décodages d'éval
+                                           # (x1,6 mesuré ; l'éval pesait 21-25%
+                                           # du mur). Hors gradient : ne touche
+                                           # que le chemin de génération.
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 50
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths:
+  - 2
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 50
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_sota_fromsif_exec_fast
+  metrics_file: ${TB_ROOT}/runs/v350_sft_sota_fromsif_exec_fast/metrics.jsonl
+chat:
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 240
+  stream: chat_batch
+  gen:
+    batch: 4
+    slots: 32
+    stream: chat_mix
+    gen:
+      streams:
+      - stream: sota_session
+        weight: 0.5
+        gen:
+          real_cache_dir: ${TB_ROOT}/data_cache
+          conv_cap: 8000
+          max_turn_tok: 192
+          max_conv_msgs: 10
+          convs_per_session:
+          - 2
+          - 6
+          p_requote: 0.5
+          n_requote:
+          - 1
+          - 2
+          requote_weight: 4.0
+          surprisal_mode: sif
+          sif_a: 0.0001
+      - stream: tool_session
+        weight: 0.25
+        gen:
+          datasets:
+          - nvidia/Nemotron-Agentic-v1#tool_calling
+          episode_cap: 6000
+          max_turn_tok: 192
+          max_schema_tok: 256
+          eps_per_session:
+          - 2
+          - 5
+          p_near: 0.5
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+      - stream: code_exec
+        weight: 0.25
+        gen:
+          dataset: nvidia/OpenCodeInstruct
+          problem_cap: 6000
+          max_problem_tok: 256
+          max_code_tok: 224
+          max_tests: 8
+          probs_per_session:
+          - 2
+          - 4
+          p_near: 0.5
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  target: surprisal
+  anneal:
+  - 150
+  - 300

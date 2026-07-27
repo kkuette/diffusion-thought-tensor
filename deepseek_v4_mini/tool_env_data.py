@@ -36,6 +36,8 @@ import json
 import re
 import sys
 
+import torch
+
 from .persona_chat_data import PersonaChatStream
 from .rl_rewards import _balanced_spans, extract_calls, grade_calls
 from .paths import load_yaml
@@ -241,6 +243,59 @@ class ToolSessionStream(PersonaChatStream):
         tail = texts[-len(golds):]
         return sum(grade_calls(t, g) for t, g in zip(tail, golds)) / len(golds)
 
+    # ── teacher discriminant ─────────────────────────────────────────────────
+    @staticmethod
+    def _schema_names(schemas: list) -> list:
+        """Nom de fonction de chaque schéma déclaré (première clé "name" — les
+        deux parseurs posent la fonction au niveau racine du JSON)."""
+        out = []
+        for s in schemas:
+            m = re.search(r'"name"\s*:\s*"([^"]+)"', s)
+            if m:
+                out.append(m.group(1))
+        return out
+
+    def _user_tools(self, text: str, names: list) -> dict:
+        """Seg de DÉCLARATION d'outils, avec un `val_mask` sur les spans des noms.
+
+        C'est le seg dont l'écriture doit porter le menu : la mesure du
+        2026-07-26 dit que le modèle n'émet le bon nom que 2 fois sur 19 — et
+        qu'il émet un nom hors des 5 déclarés exactement aussi souvent, donc
+        qu'il ne lit pas le menu du tout. Sous `teacher.target: value_sif`, le
+        slot fraîchement écrit est tiré vers la projection de l'embedding de CES
+        tokens-là plutôt que vers le gist pondéré du seg entier — le reste du
+        mix garde son pooling SIF. Échafaudage : β l'annule comme le reste, et
+        seul le verdict à β=0 compte.
+        """
+        seg = self._user(text)
+        ids = seg["input_ids"][0].tolist()
+        vmask = torch.zeros(len(ids))
+        for v in names:
+            for span in self._val_spans(ids, v):
+                vmask[span[0]:span[1]] = 1.0
+        seg["val_mask"] = vmask.unsqueeze(0)
+        return seg
+
+    def _val_spans(self, ids: list, v: str) -> list:
+        """TOUS les spans du nom `v` dans `ids`. Plusieurs variantes de
+        tokenisation sont tentées — dans un schéma JSON le nom est collé au
+        guillemet ouvrant, donc `"get_weather` ne se segmente pas comme
+        `get_weather` isolé — et on garde la première qui matche."""
+        for vs in ('"' + v, " " + v, v):
+            sub = self.tok(vs, add_special_tokens=False)["input_ids"]
+            if not sub:
+                continue
+            hits, i = [], 0
+            while i <= len(ids) - len(sub):
+                if ids[i:i + len(sub)] == sub:
+                    hits.append((i, i + len(sub)))
+                    i += len(sub)
+                else:
+                    i += 1
+            if hits:
+                return hits
+        return []
+
     # ── session assembly ─────────────────────────────────────────────────────
     def next_conv(self) -> dict:
         n_eps = self.rng.randint(*self.eps_per_session)
@@ -253,8 +308,9 @@ class ToolSessionStream(PersonaChatStream):
             segs, truths, gold_calls, ages = [], [], [], []
             for e in eps:
                 schema_idx = len(segs)
-                segs.append(self._user("Tools available this session:\n"
-                                       + "\n".join(e["schemas"])))
+                segs.append(self._user_tools(
+                    "Tools available this session:\n" + "\n".join(e["schemas"]),
+                    self._schema_names(e["schemas"])))
                 segs.append(self._user(e["query"]))
                 ages.append(len(segs) - schema_idx)  # = 2, schéma tout frais
                 segs.append(self._assistant(e["gold"]))
@@ -268,8 +324,9 @@ class ToolSessionStream(PersonaChatStream):
         # cannot know which episode a schema belongs to until its query lands
         schemas = [s for e in eps for s in e["schemas"]]
         self.rng.shuffle(schemas)
-        segs = [self._user("Tools available this session:\n"
-                           + "\n".join(schemas))]
+        segs = [self._user_tools("Tools available this session:\n"
+                                 + "\n".join(schemas),
+                                 self._schema_names(schemas))]
         # queries in an order DIFFERENT from the schema declaration (schema of
         # the last-declared episode may come first): sample a non-identity
         # permutation when possible
@@ -377,4 +434,35 @@ if __name__ == "__main__":
             half = info["truths"][:-1] + ["nope"]
             g = st.grade_conv(c, pad + half)
             assert abs(g - (info["n_eps"] - 1) / info["n_eps"]) < 1e-9
-    print("tool_env_data self-test: OK (glaive parse, assembly, ages, grader)")
+
+    # ── val_mask des noms déclarés (teacher.target: value_sif) ───────────────
+    # Un masque qui se viderait en silence rendrait le teacher discriminant
+    # INOPÉRANT sans rien casser : le run tournerait et on lirait le résultat
+    # comme un verdict sur la sélection. D'où des assertions dures.
+    assert ToolSessionStream._schema_names(
+        [json.dumps({"name": "get_btc", "parameters": {}}),
+         json.dumps({"name": "get_time"})]) == ["get_btc", "get_time"]
+    n_vm = 0
+    for _ in range(100):
+        c = st.next_conv()
+        decl = [s for s in c["segs"] if "val_mask" in s]
+        # tout seg de déclaration en porte un, et LUI SEUL
+        assert decl, c["segs"][0]["role"]
+        for s in decl:
+            vm = s["val_mask"]
+            assert vm.shape == s["input_ids"].shape, (vm.shape, s["input_ids"].shape)
+            assert float(vm.sum()) > 0.0            # jamais vide
+            assert float(vm.sum()) < vm.numel()     # ni le seg entier
+            n_vm += 1
+        # les segs question/réponse n'en portent pas : leur write garde le SIF
+        assert all("val_mask" not in s for s in c["segs"] if s not in decl)
+    assert n_vm >= 100, n_vm
+    # les tokens masqués sont bien CEUX du nom, pas un span arbitraire
+    c = st.next_conv()
+    s0 = next(s for s in c["segs"] if "val_mask" in s)
+    ids = s0["input_ids"][0].tolist()
+    keep = [i for i, m in enumerate(s0["val_mask"][0].tolist()) if m > 0]
+    assert "fn_" in "".join(chr(ids[i]) for i in keep), keep   # _Tok = char-level
+
+    print("tool_env_data self-test: OK (glaive parse, assembly, ages, grader, "
+          "val_mask noms déclarés)")

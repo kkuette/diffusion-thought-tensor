@@ -37,6 +37,612 @@ test this — before scale.
 
 ---
 
+## 2026-07-27 — run `valsif_stair` (2000 steps) : la SÉLECTION depuis la banque S'OUVRE — 10/30 noms d'outils contre 0/30 sans banque, codeexec 0.222 contre un null à 0.006 — et le mur du 07-26 tombe
+
+Le run : `sft_sota_350m_valsif_stair` (config du même nom), 2000 steps, 22,6 h
+sur la 3090, `done.`, 40 ckpts. Même data, même pavage, même init (base SIF
+propre `final_step2500`) que `_tiled` du 07-26 ; trois changements, décidés
+ensemble et donc **non ablatés** : teacher `value_sif` (cible discriminante =
+span des noms d'outils déclarés via `val_mask`, repli pooling SIF partout
+ailleurs), fenêtre teacher élargie (β=1 sur [0,300], rampe [300,600]), et
+décroissance en ESCALIER (`wsd_decay_shape: stair`, LR plein jusqu'à 1200 puis
+4 paliers de 200 steps à ×0.473/0.224/0.106/0.050 — chaque palier reçoit ses
+évals, donc l'escalier est aussi une MESURE : à quel LR le canal s'ouvre).
+
+### Le verdict, mesuré hors-run sur `final.pt` (n=30 toolcall / n=22 codeexec, protocole banque-seule du 07-26 à l'identique)
+
+| | `_tiled` 07-26 | `valsif_stair` |
+|---|---|---|
+| toolcall, nom exact | 2/19 (11 %) | **10/30 (33 %)** |
+| toolcall, nom parmi les outils déclarés | 2/19 | 13/30 |
+| toolcall, **bras ablaté** | — | **0/30** |
+| toolcall, appel complet (`grade_calls`) | 0.00 | 0.133 |
+| codeexec, pass_frac greedy | 0.000 | **0.222** |
+| codeexec, renommé | 0.080 | 0.250 |
+| codeexec, **null mélangé** (code d'un autre problème) | 0.062 | **0.006** |
+| codeexec, ablaté | 0.000 | 0.000 |
+| codeexec, gold (sanité) | 1.000 | 1.000 |
+
+Deux nombres portent tout : **10/30 contre 0/30** (la sélection vient de la
+banque, pas de l'hôte), et **le null qui s'effondre 0.062 → 0.006** (le code
+produit n'est plus du générique plausible qui passait parfois les tests d'un
+autre problème — il est spécifique au problème). Le 13>10 (« quand il se trompe,
+il se trompe parfois DANS le menu », là où `_tiled` ne touchait jamais le menu
+hors réussite) ne repose que sur 3 tours : indice, pas résultat.
+
+Le mode d'échec résiduel (20/30) est un **attracteur mémorisé hors menu** : le
+modèle retombe sur un appel appris par cœur (`get_info_from_vin`, toujours le
+même VIN), y compris quand le menu déclaré ne le contient pas. C'est le profil
+d'erreur idéal pour un cliquet GRPO : le bon comportement existe à taux
+mesurable, la porte dure sur le nom donne 0 à l'attracteur à chaque tirage.
+
+### Le piège de lecture qui a failli enterrer le résultat
+
+L'éval en run affichait `toolcall grade 0.00` aux HUIT paliers gradés, et je
+l'ai lu (07-27 au matin) comme « quatrième occurrence du mur, le teacher
+discriminant n'a rien produit ». Faux : ce `grade` est `grade_calls` =
+**porte dure sur le nom × F1 des arguments** (`rl_rewards.grade_call`) — un nom
+juste avec de mauvais arguments vaut 0.00, et sur n=2 convs en run la
+différence entre « nom jamais bon » et « appel complet jamais bon » est
+invisible. La règle qui reste : **un grade composite à 0 ne localise rien** —
+toujours re-décoder en séparant les termes (nom seul / nom dans le menu / args)
+avant de conclure qu'un canal est fermé.
+
+### Ce que l'escalier a mesuré
+
+`codeexec` en run (n=5, bras ablaté 0.00 partout) : 0.07 @1200 (LR plein) →
+0.12 @1400 (×0.473) → **0.24 @1600 (×0.224)** → 0.22 @1800 → 0.28 @2000.
+Le saut est à la DEUXIÈME marche : le canal s'ouvre autour de ×0.2 du LR de
+croisière, pas en dessous. Et rien n'a bougé pendant les 600 steps de croisière
+post-anneal (600→1200) : la conversion nll→comportement se paie au decay,
+troisième observation du genre (cf. 07-26).
+
+### Greedy contre échantillonné : ce que la banque porte est déjà dans l'argmax
+
+Question posée parce que `toolcall` avait Δnll +0.191 avec grade 0.00 en run —
+« la banque porte-t-elle une info que le décodage greedy perd ? ». Sonde : K=8
+échantillons (temp 0.8, top-p 0.95) par tour, avec le MÊME tirage sans banque
+comme null. Réponse : **non** — pass@8 nom exact 11/30 contre greedy 10/30
+(ablaté 0/30 aux deux), codeexec pass@8 0.165 < greedy 0.222 (temp 0.8 casse
+du code long, attendu). L'hypothèse « le décodage perd l'information » est
+réfutée ; corollaire utile : les rollouts RL, qui échantillonnent, porteront le
+signal de sélection.
+
+### Attribution honnête, et ce qui casse
+
+- `codeexec` n'a PAS de `val_mask` — ses segs sont au repli SIF, strictement
+  comme `_tiled`. Son ouverture (0.000 → 0.222) est donc attribuable à
+  budget+escalier SEULS. Pour `toolcall` (le seul kind à cible discriminante),
+  on ne peut pas séparer teacher/fenêtre/escalier : pas d'ablation.
+- `requote` n'est PLUS une sonde de banque : le bras ablaté rattrape (0.00 →
+  0.16 entre 800 et 2000, Δg +0.18 → −0.01). L'hôte produit du contenu sota
+  plausible sans banque et `grade_recall` lui en donne crédit. Suivi mémoire =
+  Δnll et toolcall désormais.
+- L'érosion hôte a doublé vs `_tiled` : ic_ppl codeparrot 19,5 → 115,7, fineweb
+  141 → 663 (contre 33,6/306 à `_tiled`@800). Le defer GAP tient (+2,45/+1,57)
+  — le mécanisme survit, l'hôte paie. Assumé (décision user 07-26 : « l'érosion
+  est un problème pour plus tard ») ; la réparation appartient au mid-training
+  de la prochaine phase 1, pas au cliquet RL.
+
+### Conséquence RL
+
+La gate du 07-26 (« tools rend 0 à tous les rollouts ⇒ groupe dégénéré ⇒ 55 %
+du mix mort ») n'est plus fondée : il y a de la variance de récompense sur
+tools (tours à 1.00/0.67/0.33, moyenne 0.133) et exec (0.222 vs null 0.006).
+Pré-vol à rejouer depuis `v350_sft_valsif_stair/final.pt` (le config
+`rl_disagg_350m.yaml` pointe encore sur un ckpt périmé) : compter la fraction
+de groupes rejetés par `min_reward_std`/`max_resample` par env avant de lancer.
+
+### Reproduire
+
+```bash
+# le run
+TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+  deepseek_v4_mini/configs/sft_sota_350m_valsif_stair.yaml
+# le verdict hors-run (n=32, greedy + pass@8 + nulls) : scratchpad verdict_valsif.py
+# — protocole banque-seule identique à rename_then_test.py du 07-26,
+#   + décodage échantillonné apparié (même Generator, banque vs None)
+```
+
+### Suite du même jour — pré-vol RL : deux bugs de chemin rollout trouvés et corrigés, la gate passe de « morte » à « ouverte sur 75 % du mix »
+
+Le pré-vol (Worker réel, chemin exact de `one_group` instrumenté par tentative,
+64 épisodes) a d'abord rendu **tools 0/27 groupes vivants, exec 1/11** — pire
+que le 07-26 — avec la cause au premier regard : `writes/rollout = 0.2` sur 8
+chunks. En rollout, le write est la POLITIQUE (p(`<think>`) à la frontière), et
+la data SFT ne contient aucun `<think>` ⇒ p_w ≈ 0.02 ⇒ banque vide, alors que
+toutes les mesures d'éval écrivaient chaque seg (chemin trainer).
+
+**Bug 1 — l'append `<think>` empoisonnait chaque écriture.** Avec un plancher
+d'exploration monkeypatché (p_b = max(p_w, 0.5)), les writes arrivent… et tout
+reste à 0.000, exec compris. A/B 4 bras (mêmes épisodes, banque écrite à chaque
+chunk, croisant {chunk nu, chunk+`<think>` appondu} × {décodage banque seule,
+layer_banks}) :
+
+| bras | tools nom exact | exec pass_frac |
+|---|---|---|
+| PLAIN+BANK (chemin éval) | 3/16 | 0.328 |
+| PLAIN+LB | 2/16 | 0.250 |
+| THINK+BANK | 0/16 | 0.000 |
+| THINK+LB (chemin rollout) | 0/16 | 0.000 |
+
+`boundary_step` appondait un `<think>` au chunk avant le forward qui produit le
+write — un embedding JAMAIS entraîné (aucune donnée ne le contient), du bruit
+d'init poolé dans chaque écriture. Et l'append était inutile même pour la
+politique : l'attention est causale, les logits de la dernière position ne
+dépendent pas d'un token appondu après. Fix : forward du chunk nu — p_w
+identique, write identique au trainer, un token de moins. Le décodage cascade
+(LB), lui, coûte peu.
+
+**Bug 2 — politique write froide ⇒ `explore_floor`** (nouvelle clé rl, défaut
+0.0 = comportement historique) : p_b = max(p_w, 0.5), `logp_old` = comportement
+réel (correction off-policy au replay), retour on-policy dès que think_row
+dépasse le plancher. 0.5 et pas 1.0 : la variance intra-groupe du GRPO vient de
+la DIVERSITÉ des motifs d'écriture.
+
+**Pré-vol final (48 épisodes, code du repo)** : code 7/7 et sota 13/13 groupes
+vivants, **exec 3/10 (p(groupe/appel) 0.83 avec resamples)**, tools 1/18.
+Isolation du reliquat tools (12+12 épisodes, vie fraîche vs portée) : FRESH
+1/12 = CARRIED 2/12 — **la banque portée n'est PAS le facteur**. La contrainte
+est l'épisode « touchable » (~10-15 % des tirages ; dedans, 4-5/8 rollouts
+positifs = bon contraste). Manette : pool tool aligné Nemotron-only (la
+distribution où le SFT a ouvert le canal : 33 % vs 19 % sur pool mixte avec
+glaive, jamais vu en SFT).
+
+Corrections config `rl_disagg_350m.yaml` du même passage : `init_from` →
+`v350_sft_valsif_stair/final.pt` (pointait un ckpt périmé) ; **`cascade_map` →
+`[0×8,1,2,3,4]`** (l'ancienne `[0,0,0,1,1,1,2,2,2,3,3,3]` faisait lire la
+cascade avec un routage jamais vu à l'entraînement) ; `decode_cache: true`
+(rollout = échantillon) ; `explore_floor: 0.5` ; pool tool Nemotron-only.
+
+Rejouables (scratchpad) : `rl_preflight.py` (chiffrage par tentative),
+`rollout_ab.py` (l'A/B 4 bras), `preflight_tools_iso.py` (fresh vs carried).
+
+---
+
+## 2026-07-26 — run pavé `fromsif_exec_tiled` (800 steps, base SIF propre) : le format est acquis, la SÉLECTION-depuis-la-banque ne l'est pas — deux hypothèses éliminées, et le mur de l'arc persona confirmé sur données réelles
+
+> **MAJ 2026-07-27 : le mur décrit ici est TOMBÉ au run suivant
+> (`valsif_stair`, entrée ci-dessus) — sélection 10/30 contre 0/30 ablaté.
+> Les éliminations d'hypothèses (init, grader) et le protocole du null
+> restent valides ; la conclusion « sélection fermée » ne l'est plus.**
+
+Le run existait pour trancher une question posée le 07-24 : « le canal read ne
+s'approfondit pas sur data réelle (Δnll plat +0,05) — est-ce parce qu'il a été
+transféré du persona ? ». Réponse : **non**. Et en creusant le décodage, une
+seconde explication facile tombe aussi.
+
+### La mécanique, conforme
+
+800 steps, `slots: 24` pavés, `max_seg_tok: 512`, `init_from` = phase 1 SIF
+`final_step2500`, WSD 600→800, `decode_every: 4`.
+
+| | prévu | mesuré |
+|---|---|---|
+| s/step | 40 | **35,4** |
+| chunks/step | 96 fixe | 96,0 |
+| pic VRAM | < 24 G | **16,4 G** (contre 22,6 sur `_fast`) |
+| éval | 1,36 h (15 %) | **1,37 h (15 %)** |
+| mur | 8,9 h | 9,2 h |
+
+Le pavage n'a jamais coupé une session. Les paliers AVEC décodage raccourcissent
+au fil du run (1132 → 873 → 778 s) : le modèle apprend à émettre `<|im_end|>` au
+lieu de ramer jusqu'au plafond `max_new`.
+
+### Hypothèse 1 éliminée — ce n'était pas l'init
+
+`ce/lane` 3,285 → 1,592. À steps égaux (500) contre le bras parti du rearm
+persona (`tools_exec`) :
+
+| kind | Δnll ici | Δnll bras persona | nll ici | nll bras persona |
+|---|---|---|---|---|
+| codeexec | +0,029 | +0,045 | **0,703** | 1,074 |
+| requote | +0,012 | +0,089 | **2,194** | 2,476 |
+| toolcall | **+0,188** | +0,138 | **1,698** | 1,990 |
+
+La base SIF propre donne un hôte nettement meilleur — la nll chute d'un tiers
+partout — mais le Δnll reste dans la même bande. Le plafond n'est pas au point
+de départ.
+
+Raison mécanique à garder en tête : **Δnll est une différence, et un meilleur
+hôte tire les DEUX bras**. À step 750, codeexec est à nll 0,570 / ablaté 0,622 :
+le bras sans mémoire est déjà quasi parfait, il ne reste rien à gagner. La
+pression du point fixe ignore-bank se lit directement là.
+
+### Ce qui EST acquis : le format, et il s'ouvre au decay
+
+Rien ne bouge entre 400 et 600 à LR plein ; tout se consolide sur 600→800 quand
+le LR tombe (`wsd_decay_start: 600`). Grade aux 4 paliers décodés :
+
+| kind | @200 | @400 | @600 | @800 |
+|---|---|---|---|---|
+| codeexec | 0,00 | 0,00 | 0,00 | **0,07** (abl 0,00) |
+| requote | 0,13 | 0,16 *(abl 0,20)* | 0,16 | **0,29** (abl 0,00) |
+| toolcall | 0,00 | 0,00 | 0,00 | 0,00 |
+
+Le bras ablaté est à 0,00 : ce qui est gradé est intégralement attribuable à la
+banque. Et le run **n'avait pas saturé à 800**.
+
+### Hypothèse 2 éliminée — ce n'était pas le grader
+
+Le décodage (protocole de l'éval ET du rollout RL : préfixe `A_OPEN`, banque
+seule) montre un format parfait et un contenu générique. Sur 27 tours gradés :
+identifiant exact **1/18** en codeexec, **0/7** en toolcall, avec des attracteurs
+récurrents (`find_common_elements` ×5, `get_amazon_product_details` ×3). Le bras
+ablaté est UNE phrase constante pour tout, y compris quand on demande du code.
+
+Deux faits sur les données, trouvés en cherchant pourquoi :
+
+* **toolcall est parfaitement posé** — le nom de l'outil est dans les schémas
+  déclarés **464/464 fois (100 %)**, ~1,2 schéma par épisode, 5 outils déclarés
+  par session en médiane. Il n'est dans la question que 19 % du temps : c'est
+  donc bien une tâche de mémoire, et elle est résoluble.
+* **codeexec est en partie insoluble** — le nom de la fonction n'est dans
+  l'énoncé que **114/200 fois (57 %)**. Le gold s'appelle
+  `is_balanced_brackets` là où l'énoncé dit seulement « determine if the
+  brackets are balanced », et `pass_frac` exécute `assert
+  is_balanced_brackets(...)`. 43 % des problèmes sont donc notés sur un token
+  indevinable.
+
+D'où l'hypothèse « c'est la métrique qui teste le NOM au lieu du COMPORTEMENT »
+(cadrage user : description↔output, pas lookup d'identifiant). Testée en
+renommant la fonction produite vers celle qu'appellent les tests, avec un null
+explicite — le code produit pour un AUTRE problème, renommé pareil :
+
+```
+exec — 22 tours gradés (pass_frac moyen)
+  gold (contrôle de sanité)                  : 1.000
+  exact    (le grade actuel)                 : 0.000
+  RENOMMÉ  (description -> comportement)     : 0.080
+  mélangé  (null : code d'un autre problème) : 0.062
+  ablaté   (sans banque, renommé)            : 0.000
+```
+
+**0,080 contre un null à 0,062 sur n=22 : du bruit.** Renommer ne rachète rien —
+ce n'est pas du code juste mal nommé, c'est du code générique plausible. (Une
+lecture qualitative des sorties donnait « ~4 succès sémantiques sur 18 » ; le
+sandbox la dément. Ne pas noter à l'œil.)
+
+### Le résultat le plus dur : la lecture ne sélectionne pas
+
+```
+tools — 19 tours gradés
+  nom exact (== gold)                       : 2/19
+  nom parmi les outils DÉCLARÉS en session  : 2/19
+  aucun appel parsable                      : 3/19
+  outils déclarés par session (médiane)     : 5
+```
+
+**Les deux premières lignes sont ÉGALES.** Chaque fois que le modèle se trompe
+d'outil, il émet un nom qui n'est pas non plus parmi les 5 déclarés. Il ne
+choisit pas mal dans un menu : il ne lit pas le menu.
+
+Et ce n'est pas « pas de requête pour keyer » (le préfixe ne fait que 4 tokens) :
+l'éval `defer` prédit depuis la banque seule avec **encore moins** de contexte
+(`_fill(blank_id)`) et donne GAP **+2,48** codeparrot / **+1,51** fineweb à step
+800, **plat en profondeur** (d2 +3,25 / d8 +3,03). L'asymétrie est nette :
+
+| tâche, banque seule | résultat |
+|---|---|
+| continuer le gist de ce qui vient d'être écrit | GAP +2,5 à +3,9 |
+| **sélectionner un élément discret déclaré en banque** | 2/19 |
+
+La cascade n'y change rien : sur 20 tours redécodés avec `layer_banks`, elle
+modifie l'identifiant 2 fois, les deux fois vers un autre nom faux, 0 succès
+ajouté. (Réserve : dans une conv de 9 segs la cascade ne pousse que 0-1 page —
+probant sur « pas de rattrapage intra-session », pas sur une vie RL longue.)
+
+### Verdict
+
+C'est **le mur de l'arc persona en troisième occurrence** — 07-24 : « grade 0 =
+lookup fermé, jumeau seuil 47M ». Le pivot data SOTA devait l'ouvrir en
+remplaçant les gabarits par du réel. Il ne l'a pas ouvert. Les deux explications
+faciles sont mortes : ni le point de départ, ni le caractère synthétique des
+données. Ce qui reste est le mécanisme de sélection lui-même.
+
+Corollaire RL, chiffré : `grade_call` est une porte DURE sur le nom
+(`if pred["name"] != gold["name"]: return 0.0`) et `think_economy` est
+multiplicatif (`success * eff`). Avec 2/19, l'env tools (0,30 du mix) rend 0
+pour tous les rollouts d'un groupe ⇒ `pstdev = 0 < min_reward_std` ⇒ groupe
+rejeté après 5 resamples. Exec (0,25) est à 0,08 contre un null à 0,06.
+**55 % du mix RL n'a pas de signal exploitable.** Les 45 % restants (`code`,
+`sota`, `reward_fn = None`) ont la récompense dense `-ce - λ·writes` et
+tourneraient sainement.
+
+### Coût à surveiller
+
+`p_chat: 1.0` ⇒ zéro chunk de code à l'entraînement : `ic_ppl` codeparrot
+17,3 → 33,6, fineweb 126 → 306. Le mécanisme survit (GAP plat en profondeur),
+l'hôte pré-entraîné se fait manger à ~2×.
+
+### Reproduire
+
+```bash
+# run
+TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+  deepseek_v4_mini/configs/sft_sota_350m_tools_exec_tiled.yaml
+# ckpt: /mnt/tb/checkpoints/v350_sft_sota_fromsif_exec_tiled/final.pt (step 800)
+# sondes décodage (scratchpad, rejouables sur tout ckpt) :
+#   decode_dump.py        identifiant attendu vs produit, par âge
+#   decode_cascade.py     idem + layer_banks (LIFE=1 pour porter la vie)
+#   rename_then_test.py   exact / renommé / null mélangé / ablaté + outils déclarés
+```
+
+---
+
+## 2026-07-25 — le step SFT était à 250× du compute-bound : 6,5× récupérés (Sinkhorn 2×2 en forme close, grad_checkpoint, chat batché) + deux mécanismes exhumés
+
+**Le constat de départ.** Le run `sft_sota_350m_tools_exec_near` tournait à
+**108 s/step** pour ~40 segments, soit ~2,7 s par segment. Or 386M params sur
+~150 tokens, fwd+bwd, c'est ~0,5 TFLOP — **~10 ms de 3090**. Le step était donc
+à ~250× du régime compute-bound, et le log le confirmait : `data 0.04 s` (pas
+host-bound, contrairement au pod — découverte n°2 du 2026-07-17) et
+`mem 5-7/24 G` (pas VRAM-bound). Diagnostic : la variable qui compte est le
+**nombre d'ops aten émises**, mesuré au `TorchDispatchMode` sur CPU (le compte
+d'ops ne dépend pas des largeurs, donc un jouet donne le chiffre du 386M) :
+**44 823 ops par segment**, ×40 segs ≈ 1,8 M ops/step ⇒ ~60 µs par op.
+
+**Levier 1 — le Sinkhorn 2×2 a une forme close.** `mhc._sinkhorn` déroulait 20
+itérations de (sum, div, sum, div) sur `[B*T, 2, 2]`, 24 fois par forward (2 mHC
+× 12 couches) : **26 % des ops du forward**. À `n_hc = 2` le point fixe de
+Sinkhorn s'écrit exactement — en 2×2 une matrice doublement stochastique vaut
+`[[p,1−p],[1−p,p]]`, le produit croisé élimine les facteurs de lignes/colonnes
+et donne `p = sigmoid((l₀₀+l₁₁−l₀₁−l₁₀)/2)`. Vérifié : la boucle converge bien
+vers cette forme (2,5e-2 à 20 itérations, 2,4e-3 à 200, 8,4e-5 à 5000).
+Ops : forward 11 462 → 8 894, backward 21 899 → 14 603, segment 44 823 → 32 320
+(−28 %). **Et ce n'est pas qu'une optimisation** : la boucle du dépôt finit sur
+une normalisation en COLONNE alors que l'éq. 8 de DeepSeek-V4 est
+`M⁽ᵗ⁾ = T_r(T_c(M⁽ᵗ⁻¹⁾))` — lignes en dernier. Comme `B_l` multiplie l'état
+résiduel à GAUCHE, c'est la stochasticité par ligne qui fait de chaque flux de
+sortie une combinaison convexe des flux d'entrée, et le dépôt ne l'obtenait qu'à
+2,5e-2 près. La forme close est exacte dans les deux sens, rend `‖B‖₂ ≤ 1`
+**inconditionnel** (la boucle perd la borne à logits extrêmes) et supprime
+l'`exp` — celle-là même qui avait imposé la soustraction du max contre les NaN.
+Opt-in : `model.sinkhorn_closed_form` (défaut OFF, non-régression). Les 117
+occurrences de `n_hc` du dépôt valent 2, donc ce chemin est LE chemin.
+*Pour le write-up : « à taux d'expansion 2, la projection de Birkhoff est en
+forme close » — DeepSeek dépense des kernels fusionnés et de la recomputation
+sélective pour contenir mHC à 6,7 % d'un étage 1F1B ; à n_hc=2 il n'y a rien à
+fuser.*
+
+**Levier 2 — `grad_checkpoint` achetait une marge inutilisée.** Le flag était
+justifié dans les configs par « pod : B6 sans GC = OOM step 1 » — mesure à B=6
+sur 80 GB, pas à B=1 sur 24. Il coûte un forward entier (44 823 → 33 361 ops).
+
+**Levier 3 — batcher les convs du `grad_accum`.** Mesuré : le compte d'ops est
+**indépendant du batch** (11 462 à B=1 contre 11 486 à B=4, +0,2 %). Faire
+tourner G convs en séquence paie donc G fois le dispatch. Le chemin batché
+existait pour le stream fichiers mais l'évitait par construction (chunks pleins,
+zéro padding) ; les convs chat sont ragged deux fois (longueur de tour ET nombre
+de tours). D'où `chat_batch.py` : B lanes en lockstep par index de tour, refill
+par lane (jamais de ligne toute-pad), right-padding + `pad_mask`. Le lockstep
+n'est pas un détail — `CascadeMemory` a un branchement de débordement UNIQUE
+pour tout le batch, et « une écriture par lane par slot » le satisfait par
+construction, là où le chemin fichiers exige `pack_convs`.
+
+**Ce que coûte le padding intra-slot, et pourquoi on le garde.** Mesuré sur le
+stream exact de la config prod (384 slots = 12 steps, 1536 lignes) : tokens réels
+= **55,0 %** du budget `B × L_max`, supervisés = 22,2 % du budget (40,4 % du
+réel) ; **44,9 %** des lignes sont remplies à moins de 50 %, **24,1 %** à moins
+de 25 % ; `L_max` par slot médian 178 mais **jusqu'à 1017** (un tour long impose
+sa longueur aux 4 lanes) ; charge équilibrée entre lanes (1,17× d'écart sur 384
+slots). Donc 45 % du budget de tokens est du pad — et ça ne coûte presque **rien
+en temps** dans ce régime, puisque le compte d'ops ne dépend pas de la largeur
+(11 462 à B=1 contre 11 486 à B=4). Le pad se paie en FLOPs, dont le GPU a de
+reste (31 % d'utilisation). Il se paie en revanche en **VRAM** : le pic de 16,9 G
+est fixé par le pire slot, pas par la moyenne. **Le remède n'est PAS le packing
+en largeur** (fusionner des tours dans une ligne) : une écriture par seg ⇒ un
+gist pour N tours, et surtout le contenu à rappeler revient dans le contexte, donc
+l'attention ordinaire suffit et on retombe sur le raccourci one-forward — la
+distance write→réponse *est* l'expérience. À ne pas confondre avec `pack_convs`,
+qui remplit la PROFONDEUR (chaîne de docs, chaque chunk restant une écriture),
+dont l'analogue chat est déjà en service (`convs_per_session` /
+`eps_per_session` / `probs_per_session` + `slots` fixe). Remèdes neutres pour le
+mécanisme, si le régime devient compute-bound : assigner les lanes par profil de
+longueur, ou écrêter les extrêmes (`max_schema_tok` 256, `max_problem_tok` 256 +
+`max_code_tok` 224).
+
+**Chiffrage (3090, même seed, mêmes données — `chunks/step` identique
+step-à-step entre bras, donc comparaison exacte ; s/step cumulatif à step 6) :**
+
+| config | s/step | chunks | s/chunk | pic VRAM |
+|---|---|---|---|---|
+| near (boucle + GC) | 88,47 | 44 | 2,011 | 9,1 G |
+| + forme close | 69,13 | 44 | 1,571 | 9,0 G |
+| + GC off (batch 1) | 42,85 | 44 | 0,974 | 20,6 G |
+| + chat_batch 4 lanes × **3** tours | 15,14 | 36 | 0,421 | 14,7 G |
+| chat_batch 4 lanes × 16 tours | 22,66 | 64 | 0,354 | 15,0 G |
+| **chat_batch 4 lanes × 32 tours** | **47,20** | 128 | **0,369** | 16,9 G |
+
+**5,5× par chunk**, et c'est la DERNIÈRE ligne qui compte, pas la quatrième.
+`slots` **est** la fenêtre TBPTT : la banque est détachée à chaque pull (`the
+carried bank is data, not gradient path`), donc un write ne reçoit de gradient
+que des réponses du MÊME pull. En batch 1 un pull = une session, la fenêtre est
+donc *alignée* sur la session et 100 % des couples write→réponse sont couverts.
+Mesuré sur ce mix : sessions 9 tours en médiane (p90 15, max 32), âge
+write→réponse sota médian 6 (p90 12, max 22). Un couple d'âge *a* survit avec
+probabilité **exactement max(0, 1−*a*/*s*)** (offset uniforme dans la fenêtre).
+Survie moyenne sur la distribution d'âges réelle (1416 couples, pondérés par
+sous-stream) :
+
+| slots | survie moyenne | âge 6 | âge 12 | âge 22 | hors portée |
+|---|---|---|---|---|---|
+| 3 | 25,4 % | 0 % | 0 % | 0 % | — |
+| 8 | 55,7 % | 25 % | 0 % | 0 % | — |
+| 16 | 75,7 % | 62 % | 25 % | 0 % | 1,2 % |
+| 24 | 83,8 % | 75 % | 50 % | 8 % | 0,2 % |
+| **32** | **87,8 %** | 81 % | 62 % | 31 % | **0,0 %** |
+
+`slots = 3` ⇒ **0 % des sessions tiennent** : les requotes, c'est-à-dire le signal
+central du programme, perdaient tout leur chemin de gradient. Référence batch=1 :
+100 % partout, puisque la fenêtre y est la session.
+
+Et **le coût par chunk est PLAT en slots** (0,421 à 3 tours, 0,354 à 16, 0,369 à
+32), la VRAM presque plate aussi (14,7 / 15,0 / 16,9 G) : allonger la fenêtre est
+quasi gratuit par unité de travail. slots=3 avait été choisi pour borner le
+graphe sans regarder ce que ça faisait à l'assignation de crédit — mauvais sur
+tous les axes, y compris la vitesse. Ce que `slots` change vraiment, c'est la
+TAILLE du step (`chunks/step = batch × slots × grad_accum`, `grad_accum ≥ 1`) :
+à schedule constant la couverture se paie en **temps de mur**, pas en mémoire.
+Structure réelle : **la vitesse va en 1/batch, la VRAM suit surtout batch, la
+couverture suit slots, et le mur suit batch × slots.**
+
+Loss identique entre bras GC on/off (ce/lane 3,046, chat 3,140, dist 0,285 aux
+trois décimales) ; entre boucle et forme close, écart ≤1e-3 sur 6 steps. Config
+prod : `sft_sota_350m_tools_exec_fast.yaml` — **4 lanes × 32 tours, 128 chunks/step,
+47,2 s/step, 800 steps ≈ 10 h 30** contre ~20 h pour `near` (décision user
+2026-07-25 : payer le mur pour la couverture plutôt que 5 h à 75,7 %). Réserve
+assumée : ~3× les tokens/step de `near` alors que le schedule est en STEPS — la
+recette rearm validée est en steps et on ne la redescend pas (400 × 128 donnerait
+le même budget de tokens en 5 h, mais avec la moitié des updates pour un batch
+effectif double : écart à la recette, pas réglage).
+
+Le run lancé sur cette config repart de la **base phase 1 SIF**
+(`v350_sif_repass/final_step2500.pt`) et non du rearm persona `step_550` —
+décision user du 2026-07-25 : les runs `tools_exec` (500 steps) et `near` (300)
+partent tous deux du canal read transféré du persona, dont le 07-24 avait
+constaté qu'il ne s'approfondit pas sur data réelle (Δnll plat +0,05). Schedule
+et mix identiques, seule l'init change (les deux ckpts ont un `cfg` strictement
+identique) : c'est le bras « base propre ». Deux réglages ajoutés au lancement,
+même décision : **`wsd_decay_start` 600** (300 steps de croisière à LR plein
+APRÈS la fin de l'anneal teacher, là où la recette rearm entamait le decay pile
+à la sortie de la rampe) et **`decode_cache: true`** (cache KV aux décodages
+d'éval, ×1,6 mesuré sur un poste qui pesait 21-25 % du mur ; hors gradient).
+Écarté au passage, le prélude à deux
+étages du 07-24 (`sft_sota_fromsif_reg.yaml`, 150 steps teacher-off pour payer le
+registre ChatML avant d'ouvrir la fenêtre β) — ce run paie donc le registre SOUS
+teacher, β=1 dès le step 1, sur une base qui n'a jamais vu de ChatML. Point de
+surveillance désigné : `chat` qui stagnerait au-delà de ~step 100.
+
+Note VRAM : `grad_checkpoint` reste **ON**. Le couper n'a été mesuré sûr qu'à
+batch 1 (20,6 G, et le pic y suivait la longueur de la conv — jusqu'à 66 chunks
+pour 3 G de marge) ; à 4 lanes × 32 tours le graphe fait 128 seg-équivalents et le
+couper ferait OOM. Ce que le batching apporte côté mémoire, c'est le
+DÉTERMINISME : `chunks/step` est fixe (128,0 à chaque step), le pic avec (16,9 G).
+
+**Le goulot est CONFIRMÉ à l'exécution, et il désigne `compile`.** Mesuré sur le
+run en cours (350M, 4 lanes × 32 tours) : le processus est à **100,5 % de CPU sur
+un seul thread runnable** (87 threads, un seul actif) alors que le 5900X boost à
+4,5 GHz — le plafond est l'émission d'ops mono-thread, pas la fréquence. En face,
+le GPU est à **31 % d'utilisation, 88 W sur 370, et redescend en P3 (~1100 MHz
+sur 2115)** avec une raison explicite : `Clocks Event Reasons → Idle : Active`,
+tous les `HW/SW Slowdown` et `SW Power Cap` à *Not Active*. Ce n'est donc ni
+thermique ni une limite de puissance : les trous entre kernels suffisent à faire
+redescendre le gouverneur, et les kernels qui tournent le paient. Oscillation
+P3↔P2 observée en direct (1095 → 1965 MHz, 88 → 168 W). **Verrouiller les
+horloges est impossible depuis WSL** (`nvidia-smi -lgc` → « The current user does
+not have permission to change clocks » ; ça se ferait côté Windows en admin).
+Conséquence pour la suite : `compile` avait été rangé au rayon VRAM et laissé non
+chiffré — c'est en fait le seul levier restant qui attaque le goulot réel (le
+NOMBRE de dispatches). Réserve connue : `compile_model` impose `dynamic=False`,
+qui risque de thrasher le cache dynamo sur les longueurs de tour variables ⇒
+chiffrer sur 20 steps, et ne bucketiser les longueurs que si le compteur de
+recompilations est bien la cause. **Décision user 2026-07-25 : intéressant, mais
+plus tard** — pas pendant ce run.
+
+Écart non attribué, pour honnêteté : le même régime mesuré à 47,20 s/step la
+veille tourne à **53,03** au step 6 de ce run, à forme identique (128,0
+chunks/step, 16,9 G de pic). Le CPU était déjà saturé dans les deux cas ; la
+résidence P2/P3 est le seul candidat, mais elle n'a pas été mesurée la veille,
+donc ce n'est pas démontré.
+
+**L'éval pesait 26 % du mur, et 89 % de l'éval tenait dans un décodage.**
+Un palier coûtait 1100 à 2100 s sur `near` (6 paliers = 2 h 27 pour 7 h de
+train) et aurait fait 35 % du mur de la config pavée. Décomposition mesurée
+2026-07-25 sur la 3090, ckpt `step_50` du run `_fast`, un palier chronométré
+bloc par bloc :
+
+| bloc | temps | forwards | ms/forward |
+|---|---|---|---|
+| `evaluate` × 2 sources | 49 s | 172 | ~290 |
+| `evaluate_by_depth` × 2 sources | 69 s | 224 | ~305 |
+| `evaluate_math` (le chat) | **958 s** | **4401** | 218 |
+| palier | 1076 s | 4797 | |
+
+4242 des 4401 forwards de `evaluate_math` sont des pas de décodage greedy :
+des forwards d'**un seul token payés 218 ms**. C'est le même mur que le train
+(launch-bound), en pire — 54 décodages strictement séquentiels, aucun batch
+pour amortir. Rien à voir avec la taille des tenseurs : 5 tokens/forward.
+
+Deux corrections, aucune n'est une approximation.
+
+1. **Le bras ablaté est une constante, il était recalculé 27 fois.** Le
+   décodage ablaté part d'un préfixe constant (`a_open`) avec `init_mem=None`,
+   en greedy, à poids gelés : il rend la même phrase à chaque tour gradé du
+   palier. Vérifié — 8 redécodages, **une seule sortie distincte** (ici un
+   appel d'outil `get_user_details`, 30 tokens). C'est d'ailleurs ce qu'il est
+   conceptuellement : « ce que le modèle répond sans aucune mémoire » est UNE
+   réponse, pas une par question. Décodé une fois : palier chat **958 → 611 s**
+   (−36 %, 4401 → 3150 forwards). Effet de bord bienvenu : le bras ablaté ne
+   jitte plus d'un tour à l'autre sous les ULP du top-k MoE.
+2. **`chat.decode_every` (opt-in, défaut 1 = historique).** Le décodage ne sert
+   qu'au grade exact-match, aveugle tant que le canal n'est pas ouvert (grade
+   0.00 sur les trois kinds gradés à step 50) ; la sonde Δnll, elle, est
+   sensible tout de suite et coûte **un** forward par tour gradé. On paie donc
+   le grade un palier sur N et la sonde à tous. Palier chat sans décodage :
+   **46 s, 159 forwards**.
+
+| palier | avant | après |
+|---|---|---|
+| avec décodage | 1076 s | 729 s |
+| sans décodage | — | 164 s |
+| 16 paliers (4 avec, 12 sans) | 4 h 47 | **1 h 21** |
+
+Levier identifié et non dépensé : dans `evaluate`, le bras `res` est lui aussi
+une constante — `_fill(x, blank_id, dl)` ne dépend pas du contenu de `x`, et
+`init_mem=None` — soit ~20 % des 118 s du bloc code, ~6 min sur le run. Pas
+fait : le mur est ailleurs. Le vrai plafond restant, ce sont les 218 ms de
+latence de lancement par forward ; le décodage cache-KV a une forme FIXE (1, 1),
+c'est donc l'endroit du dépôt où un graphe CUDA / `compile(reduce-overhead)`
+paierait le plus.
+
+**Piège d'instrumentation, à ne pas refaire.** Deux bras lancés en parallèle sur
+cette machine (15 Go de RAM hôte, ~11 par trainer) ⇒ swap. Signature : le s/step
+cumulatif qui **MONTE** (55 → 68 → 93). Ce n'est PAS de la contention GPU (il
+était à 15 Go sur 24), et ça invalide les deux bras, pas seulement le nouveau.
+
+**Mécanisme exhumé en chemin — le top-k de l'indexeur Lightning tranche des
+ex æquo EXACTS.** En vérifiant que le right-padding ne corrompt pas les
+positions réelles, on trouve un écart de 1,7e-1 en float64. Ce n'est PAS une
+fuite causale : le masque de bloc (`j < t//m`, le bloc de la requête exclu) est
+strict, vérifié en perturbant un token à la fois — aucune position antérieure ne
+bouge jamais. La cause est ailleurs : le `F.relu` de l'indexeur produit des
+scores **exactement égaux** (souvent 0), et quand le nombre de blocs valides
+dépasse `top_k_csa`, `topk` départage par disposition mémoire. Mesuré pour la
+requête t=38 : scores identiques à **1,04e-17** entre les deux longueurs, marge
+entre le 8ᵉ et le 9ᵉ score **exactement nulle**, sélection {0,1,2,3,4,6,7,8}
+contre {0,1,2,4,5,6,7,8} ⇒ ~3e-2 sur l'état caché. C'est la famille documentée
+dans `dsv6-topk-dur-amplifie-les-ulp` et dans `runtime.save_topk` : le batching
+padé n'est donc pas bit-identique à B=1, exactement comme `decode_cache` ou
+`compile`. La position touchée est celle dont la cible est un pad — `loss_mask`
+l'exclut déjà de la CE. **Piste non prise** : départager les ex æquo par
+récence (le défaut de conception du programme, cf.
+`dsv6-grpo-recence-feature`) rendrait la sélection déterministe ET
+batch-invariante. C'est un changement de comportement du modèle, donc à
+instruire séparément.
+
+**Piège de mesure, pour mémoire.** La diagnostique `ce/lane` (CE normalisée dans
+chaque lane, seule quantité comparable à un run B=1 puisque la loss normalise
+globalement sur le batch) donnait 1,885 au lieu de ~3,05 : les lanes NON
+supervisées (tours utilisateur, masque tout-zéro) versaient un 0 dans la
+moyenne. En B=1 ces segments sont simplement absents de la moyenne. Corrigé, et
+épinglé par une assertion dédiée dans le self-test.
+
+Repro :
+```bash
+bash scripts/selftest.sh mhc chat_batch code_defer_native
+python scripts/resume_check.py --cpu          # resume reste bit-identique
+TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+  deepseek_v4_mini/configs/sft_sota_350m_tools_exec_fast.yaml
+```
+
+`compile` **non chiffré** : sa raison d'être ici était la marge VRAM (−29 % au
+pod), que le batching fournit autrement ; et `dynamic=False` thrasherait sur des
+longueurs de slot variables. À reprendre seulement avec bucketisation des
+longueurs, si jamais le besoin revient.
+
+---
+
 ## 2026-07-23 — fastpath phase 1 : 4 flags budget-compute (prefetch, chunk_budget, allreduce_bf16, compile_cache_dir) — smokes 97M VERTS, gains à chiffrer au prochain bring-up
 
 Suite directe des découvertes n°1-3 du pod 10B (2026-07-17) : le host-bound
