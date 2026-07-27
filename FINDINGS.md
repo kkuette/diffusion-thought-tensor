@@ -37,6 +37,68 @@ test this — before scale.
 
 ---
 
+## 2026-07-27 — census de dispatch du décodage : 12,9k ops aten/token AVEC cache KV — le cache supprime du travail, pas des lancements
+
+**Le constat.** Le décodage token-par-token est launch-bound (07-25 : 218
+ms/token, ~10 ms de GPU utile). Le cache KV (`decode_cache`) a réduit le
+TRAVAIL (plus de re-forward du préfixe) mais à peine les LANCEMENTS : mesuré au
+`TorchDispatchMode` (nouveau `scripts/bench_decode.py`, mode `--toy` = structure
+du `v350_phase1_10b`, largeurs jouets — le compte d'ops ne dépend pas des
+largeurs), **14 294 ops/forward sans cache, 12 865 avec** en régime établi.
+À ~60 µs de latence de lancement par op (mesure du 07-25), les ~12,9k ops
+expliquent la quasi-totalité des ~137 ms/token observées avec cache.
+
+Reproduction :
+```
+TB_ROOT=/mnt/tb python scripts/bench_decode.py \
+    deepseek_v4_mini/configs/v350_phase1_10b.yaml --tokens 24 --report md
+```
+
+**Où vont les ops (avec cache, par forward d'UN token)** — attribution au
+module le plus interne ; nota : `forward_cached` est appelé en méthode directe
+(pas via `__call__`), ses ops s'imputent donc au bucket mHC qui l'enveloppe :
+
+| bucket | n/fwd | dedans |
+|---|---|---|
+| ManifoldHyperConnections | 5 532 | 24× Sinkhorn 20 it. (~2 950, 26 %) + RMSNorm 1536 + 3 Linear + einsums + l'attention cachée (CSA/HCA `forward_cached`) |
+| DualModalBlock | 4 764 | read fast-weight : `fw_A`/`fw_B` recalculés À CHAQUE token (banque constante au décodage !) + boucle séquentielle sur 8 slots (SwiGLU par slot) |
+| Linear | 992 | dont 24/token pour `fw_A`/`fw_B` hoistables |
+| DeepSeekMoE | 828 | double boucle Python 2×4 ⇒ 96 itérations/token, `.any()` + masques booléens = **~190 syncs GPU/token** ; + balance_loss calculée sous no_grad |
+| RMSNorm | 546 | 8 ops maison × >80 appels/token |
+| par op | — | view 1 982, permute 1 932, add 1 363, sum/div 1 015 chacun : de la MICRO-op, pas du calcul |
+
+**Les leviers, chiffrés** (branche `perf/decode-dispatch`, flags OFF par défaut,
+contrat = une config existante reproduit à l'octet, preuve float64 CPU A/B) :
+
+1. `sinkhorn_closed_form: true` — flag EXISTANT (07-25), jamais posé sur les
+   configs 386M : **12 865 → 10 297 ops (−20 %)** mesuré ici. Pas bit-identique
+   (mais plus exact) ⇒ décision de config, pas de code. À poser dans toute
+   config neuve.
+2. `decode_fuse` (nouveau) — RoPE mémoïsé (recalculé 12×/token, constante au
+   bit près), hoisting `fw_A(bank)`/`fw_B(bank)` (à ne recalculer qu'à l'insert
+   d'un write : mémo par identité d'objet + `_version`), balance_loss coupée
+   sous no_grad. Bit-identique.
+3. `decode_dense_moe` (nouveau) — à BT≤16, évaluer les 4 experts DENSÉMENT et
+   pondérer par les poids top-k : ~5 dispatches et 0 sync contre ~1 500 ops et
+   ~190 syncs, pour 2× les FLOPs d'une quantité négligeable. Même ordre de
+   sommation ⇒ bit-identique. Débloque la capture CUDA graphs (shapes fixes).
+4. `decode_static_cache` (nouveau) — AttnCache à capacité fixe, colonnes à
+   −inf (le chemin caché le fait DÉJÀ pour les blocs interdits, exp(−inf)=0
+   exact ⇒ bit-identique). Seule shape non bornée restante : le `K_all` HCA.
+   Prérequis graphs.
+5. CUDA graphs (`decode_graphs.py`, runner hors modèle) — un graph par phase
+   `p % 16`, capture manuelle (PAS `compile(reduce-overhead)` : les graph
+   breaks MoE/sinkhorn partitionneraient en silence), fallback eager bruyant.
+   C'est le levier qui absorbe TOUT le reste du compte d'ops.
+
+**Leviers écartés** (violent le contrat bit-identique — chiffrés pour plus
+tard) : RMSNorm fusionné `torch.rms_norm` (~−600 ops, ULP), sink-softmax en
+colonne concaténée (~7 ops→1 par appel, ULP), `_win_push` en ring buffer
+(ordre de sommation), `bool(done.all())` de generate (1 sync/token, utile
+seulement avec `stop_id`).
+
+---
+
 ## 2026-07-27 — run `valsif_stair` (2000 steps) : la SÉLECTION depuis la banque S'OUVRE — 10/30 noms d'outils contre 0/30 sans banque, codeexec 0.222 contre un null à 0.006 — et le mur du 07-26 tombe
 
 Le run : `sft_sota_350m_valsif_stair` (config du même nom), 2000 steps, 22,6 h
