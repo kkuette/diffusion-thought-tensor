@@ -37,6 +37,61 @@ test this — before scale.
 
 ---
 
+## 2026-07-27 (nuit) — le régime établi des graphs est à 6,5 ms/token (153 tok/s) ; bf16-autocast est une PERTE ; un bug de capture et un bug de mémo corrigés
+
+Job 33 (rig gpu5, 3070 Ti, ckpt `v350_sft_valsif_stair`, B=1, 192 tokens,
+chrono en RÉGIME ÉTABLI — warmup + 16 captures HORS chrono, contrairement au
+23,4 ms/token de job 32 qui les amortissait) :
+
+| bras | ms/token | tok/s |
+|---|---|---|
+| eager cache=on (référence) | 75,4 | 13,3 |
+| graphs fp32, pilotage python (`/step`) | **6,6** | 152,5 |
+| graphs fp32, chaîné in-graph (`/chain`) | **6,5** | 153,4 |
+| graphs + autocast bf16 `/step` | 10,8 | 92,6 |
+| graphs + autocast bf16 `/chain` | 10,7 | 93,1 |
+
+**Lecture.**
+1. **Le vrai chiffre des graphs est 6,5 ms/token (20,8× la baseline cache
+   135,3 ms)** — le 23,4 de job 32 était dominé par l'amortissement du warmup
+   eager (~83 ms × 32) et des captures. On est à l'os : ~6,5 ms ≈ le calcul
+   fp32 pur estimé au census.
+2. **Le chaînage in-graph ne gagne que ~1 %** : le python de la boucle
+   (argmax host, copies) était déjà MASQUÉ par l'asynchronisme CUDA — aucune
+   sync par token dans le pilotage python (argmax reste device). Le chaînage
+   garde sa valeur structurelle : il supprime toute dépendance au host (utile
+   si le pas GPU descend sous le temps python, et pour l'intégration RL).
+3. **bf16 par autocast est une perte nette (10,7 vs 6,5)** : avec
+   `cache_enabled=False` (la seule forme capturable), CHAQUE poids est recasté
+   à CHAQUE replay — les kernels de recast coûtent plus que le gain tensor
+   cores. Le bf16 qui paierait est un CAST COMPLET des poids
+   (`model.bfloat16()`, zéro recast) — marche future, quantization assumée,
+   pas de l'ULP.
+4. **Bug corrigé — la capture ENREGISTRE sans exécuter** (sémantique
+   cudaStreamBeginCapture) : les 16 pas de capture de job 32 n'avaient jamais
+   vraiment tourné (sorties = mémoire jamais écrite, mutations de cache
+   perdues). Invisible au chrono, faux pour tout usage des tokens. Fix :
+   `g.replay()` immédiat après chaque capture.
+5. **Bug corrigé — le mémo `fw_A`/`fw_B` empoisonné par autocast** : rempli en
+   bf16 sous le bras autocast puis SERVI au forward eager fp32 suivant (même
+   banque) ⇒ einsum en erreur dtype (le crash du bras référence de job 33).
+   Garde : hit seulement si `A.dtype == bank.dtype` ; sous autocast le mémo
+   est inerte (dans un graph le recalcul est rejoué à coût de lancement nul).
+   Régression au self-test model.
+
+Le graph est désormais ÉTENDU : `[tête RoPE (index_select sur compteur de
+position device)] → forward → [argmax → buffer d'entrée partagé → journal
+device]` ; `_chain(fed, n)` = n replays purs, zéro aller-retour host, pris par
+`decode()` quand `stop_id is None`. Prouvé sur CPU float64 : chaînage émulé ==
+pilotage python au bit (self-test decode_graphs).
+
+Reproduction (via la queue de la ferme) : job `33_perf_graphs_bf16_chain`,
+arbre `git archive` → `$TB_MNT/perf_decode/thought-bank`,
+`bench_decode.py <cfg> --real --ckpt <pt> --time --device cuda --cuda-graphs
+[--amp bf16] --cache on --flags all --tokens 192 --prefix 65`.
+
+---
+
 ## 2026-07-27 — census de dispatch du décodage : 12,9k ops aten/token AVEC cache KV — le cache supprime du travail, pas des lancements
 
 **Le constat.** Le décodage token-par-token est launch-bound (07-25 : 218
