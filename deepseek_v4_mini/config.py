@@ -46,6 +46,18 @@ class ThoughtBankConfig:
     # coupée sous no_grad — de la télémétrie d'entraînement calculée à chaque
     # token décodé.
     decode_fuse: bool = False
+    # decode_dense_moe : à BT == 1 (décodage caché non batché) et sous no_grad,
+    # évalue les n_experts DENSÉMENT et pondère par les poids top-k, au lieu de
+    # la double boucle Python (top_k × n_experts = 96 itérations/token à 12
+    # couches, chacune avec un .any() et un masquage booléen ⇒ ~190 syncs GPU
+    # par token). ~5 dispatches et 0 sync contre ~1 500 ops, pour 2× les FLOPs
+    # d'une quantité négligeable. BT == 1 STRICT : à BT ≥ 2 la boucle évalue
+    # chaque expert sur un sous-ensemble des lignes et un GEMM M=1 vs M=2 ne
+    # rend pas les mêmes bits (mesuré : rel ~1.2e-16 même en float64 CPU) — à
+    # BT=1 le sous-ensemble élu EST le batch, mêmes bits garantis (torch.equal,
+    # self-test moe). Le décodage BATCHÉ (rollouts RL) garde la boucle.
+    # Prérequis de la capture CUDA graphs (shapes fixes, plus de data-dependent).
+    decode_dense_moe: bool = False
 
     # ── Attention (§2.3) ──────────────────────────────────────────────────────
     csa_m: int = 4             # CSA: compress every m tokens (overlapping)

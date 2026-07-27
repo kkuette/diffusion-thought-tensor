@@ -268,6 +268,7 @@ class DualModalBlock(nn.Module):
         moe = DeepSeekMoE(
             d_model=d, n_experts=cfg.n_experts, n_shared=cfg.n_shared,
             top_k_experts=cfg.top_k_experts, d_ff=cfg.d_ff, dropout=cfg.dropout,
+            dense_decode=bool(getattr(cfg, "decode_dense_moe", False)),
         )
 
         self.norm_attn = RMSNorm(d)

@@ -308,18 +308,20 @@ def run_ab(raw, a):
             **mcfg, **{f: True for f in known})).double().eval()
         m_on.load_state_dict(m_off.state_dict())
         g = torch.Generator().manual_seed(a.bank_seed)
-        bank = torch.rand(2, mcfg["max_mem"], _TOY_WIDTHS["mem_dim"],
-                          generator=g).double()
-        for T0 in (1, 2, 5, 11, 17):
-            pr = torch.randint(0, 61, (2, T0), generator=g)
-            for use_cache in (False, True):
-                ta, la = _greedy_logits(m_off, pr, bank, 13, use_cache)
-                tb, lb = _greedy_logits(m_on, pr, bank, 13, use_cache)
-                assert torch.equal(ta, tb) and torch.equal(la, lb), (
-                    f"A/B DIVERGE (neutral={neutral}, T0={T0}, "
-                    f"cache={use_cache})\n  OFF: {ta}\n  ON : {tb}")
+        # B=1 exerce le chemin dense du MoE (gate BT==1) ; B=2 le chemin boucle
+        for Bt in (1, 2):
+            bank = torch.rand(Bt, mcfg["max_mem"], _TOY_WIDTHS["mem_dim"],
+                              generator=g).double()
+            for T0 in (1, 2, 5, 11, 17):
+                pr = torch.randint(0, 61, (Bt, T0), generator=g)
+                for use_cache in (False, True):
+                    ta, la = _greedy_logits(m_off, pr, bank, 13, use_cache)
+                    tb, lb = _greedy_logits(m_on, pr, bank, 13, use_cache)
+                    assert torch.equal(ta, tb) and torch.equal(la, lb), (
+                        f"A/B DIVERGE (neutral={neutral}, B={Bt}, T0={T0}, "
+                        f"cache={use_cache})\n  OFF: {ta}\n  ON : {tb}")
         print(f"top-k {'neutralisés' if neutral else 'DURS'} : OFF == ON "
-              f"(tokens ET logits, 5 préfixes × cache on/off)")
+              f"(tokens ET logits, B∈{{1,2}} × 5 préfixes × cache on/off)")
 
 
 # ── chrono GPU (gardé) ───────────────────────────────────────────────────────

@@ -54,6 +54,7 @@ class DeepSeekMoE(nn.Module):
         top_k_experts: int,
         d_ff: int,
         dropout: float = 0.0,
+        dense_decode: bool = False,
     ) -> None:
         super().__init__()
         assert top_k_experts <= n_experts
@@ -73,6 +74,9 @@ class DeepSeekMoE(nn.Module):
 
         # Gating: score = sqrt(softplus(h W_gate))
         self.W_gate = nn.Linear(d_model, n_experts, bias=False)
+
+        # decode_dense_moe : dispatch dense sans sync à petit BT (décodage).
+        self.dense_decode = dense_decode
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
@@ -105,6 +109,38 @@ class DeepSeekMoE(nn.Module):
         top_w = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-8)
 
         # ── Dispatch & combine ────────────────────────────────────────────────
+        # decode_dense_moe : au décodage (no_grad, BT=1), la double boucle
+        # ci-dessous coûte top_k × n_experts itérations Python dont chaque
+        # .any()/masquage force une sync GPU→CPU, pour router UN token. Évaluer
+        # les n_experts densément et sélectionner par indexation coûte 2× les
+        # FLOPs (négligeables à cette taille) et ZÉRO sync — et rend les shapes
+        # fixes, la condition de capture d'un CUDA graph.
+        #
+        # BT == 1 STRICT, mesuré et pas négociable : à BT ≥ 2 la boucle évalue
+        # chaque expert sur un SOUS-ENSEMBLE des lignes et le dense sur toutes,
+        # et un GEMM à M=1 vs M=2 ne rend pas les mêmes bits (kernels BLAS
+        # différents — écart rel ~1.2e-16 = epsilon float64, mesuré CPU). À
+        # BT=1 le sous-ensemble élu EST le batch entier : mêmes bits garantis.
+        if self.dense_decode and not torch.is_grad_enabled() and flat.size(0) == 1:
+            routed_out = self._dispatch_dense(flat, top_idx, top_w)
+        else:
+            routed_out = self._dispatch_loop(flat, top_idx, top_w)
+
+        # ── Sequence-wise load balance loss ───────────────────────────────────
+        # Penalise deviation from uniform expert usage within the batch
+        if need_balance:
+            usage = F.one_hot(top_idx, self.n_routed).float().sum(dim=1)  # [BT, n_routed]
+            usage_frac    = usage.mean(dim=0)                              # [n_routed]
+            expected_frac = torch.full_like(usage_frac, self.top_k / self.n_routed)
+            balance_loss  = ((usage_frac - expected_frac) ** 2).mean()
+        else:
+            balance_loss = flat.new_zeros(())
+
+        out = (shared_out + routed_out).view(B, T, d)
+        return out, balance_loss
+
+    def _dispatch_loop(self, flat, top_idx, top_w):
+        """Le dispatch historique : par expert, sur les tokens qui l'ont élu."""
         routed_out = torch.zeros_like(flat)
         for ki in range(self.top_k):
             expert_ids = top_idx[:, ki]      # [BT]
@@ -120,19 +156,22 @@ class DeepSeekMoE(nn.Module):
                 torch._dynamo.mark_dynamic(sel, 0)
                 out = expert(sel)
                 routed_out[mask] = routed_out[mask] + weights[mask].unsqueeze(-1) * out
+        return routed_out
 
-        # ── Sequence-wise load balance loss ───────────────────────────────────
-        # Penalise deviation from uniform expert usage within the batch
-        if need_balance:
-            usage = F.one_hot(top_idx, self.n_routed).float().sum(dim=1)  # [BT, n_routed]
-            usage_frac    = usage.mean(dim=0)                              # [n_routed]
-            expected_frac = torch.full_like(usage_frac, self.top_k / self.n_routed)
-            balance_loss  = ((usage_frac - expected_frac) ** 2).mean()
-        else:
-            balance_loss = flat.new_zeros(())
+    def _dispatch_dense(self, flat, top_idx, top_w):
+        """Tous les experts sur tous les tokens, sélection par indexation.
 
-        out = (shared_out + routed_out).view(B, T, d)
-        return out, balance_loss
+        Reproduit EXACTEMENT l'accumulation de la boucle : pour chaque token,
+        0 + w₀·out(e₀) + w₁·out(e₁) dans l'ordre ki — même ordre de sommation,
+        donc mêmes bits (prouvé float64 au self-test). Aucune op data-dependent
+        (pas de .any(), pas de masque booléen) : zéro sync, shapes fixes.
+        """
+        outs = torch.stack([e(flat) for e in self.experts])       # [E, BT, d]
+        ar = torch.arange(flat.size(0), device=flat.device)
+        acc = torch.zeros_like(flat)
+        for ki in range(self.top_k):
+            acc = acc + top_w[:, ki].unsqueeze(-1) * outs[top_idx[:, ki], ar]
+        return acc
 
 
 # ── self-test ────────────────────────────────────────────────────────────────
@@ -213,6 +252,50 @@ def _selftest() -> None:
     assert len(m2.shared) == 3
     assert torch.isfinite(m2(x)[0]).all()
 
+    # ── decode_dense_moe : dense == boucle AU BIT à BT=1, gate strict ───────
+    # (float64 isole « même calcul ? » des ULP BLAS, float32 CPU en témoin.
+    # Pourquoi BT=1 seulement : à BT≥2 la boucle évalue chaque expert sur un
+    # SOUS-ENSEMBLE des lignes — GEMM M=1 vs M=2 ⇒ rel ~1.2e-16 mesuré, même
+    # en float64. Le témoin ci-dessous vérifie que cet écart existe bien :
+    # c'est LUI qui justifie le gate, pas une prudence rituelle.)
+    for dtype in (torch.float64, torch.float32):
+        md = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K,
+                         d_ff=FF, dense_decode=True).to(dtype)
+        for _ in range(5):                            # 5 tirages de token
+            xd = torch.randn(1, 1, D, dtype=dtype)
+            with torch.no_grad():
+                o_dense, _ = md(xd)
+                md.dense_decode = False
+                o_loop, _ = md(xd)
+                md.dense_decode = True
+            assert torch.equal(o_dense, o_loop), f"dense ≠ boucle (dtype={dtype})"
+    # témoin du gate : à BT=2 l'écart sous-ensemble/batch EXISTE (ULP, pas 0)
+    e0 = md.experts[0].double()
+    x2 = torch.randn(2, D, dtype=torch.float64)
+    with torch.no_grad():
+        sub_vs_batch = (e0(x2)[1:2] - e0(x2[1:2])).abs().max().item()
+    assert sub_vs_batch < 1e-14, "ce n'est plus de l'ULP — bug réel quelque part"
+    # la boucle reste le chemin sous gradient, à BT>1, et flag OFF
+    md64 = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K,
+                       d_ff=FF, dense_decode=True)
+    hits = {"n": 0}
+    _orig_dense = md64._dispatch_dense
+    md64._dispatch_dense = lambda *a: (hits.__setitem__("n", hits["n"] + 1),
+                                       _orig_dense(*a))[1]
+    xg = torch.randn(1, 1, D, requires_grad=True)
+    o, bl = md64(xg)                                  # grad ON ⇒ boucle
+    (o.sum() + bl).backward()
+    assert hits["n"] == 0 and xg.grad is not None
+    with torch.no_grad():
+        md64(torch.randn(1, 2, D))                    # BT>1 ⇒ boucle
+    assert hits["n"] == 0
+    with torch.no_grad():
+        md64(torch.randn(1, 1, D))                    # no_grad + BT=1 ⇒ dense
+    assert hits["n"] == 1
+    m_off_flag = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1,
+                             top_k_experts=K, d_ff=FF)
+    assert not m_off_flag.dense_decode
+
     # ── need_balance=False : SORTIE au bit près, balance rendue à zéro ──────
     x64 = torch.randn(B, T, D, dtype=torch.float64)
     m64 = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1, top_k_experts=K,
@@ -227,7 +310,9 @@ def _selftest() -> None:
     print("moe self-test: OK (formes, loss d'équilibrage nulle si uniforme et "
           "positive si concentrée, top_k + poids normalisés, garde-fou NaN "
           "sqrt(softplus) en fp32 ET bf16, partagés toujours actifs, clamps "
-          "SwiGLU, need_balance=False : sortie au bit près + balance à 0)")
+          "SwiGLU, dense_decode == boucle AU BIT à BT=1 (f64+f32) + témoin ULP "
+          "qui justifie le gate, gated no_grad/BT=1/flag, need_balance=False : "
+          "sortie au bit près + balance à 0)")
 
 
 if __name__ == "__main__":
