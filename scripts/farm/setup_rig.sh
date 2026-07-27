@@ -68,8 +68,12 @@ WantedBy=multi-user.target
 EOF
 
 echo "== Workers (un par GPU, démarrés au boot) =="
-install -m 755 "$(dirname "$0")/gpu_worker.sh" /usr/local/bin/gpu_worker.sh 2>/dev/null || \
-  install -m 755 /opt/thought-bank/scripts/farm/gpu_worker.sh /usr/local/bin/gpu_worker.sh
+# Le service exécute le script DU REPO — pas de copie /usr/local/bin. Une copie
+# déployée diverge en silence : deux morsures (farm_dashboard patché sur la VM
+# sans commit ; gpu_worker figé au 07-11 SANS l'export TB_ROOT ⇒ les workers RL
+# du 07-27 ont tout résolu en chemins relatifs — caches ratés, hub raté,
+# re-tokenisation sans token HF). Le repo du rig est épinglé et mis à jour à la
+# main entre campagnes : c'est déjà le mécanisme de versionnage voulu.
 cat > /etc/systemd/system/tb-worker@.service <<'EOF'
 [Unit]
 Description=thought-bank GPU worker %i
@@ -83,7 +87,7 @@ Environment=GPU_ID=%i
 Environment=TB_MNT=/mnt/tb
 Environment=TB_REPO=/opt/thought-bank
 Environment=TB_VENV=/opt/tb-venv
-ExecStart=/usr/local/bin/gpu_worker.sh
+ExecStart=/opt/thought-bank/scripts/farm/gpu_worker.sh
 Restart=always
 RestartSec=30
 User=root
