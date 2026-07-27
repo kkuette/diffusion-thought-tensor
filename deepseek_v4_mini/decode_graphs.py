@@ -173,16 +173,23 @@ class GraphDecodeRunner:
             pool = getattr(self, "_pool", None)
             with torch.cuda.graph(g, pool=pool):
                 out = self._eager(in_buf)
-            self._pool = g.pool() if pool is None else pool
+            torch.cuda.synchronize()    # faire surfacer ICI toute erreur de
+            self._pool = g.pool() if pool is None else pool   # capture différée
             self.graphs[phase] = (g, in_buf, out)
             return out
         except Exception as e:                      # noqa: BLE001 — piège WSL2
-            warnings.warn(f"capture CUDA graph échouée (phase {phase}) : {e} — "
-                          f"fallback eager DÉFINITIF, le gain graphs est perdu",
-                          stacklevel=2)
+            import traceback
+            warnings.warn(f"capture CUDA graph échouée (phase {phase}, "
+                          f"pos {self.pos}) : {e} — fallback eager DÉFINITIF, "
+                          f"le gain graphs est perdu\n"
+                          f"{traceback.format_exc()}", stacklevel=2)
             self.eager_only = True
             self.graphs.clear()
             attention._ROPE_OVERRIDE = None
+            try:                        # l'état CUDA peut être poisseux après
+                torch.cuda.synchronize()  # un échec de capture : purger avant
+            except Exception:             # de continuer en eager
+                pass
             return self._eager(fed)
         finally:
             if self.eager_only:
