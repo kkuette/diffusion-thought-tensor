@@ -37,6 +37,63 @@ test this — before scale.
 
 ---
 
+## 2026-07-28 (soir) — REBIND prouvé au bit sur GPU (jobs 35-36) : 3,3 ms/rebind vs ~6 s d'armement frais ; intégration rl_disagg opt-in livrée ; 4e et 5e bugs fermés
+
+Le rebind (`runner.rebind(bank, layer_banks)` — commits 50b856b..4b94c69)
+recopie l'état d'un NOUVEAU décodage DANS les objets que les graphs
+connaissent, sans réallocation : `AttnCache.reset()` (comp/dead/idx/sbufs
+préservés, `_cache_store_comp` réutilise `comp` en place au nouveau
+préfixe), `model._fw_refresh` (A/Bm recalculés et `copy_` dans les tenseurs
+mémoïsés — un miss normal aurait alloué de NOUVEAUX tenseurs, poison), la
+banque vit dans un buffer POSSÉDÉ par le runner, gate MoE restauré à 1.
+
+**4e bug, fermé par analyse — hist_len baké.** En mode full la lecture est
+`hist[:, :hist_len]` : un int PYTHON, baké comme taille de slice à la
+capture, et qui OSCILLE avec la position (m après fermeture, 2m−1 avant).
+Garde de RÉGIME ÉTABLI (`_enter_ready` : `hist_len == m + pos % m` sur
+toutes les couches — la seule condition qui rende la largeur périodique en
+position, donc rejouable) avant TOUTE bascule, armement et ré-armement ; un
+préfixe court post-rebind (a_open ≈ 4 tokens, hca_m=16 ⇒ 11 singles eager)
+reste eager jusqu'à convergence. Fermait aussi le cas latent d'un premier
+armement avant régime établi.
+
+**5e bug, attrapé par le job 35 — _ROPE_OVERRIDE jamais rendu.** `_capture`
+posait l'override RoPE et ne le rendait qu'en cas d'échec : tout forward
+EAGER ultérieur du process lisait la RoPE de la DERNIÈRE position — les
+singles post-rebind d'un préfixe court divergeaient au 1er token. Signature
+parlante : préfixe long OK (zéro single), préfixe court FAUX, et chain vs
+step stop divergeaient ENTRE EUX (staleness différentes). L'override ne
+sert qu'à l'ENREGISTREMENT ⇒ `finally` inconditionnel + ceinture dans
+`rebind()` + verrou au self-test. GPU-only par nature : l'émulation CPU
+pose/rend l'override explicitement — d'où la re-preuve job 36.
+
+**Job 36 (rig gpu5, ckpt valsif_stair, fp32, 96 tokens/bras)** :
+
+| bras | B=1 | B=8 |
+|---|---|---|
+| rebind verify (préfixe court + long + stop) | **TOUT OK (au bit)** | **TOUT OK (au bit)** |
+| armement frais (warmup 32 + 16 captures + 64 tok) | 5,3 s | 6,2 s |
+| rebind seul | 3,3 ms | 3,3 ms |
+| appel complet rebind + decode 96 tok (préfixe court) | 1,42 s | 1,92 s |
+
+Lecture rollout : **400 tok/s agrégés par appel à B=8 (4,9× l'eager worker
+à 82 tok/s)** — pas les 10,8× du régime établi pur : ~1,1 s de l'appel part
+dans les 11 singles eager imposés par la garde de régime établi (le prix de
+la correction sur préfixe court). Récupérable un jour par des graphs de
+rampe — chantier séparé, non ouvert. Non-régression job 34 verte (verify
+B=8 chain/step/stop OK au bit sur l'arbre neuf).
+
+**Intégration rl_disagg livrée, OPT-IN `rl.decode_graphs`** (3f7f151) : UN
+runner par worker baké B=G, buckets banque-pleine padés à G (batch quasi
+gratuit), warmup+captures payés une fois au premier bucket puis rebind par
+appel ; dégradation TOUJOURS propre (CPU / banque en croissance / signature
+atypique / exception / capture ratée ⇒ generate, désarmement bruyant) ;
+belt data_ptr des poids (un load_state_dict assign invaliderait les
+graphs) ; le yaml du run LIVE n'est pas touché — le knob se pose au
+prochain run, avec les 3 flags decode_* dans la config modèle.
+
+---
+
 ## 2026-07-28 — runner rollout : VÉRIFIÉ AU BIT sur GPU, B=8 à 1,13 ms/token-ligne (10,8× l'eager batché) ; 3e bug trouvé et fermé (couture du cycle)
 
 Chantier ouvert sur décision user (banque FIFO fixe ⇒ plus d'obstacle de
