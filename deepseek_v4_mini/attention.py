@@ -767,6 +767,28 @@ class AttnCache:
         self.hist_len = hl
         self.full = True
 
+    def reset(self) -> None:
+        """Rebind du GraphDecodeRunner : repart pour un NOUVEAU décodage dans
+        les MÊMES objets device. Tout ce qu'un graph capturé lit ou écrit —
+        comp, dead, idx, sbufs — est PRÉSERVÉ (réécrit en place, jamais
+        réalloué) : une réallocation laisserait les graphs pointer sur
+        l'ancien storage, faux en silence. L'état eager (hist/wk/wv) est
+        réassigné librement par le prochain forward de préfixe, puis recopié
+        dans sbufs par la ré-entrée d'enter_full_width."""
+        assert self.cap is not None, \
+            "reset : réservé au cache statique (GraphDecodeRunner)"
+        self.pos = 0
+        self.count = 0
+        self.full = False
+        self.hist_len = 0
+        self.hist = self.wk = self.wv = None
+        if self.dead is not None:
+            self.dead.fill_(True)
+        if self.comp is not None:
+            self.comp.zero_()
+        if self.idx is not None:
+            self.idx.zero_()
+
 
 def _cache_store_comp(cache, comp: torch.Tensor, H: torch.Tensor) -> None:
     """Pose les blocs fermés du préfixe dans le cache — buffer statique
@@ -779,6 +801,16 @@ def _cache_store_comp(cache, comp: torch.Tensor, H: torch.Tensor) -> None:
     assert nb <= cache.cap, (
         f"préfixe de {nb} blocs > capacité statique {cache.cap} — "
         f"max_seq_len trop court pour ce décodage")
+    if cache.comp is not None:
+        # cache réutilisé (reset du GraphDecodeRunner) : les graphs capturés
+        # lisent comp/dead à ces adresses — réécrire EN PLACE, pas réallouer
+        cache.comp.zero_()
+        if nb:
+            cache.comp[:, :nb] = comp
+        cache.dead.fill_(True)
+        cache.dead[:nb] = False
+        cache.count = nb
+        return
     buf = H.new_zeros(B, cache.cap, dh)
     if nb:
         buf[:, :nb] = comp
@@ -998,6 +1030,49 @@ def _selftest() -> None:
                 raised = "statique plein" in str(e)
         assert raised, "déborder la capacité statique doit lever, pas corrompre"
 
+    # ── reset() : le cache statique repart de zéro pour un NOUVEAU décodage
+    #    dans les MÊMES objets device (comp/dead/idx/sbufs préservés — le
+    #    contrat du rebind : les graphs capturés lisent ces adresses) ─────────
+    for cls, kw, m in ((CompressedSparseAttention, {"csa_m": M, "top_k": 3}, M),
+                       (HeavilyCompressedAttention, {"hca_m": MP}, MP)):
+        torch.manual_seed(7)
+        mod = _mk(cls, torch.float64, **kw)
+        H1 = torch.randn(1, 3 * m + 4, 24, dtype=torch.float64)
+        H2 = torch.randn(1, 2 * m + 6, 24, dtype=torch.float64)
+        cap = -(-max(H1.size(1), H2.size(1)) // m) + 2
+        cr = AttnCache(cap=cap)
+        with torch.no_grad():
+            # décodage 1 complet, PUIS bascule largeur pleine (crée sbufs/idx)
+            mod.forward_cached(H1[:, :m + 1], cr)
+            for i in range(m + 1, H1.size(1)):
+                mod.forward_cached(H1[:, i:i + 1], cr)
+            cr.enter_full_width(hist_cap=2 * m)
+            keep = (id(cr.comp), id(cr.dead), id(cr.idx),
+                    tuple(id(t) for t in cr.sbufs))
+            # reset → décodage 2 : mêmes sorties qu'un cache NEUF, au bit
+            cr.reset()
+            assert cr.pos == 0 and cr.count == 0 and not cr.full
+            cf = AttnCache(cap=cap)
+            a = mod.forward_cached(H2[:, :3], cr)
+            b = mod.forward_cached(H2[:, :3], cf)
+            assert torch.equal(a, b), f"{cls.__name__}: préfixe post-reset ≠ neuf"
+            for i in range(3, H2.size(1)):
+                a = mod.forward_cached(H2[:, i:i + 1], cr)
+                b = mod.forward_cached(H2[:, i:i + 1], cf)
+                assert torch.equal(a, b), \
+                    f"{cls.__name__}: reset ≠ cache neuf à pos {i}"
+            # …et la ré-entrée largeur pleine retombe sur les MÊMES adresses
+            cr.enter_full_width(hist_cap=2 * m)
+            assert keep == (id(cr.comp), id(cr.dead), id(cr.idx),
+                            tuple(id(t) for t in cr.sbufs)), \
+                f"{cls.__name__}: reset a réalloué un buffer vu par les graphs"
+    raised = False
+    try:
+        AttnCache().reset()
+    except AssertionError:
+        raised = True
+    assert raised, "reset sans cap (cache historique) doit lever"
+
     # ── la fenêtre glissante n'inclut PAS le token courant, et démarre sur des
     #    zéros — c'est la convention du F.pad du chemin complet, pas un choix ─
     mod = _mk(CompressedSparseAttention, torch.float64, csa_m=M, top_k=3)
@@ -1016,7 +1091,8 @@ def _selftest() -> None:
           f"inclus, blocs fermés = pos//m, fenêtre zéro-paddée à gauche, "
           f"fuse_rope BIT-identique — tranche et décodage entier, cache "
           f"STATIQUE == historique au bit sur 3 préfixes × toutes positions + "
-          f"débordement de capacité qui lève)")
+          f"débordement de capacité qui lève, reset == cache neuf au bit avec "
+          f"comp/dead/idx/sbufs aux MÊMES adresses)")
 
 
 if __name__ == "__main__":
