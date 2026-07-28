@@ -77,6 +77,13 @@ class DeepSeekMoE(nn.Module):
 
         # decode_dense_moe : dispatch dense sans sync à petit BT (décodage).
         self.dense_decode = dense_decode
+        # Élargi à B par GraphDecodeRunner PENDANT le mode graphs (attribut
+        # runtime, jamais un flag de config) : à BT > 1 le dense diverge de la
+        # boucle en ULP (GEMM M=1 vs M>1, témoin au self-test) — interdit sur
+        # le chemin eager bit-exact, assumé dans la classe ULP du runner. Et
+        # indispensable là-bas : les .any() de la boucle sont des syncs host,
+        # incapturables dans un CUDA graph.
+        self.dense_max_bt = 1
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
@@ -121,7 +128,8 @@ class DeepSeekMoE(nn.Module):
         # et un GEMM à M=1 vs M=2 ne rend pas les mêmes bits (kernels BLAS
         # différents — écart rel ~1.2e-16 = epsilon float64, mesuré CPU). À
         # BT=1 le sous-ensemble élu EST le batch entier : mêmes bits garantis.
-        if self.dense_decode and not torch.is_grad_enabled() and flat.size(0) == 1:
+        if (self.dense_decode and not torch.is_grad_enabled()
+                and flat.size(0) <= self.dense_max_bt):
             routed_out = self._dispatch_dense(flat, top_idx, top_w)
         else:
             routed_out = self._dispatch_loop(flat, top_idx, top_w)
@@ -292,9 +300,18 @@ def _selftest() -> None:
     with torch.no_grad():
         md64(torch.randn(1, 1, D))                    # no_grad + BT=1 ⇒ dense
     assert hits["n"] == 1
+    # dense_max_bt : le runner graphs élargit le gate à B (classe ULP —
+    # les .any() de la boucle sont des syncs, incapturables) ; défaut 1
+    md64.dense_max_bt = 2
+    with torch.no_grad():
+        md64(torch.randn(1, 2, D))                    # BT=2 ≤ dense_max_bt ⇒ dense
+        assert hits["n"] == 2
+        md64(torch.randn(1, 3, D))                    # BT=3 > dense_max_bt ⇒ boucle
+        assert hits["n"] == 2
+    md64.dense_max_bt = 1
     m_off_flag = DeepSeekMoE(d_model=D, n_experts=E, n_shared=1,
                              top_k_experts=K, d_ff=FF)
-    assert not m_off_flag.dense_decode
+    assert not m_off_flag.dense_decode and m_off_flag.dense_max_bt == 1
 
     # ── need_balance=False : SORTIE au bit près, balance rendue à zéro ──────
     x64 = torch.randn(B, T, D, dtype=torch.float64)

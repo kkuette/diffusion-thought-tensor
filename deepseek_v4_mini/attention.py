@@ -420,7 +420,8 @@ class CompressedSparseAttention(nn.Module):
 
         # 4. avancer le cache — APRÈS l'attention : le bloc que ce token vient
         #    de fermer le contient, et le masque causal l'interdit à lui-même.
-        hist = torch.cat([cache.hist, h], dim=1)
+        hist = torch.cat([cache.hist[:, :cache.hist_len] if cache.full
+                          else cache.hist, h], dim=1)
         if (p + 1) % m == 0:
             newc = self._compress_kv(hist[:, -2 * m:])[:, -1:]
             if cache.cap is not None:
@@ -428,9 +429,10 @@ class CompressedSparseAttention(nn.Module):
             else:
                 cache.comp = torch.cat([cache.comp, newc], dim=1)
             hist = hist[:, -m:]
-        cache.hist = hist[:, -2 * m:]
-        cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
-        cache.wv = _win_push(cache.wv, self.W_wv(h), n_win)
+        hist = hist[:, -2 * m:]
+        nk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
+        nv = _win_push(cache.wv, self.W_wv(h), n_win)
+        _cache_advance(cache, hist, nk, nv)
         cache.pos = p + 1
 
         return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
@@ -636,7 +638,8 @@ class HeavilyCompressedAttention(nn.Module):
         out = torch.einsum("bhn,bnd->bhd", attn_w, V_all
                            ).view(B, 1, self.n_heads, self.d_head)
 
-        hist = torch.cat([cache.hist, h], dim=1)
+        hist = torch.cat([cache.hist[:, :cache.hist_len] if cache.full
+                          else cache.hist, h], dim=1)
         if (p + 1) % m == 0:
             newc = self.kv_norm(self._compress_kv(hist[:, -m:]))
             if cache.cap is not None:
@@ -644,9 +647,10 @@ class HeavilyCompressedAttention(nn.Module):
             else:
                 cache.comp = torch.cat([cache.comp, newc], dim=1)
             hist = hist[:, -m:]
-        cache.hist = hist[:, -2 * m:]
-        cache.wk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
-        cache.wv = _win_push(cache.wv, self.W_wv(h), n_win)
+        hist = hist[:, -2 * m:]
+        nk = _win_push(cache.wk, self.kv_norm(self.W_wk(h)), n_win)
+        nv = _win_push(cache.wv, self.W_wv(h), n_win)
+        _cache_advance(cache, hist, nk, nv)
         cache.pos = p + 1
 
         return _grouped_out_proj(out, self.n_groups, self.out_group, self.out_proj)
@@ -686,7 +690,7 @@ class AttnCache:
     condition de capture d'un CUDA graph, et plus un seul cat qui grossit.
     """
     __slots__ = ("pos", "comp", "hist", "wk", "wv", "cap", "count", "dead",
-                 "full", "idx")
+                 "full", "idx", "hist_len", "sbufs")
 
     def __init__(self, cap: int | None = None) -> None:
         self.pos = 0            # tokens déjà consommés
@@ -706,6 +710,9 @@ class AttnCache:
         # s'associe autrement (~5e-15). Opt-in via GraphDecodeRunner.
         self.full = False
         self.idx = None         # LongTensor [1] device : prochain slot à écrire
+        self.hist_len = 0       # mode full : largeur UTILE de hist (python,
+        #                         déterministe par phase ⇒ bakable en graph)
+        self.sbufs = None       # mode full : (wk, wv, hist) buffers STABLES
 
     def _close_block(self, newc: torch.Tensor) -> None:
         """Range un bloc fermé dans le buffer statique (mode cap)."""
@@ -723,13 +730,42 @@ class AttnCache:
         self.dead[self.count] = False
         self.count += 1
 
-    def enter_full_width(self) -> None:
-        """Bascule ce cache en mode largeur pleine (voir GraphDecodeRunner)."""
+    def enter_full_width(self, hist_cap: int | None = None) -> None:
+        """Bascule ce cache en mode largeur pleine (voir GraphDecodeRunner).
+
+        L'état inter-pas (wk/wv/hist) déménage dans des buffers STABLES mis à
+        jour en place : chaque graph capturé lit et écrit les MÊMES adresses.
+        Sans ça, le graph de la PREMIÈRE phase capturée lit pour toujours les
+        tenseurs eager du warmup — jamais réécrits par le graph de la dernière
+        phase du cycle : 1 pas sur lcm attend sur des fenêtres FIGÉES à la
+        capture (couture du cycle, bug corrigé 2026-07-28, invisible au chrono).
+
+        `hist_cap` = 2m selon la parité de la couche (le cache ne connaît pas
+        m) ; requis au premier passage, ignoré ensuite. Un second passage
+        (rebind du runner après un nouveau préfixe) RÉUTILISE les buffers —
+        les adresses que les graphs connaissent — en y recopiant l'état.
+        """
         assert self.cap is not None and self.comp is not None, \
             "enter_full_width : après le forward de préfixe, mode statique requis"
+        if self.sbufs is None:
+            assert hist_cap is not None, \
+                "premier enter_full_width : hist_cap (2m de la couche) requis"
+            B, _, dm = self.hist.shape
+            self.sbufs = (self.wk.clone(), self.wv.clone(),
+                          self.hist.new_zeros(B, hist_cap, dm))
+            self.idx = torch.full((1,), self.count, dtype=torch.long,
+                                  device=self.comp.device)
+        else:                   # rebind : mêmes adresses, nouvel état
+            self.sbufs[0].copy_(self.wk)
+            self.sbufs[1].copy_(self.wv)
+            self.idx.fill_(self.count)
+        wkb, wvb, hb = self.sbufs
+        hl = min(self.hist.size(1), hb.size(1))
+        if self.hist is not hb:
+            hb[:, :hl] = self.hist[:, -hl:]
+        self.wk, self.wv, self.hist = wkb, wvb, hb
+        self.hist_len = hl
         self.full = True
-        self.idx = torch.full((1,), self.count, dtype=torch.long,
-                              device=self.comp.device)
 
 
 def _cache_store_comp(cache, comp: torch.Tensor, H: torch.Tensor) -> None:
@@ -800,6 +836,26 @@ def _rope_at_cached(pos: int, n: int, dim: int, device: torch.device):
 def _win_push(buf, new, n_win):
     """Fait glisser la fenêtre d'un token. `buf` est [B, n_win, d]."""
     return torch.cat([buf[:, 1:], new], dim=1) if n_win > 0 else buf
+
+
+def _cache_advance(cache, hist, nk, nv):
+    """Pose l'état inter-pas (hist, wk, wv) d'un pas caché.
+
+    Chemin normal : réassignation python (les cats sont les nouveaux objets).
+    Mode largeur pleine : écriture EN PLACE dans les buffers stables — les
+    graphs capturés lisent et écrivent ces adresses à chaque replay ; l'état
+    circule par les intermédiaires du pool mais atterrit toujours ici. C'est
+    ce qui ferme la couture du cycle (voir enter_full_width) et ce qui rend
+    les graphs réutilisables d'un décodage au suivant.
+    """
+    if cache.full:
+        cache.hist[:, :hist.size(1)].copy_(hist)
+        cache.hist_len = hist.size(1)
+        if nk is not cache.wk:                  # n_win == 0 : _win_push
+            cache.wk.copy_(nk)                  # rend le buffer lui-même
+            cache.wv.copy_(nv)
+    else:
+        cache.hist, cache.wk, cache.wv = hist, nk, nv
 
 
 def _win_init(vals, n_win):

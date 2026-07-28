@@ -66,7 +66,12 @@ from .attention import _rope_at_cached
 
 
 class GraphDecodeRunner:
-    """Décodage greedy B=1 token-par-token, pas rejoué par CUDA graph.
+    """Décodage greedy token-par-token, pas rejoué par CUDA graph.
+
+    B est FIXÉ au constructeur (la shape de la banque) et baké dans les
+    buffers et les graphs : un runner par largeur de groupe. À B > 1 le gate
+    du MoE dense est élargi à B pendant le mode graphs (attribut runtime
+    `dense_max_bt`, classe ULP — le chemin eager bit-exact reste BT==1).
 
     Usage :
         runner = GraphDecodeRunner(model, bank)          # exige les 3 flags
@@ -104,6 +109,7 @@ class GraphDecodeRunner:
             raise ValueError(f"amp={amp!r} : seul 'bf16' (ou None) est supporté")
         self.model = model
         self.bank = bank
+        self.B = int(bank.size(0))
         self.layer_banks = layer_banks
         self.warmup = int(warmup)
         self.amp = amp
@@ -135,7 +141,8 @@ class GraphDecodeRunner:
     @torch.no_grad()
     def step(self, fed: torch.Tensor) -> torch.Tensor:
         """fed [1, S] (préfixe au premier appel, puis [1, 1]) → logits [1,1,V]."""
-        assert fed.size(0) == 1, "B == 1 (gate du MoE dense, buffers statiques)"
+        assert fed.size(0) == self.B, \
+            f"B={fed.size(0)} ≠ {self.B} : B est baké dans les buffers du runner"
         if self.cache is None:
             self.cache = self.model.make_cache()
             assert self.cache and self.cache[0].cap is not None
@@ -167,6 +174,8 @@ class GraphDecodeRunner:
         Mode croisière : dès que les lcm phases sont capturées et que stop_id
         est None (pas de test d'arrêt ⇒ pas de sync par token), le reste de la
         génération part en `_chain` — replays purs, argmax dans le graph."""
+        assert stop_id is None or self.B == 1, \
+            "stop_id à B > 1 : pas encore servi (arrêt par tranches à venir)"
         toks = []
         fed = prefix
         left = max_new
@@ -203,8 +212,18 @@ class GraphDecodeRunner:
                               write=False, cache=self.cache)
 
     def _enter_full(self):
-        for c in self.cache:
-            c.enter_full_width()
+        cfg = self.model.cfg
+        for li, c in enumerate(self.cache):
+            # hist_cap = 2m selon la parité de la couche (même règle que
+            # model.make_cache) — le cache ne connaît pas son m
+            m_l = int(cfg.csa_m) if li % 2 == 0 else int(cfg.hca_m)
+            c.enter_full_width(hist_cap=2 * m_l)
+        # le gate du MoE dense s'élargit à B — attribut runtime, PAS un flag de
+        # config : le chemin eager bit-exact (BT==1) reste intact partout
+        # ailleurs, l'élargissement est classe ULP comme le reste du runner
+        for mod in self.model.modules():
+            if hasattr(mod, "dense_max_bt"):
+                mod.dense_max_bt = self.B
         half = self.d_head // 2
         dev = self.bank.device
         self._rope_bufs = (torch.zeros(1, half, device=dev),
@@ -218,8 +237,9 @@ class GraphDecodeRunner:
         # buffers du graph étendu : entrée partagée entre toutes les phases
         # (le tail de l'une nourrit la tête de la suivante), journal des
         # tokens produits, compteurs device (le python ne tourne pas au replay)
-        self._in_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
-        self._out_toks = torch.zeros(self.max_pos, dtype=torch.long, device=dev)
+        self._in_buf = torch.zeros(self.B, 1, dtype=torch.long, device=dev)
+        self._out_toks = torch.zeros(self.max_pos, self.B, dtype=torch.long,
+                                     device=dev)
         self._wptr = torch.zeros(1, dtype=torch.long, device=dev)
         self._pos_dev = torch.tensor([self.pos], dtype=torch.long, device=dev)
         self._full = True
@@ -232,9 +252,9 @@ class GraphDecodeRunner:
 
     def _graph_tail(self, out):
         """Queue de graph : argmax, chaînage token→token, comptabilité device."""
-        nt = out["logits"][:, -1].argmax(-1)            # [1]
-        self._in_buf.copy_(nt.unsqueeze(0))             # le graph suivant lit ça
-        self._out_toks.index_copy_(0, self._wptr, nt)
+        nt = out["logits"][:, -1].argmax(-1)            # [B]
+        self._in_buf.copy_(nt.unsqueeze(1))             # le graph suivant lit ça
+        self._out_toks.index_copy_(0, self._wptr, nt.unsqueeze(0))
         self._wptr.add_(1)
         self._pos_dev.add_(1)
 
@@ -304,11 +324,15 @@ class GraphDecodeRunner:
         for _ in range(n):
             self.graphs[self.pos % self.lcm][0].replay()
             self.pos += 1
-        return self._out_toks[:n].unsqueeze(0).clone()
+        return self._out_toks[:n].t().clone()           # [B, n]
 
     def close(self):
-        """Rend la main proprement (l'override RoPE est module-level)."""
+        """Rend la main proprement : override RoPE (module-level) et gate du
+        MoE dense (attribut runtime élargi à B en mode graphs) restaurés."""
         attention._ROPE_OVERRIDE = None
+        for mod in self.model.modules():
+            if hasattr(mod, "dense_max_bt"):
+                mod.dense_max_bt = 1
 
 
 # ── self-test (CPU-only : la capture réelle attend un GPU libre) ─────────────
@@ -372,15 +396,19 @@ def _selftest() -> None:
     assert isinstance(r_amp._autocast(), contextlib.nullcontext), \
         "amp sur CPU (eager_only) doit rester un nullcontext"
 
-    # 2. CPU ⇒ eager, tokens == generate (bit, float64, top-k durs compris)
-    pr = torch.randint(0, 61, (1, 5))
-    runner = GraphDecodeRunner(m_on, bank)
-    assert runner.eager_only or torch.cuda.is_available()
-    g1, n1 = runner.decode(pr, max_new=17)
-    g2, l2 = generate(m_on, pr, bank=bank, max_new=17, use_cache=True)
-    assert torch.equal(g1, g2[:, :n1]) and n1 == int(l2[0]), \
-        f"runner eager ≠ generate\n  runner  : {g1}\n  generate: {g2}"
-    runner.close()
+    # 2. CPU ⇒ eager, tokens == generate (bit, float64, top-k durs compris).
+    #    À B=2 aussi : en eager le gate MoE dense reste BT==1 (il ne s'élargit
+    #    qu'en mode graphs), le chemin est donc bit-exact face à generate.
+    for Bt in (1, 2):
+        bank_t = bank if Bt == 1 else torch.randn(Bt, 3, 16, dtype=torch.float64)
+        pr = torch.randint(0, 61, (Bt, 5))
+        runner = GraphDecodeRunner(m_on, bank_t)
+        assert runner.eager_only or torch.cuda.is_available()
+        g1, n1 = runner.decode(pr, max_new=17)
+        g2, l2 = generate(m_on, pr, bank=bank_t, max_new=17, use_cache=True)
+        assert torch.equal(g1, g2[:, :n1]), \
+            f"runner eager ≠ generate (B={Bt})\n  runner  : {g1}\n  generate: {g2}"
+        runner.close()
 
     # 3. injection RoPE : buffers remplis = calcul en place, au bit
     from .attention import AttnCache, CompressedSparseAttention, _mk
@@ -419,8 +447,9 @@ def _selftest() -> None:
 
     lcm = math.lcm(3, 5)
     runner2 = GraphDecodeRunner(m_on, bank, warmup=4)
+    pr4 = torch.randint(0, 61, (1, 5))
     with torch.no_grad():
-        runner2.step(pr)                            # préfixe (eager)
+        runner2.step(pr4)                           # préfixe (eager)
         fed = torch.randint(0, 61, (1, 1))
         for _ in range(4):                          # warmup mono-token eager
             runner2.step(fed)
@@ -459,49 +488,72 @@ def _selftest() -> None:
 
     # 6. chaînage émulé == pilotage python (largeur pleine, greedy, au bit) :
     #    deux runners jumeaux, même préfixe, même warmup ; l'un piloté par
-    #    argmax python, l'autre par le programme du graph bouclé sur _in_buf
-    ra = GraphDecodeRunner(m_on, bank, warmup=2)
-    rb = GraphDecodeRunner(m_on, bank, warmup=2)
-    pr2 = torch.randint(0, 61, (1, 4))
-    with torch.no_grad():
-        f = None
-        for r in (ra, rb):
-            o = r.step(pr2)
-            f = o["logits"][:, -1].argmax(-1, keepdim=True)
-            for _ in range(2):
-                o = r.step(f)
+    #    argmax python, l'autre par le programme du graph bouclé sur _in_buf.
+    #    À B=2 : exerce les buffers batchés ET le gate MoE dense élargi
+    #    (dense_max_bt=B posé par _enter_full — les deux bras l'utilisent).
+    for B2 in (1, 2):
+        bank2 = torch.randn(B2, 3, 16, dtype=torch.float64)
+        ra = GraphDecodeRunner(m_on, bank2, warmup=2)
+        rb = GraphDecodeRunner(m_on, bank2, warmup=2)
+        pr2 = torch.randint(0, 61, (B2, 4))
+        with torch.no_grad():
+            f = None
+            for r in (ra, rb):
+                o = r.step(pr2)
                 f = o["logits"][:, -1].argmax(-1, keepdim=True)
-            r._enter_full()
-        pos0 = int(rb._pos_dev)
-        n = 9
-        toks_a, fa = [], f.clone()
-        for _ in range(n):                          # bras python
-            o = ra._eager(fa)
-            fa = o["logits"][:, -1].argmax(-1, keepdim=True)
-            toks_a.append(fa)
-        rb._in_buf.copy_(f)                         # bras « graph émulé »
-        rb._wptr.zero_()
-        for _ in range(n):
-            attention._ROPE_OVERRIDE = rb._rope_bufs
-            try:
-                rb._graph_head()
-                o = rb._eager(rb._in_buf)
-                rb._graph_tail(o)
-            finally:
-                attention._ROPE_OVERRIDE = None
-    assert torch.equal(torch.cat(toks_a, dim=1).view(-1), rb._out_toks[:n]), (
-        "chaînage émulé ≠ pilotage python\n"
-        f"  python : {torch.cat(toks_a, dim=1).view(-1)}\n"
-        f"  chaîne : {rb._out_toks[:n]}")
-    assert int(rb._wptr) == n and int(rb._pos_dev) == pos0 + n, \
-        "compteurs device du chaînage faux"
-    ra.close(); rb.close()
+                for _ in range(2):
+                    o = r.step(f)
+                    f = o["logits"][:, -1].argmax(-1, keepdim=True)
+                r._enter_full()
+            assert all(mod.dense_max_bt == B2
+                       for mod in m_on.modules()
+                       if hasattr(mod, "dense_max_bt")), \
+                "_enter_full doit élargir le gate MoE dense à B"
+            # stabilité d'adresses : l'état inter-pas vit dans des buffers
+            # STABLES — c'est ce que les graphs captureront comme interface
+            addrs = [(id(c.wk), id(c.wv), id(c.hist), id(c.idx))
+                     for c in rb.cache]
+            pos0 = int(rb._pos_dev)
+            n = 9
+            toks_a, fa = [], f.clone()
+            for _ in range(n):                      # bras python
+                o = ra._eager(fa)
+                fa = o["logits"][:, -1].argmax(-1, keepdim=True)
+                toks_a.append(fa)
+            rb._in_buf.copy_(f)                     # bras « graph émulé »
+            rb._wptr.zero_()
+            for _ in range(n):
+                attention._ROPE_OVERRIDE = rb._rope_bufs
+                try:
+                    rb._graph_head()
+                    o = rb._eager(rb._in_buf)
+                    rb._graph_tail(o)
+                finally:
+                    attention._ROPE_OVERRIDE = None
+        assert addrs == [(id(c.wk), id(c.wv), id(c.hist), id(c.idx))
+                         for c in rb.cache], (
+            "l'état inter-pas a changé d'objet en mode largeur pleine — la "
+            "couture du cycle des graphs se rouvre (wk/wv/hist doivent être "
+            "mis à jour EN PLACE)")
+        got = rb._out_toks[:n].t()                  # [B, n]
+        want = torch.cat(toks_a, dim=1)
+        assert torch.equal(want, got), (
+            f"chaînage émulé ≠ pilotage python (B={B2})\n"
+            f"  python : {want}\n  chaîne : {got}")
+        assert int(rb._wptr) == n and int(rb._pos_dev) == pos0 + n, \
+            "compteurs device du chaînage faux"
+        ra.close(); rb.close()
+        assert all(mod.dense_max_bt == 1 for mod in m_on.modules()
+                   if hasattr(mod, "dense_max_bt")), \
+            "close() doit restaurer le gate MoE dense"
 
     print(f"decode_graphs self-test: OK (refus sans flags/banque/amp inconnu, "
-          f"eager CPU == generate au bit, injection RoPE bit-identique, "
-          f"programme du graph étendu : signature ops+shapes CONSTANTE par "
-          f"phase sur 2×lcm={2 * lcm} pas, comptabilité de blocs device == "
-          f"python, chaînage émulé == pilotage python au bit ; la capture "
+          f"eager CPU == generate au bit à B∈{{1,2}}, injection RoPE "
+          f"bit-identique, programme du graph étendu : signature ops+shapes "
+          f"CONSTANTE par phase sur 2×lcm={2 * lcm} pas, comptabilité de "
+          f"blocs device == python, chaînage émulé == pilotage python au bit "
+          f"à B∈{{1,2}} avec état inter-pas à ADRESSES STABLES (couture du "
+          f"cycle fermée) + gate MoE dense élargi/restauré ; la capture "
           f"réelle attend un GPU libre)")
 
 
