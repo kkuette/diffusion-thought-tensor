@@ -305,7 +305,13 @@ class Worker:
         self.rng = _random.Random(seed + 17)
         dg = r["disagg"]
         self.root = dg["root"]
-        self.hub = WeightHub(self.root, keep=int(dg.get("keep_weights", 3)))
+        # TB_WEIGHTS_MIRROR (rig) : lire les poids depuis une copie locale
+        # entretenue par scripts/rl_weights_mirror.sh — un pull NAS par
+        # publication au lieu d'un par worker. Ne concerne que le fetch des
+        # poids : rollouts, lives et STOP restent sur root (NFS).
+        mroot = os.environ.get("TB_WEIGHTS_MIRROR")
+        self.hub = WeightHub(mroot or self.root,
+                             keep=int(dg.get("keep_weights", 3)))
         self.store = RolloutStore(self.root)
         self.max_pending = int(dg.get("max_pending", 24))
         self.poll_s = float(dg.get("poll_s", 2.0))
