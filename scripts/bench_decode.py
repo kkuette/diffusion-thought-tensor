@@ -557,6 +557,157 @@ def run_verify(raw, a):
     print("verify:", "TOUT OK" if fails == 0 else f"{fails} ÉCHEC(S)")
 
 
+# ── rebind (verify au bit + chrono du coût par appel) ────────────────────────
+
+def _rebound_eager_ref(model, bank, prefix, n_tokens):
+    """La trajectoire attendue d'un décodage POST-REBIND, exécutée eager en
+    largeur pleine : préfixe eager, singles eager tant que la garde de régime
+    établi retient (`_enter_ready` — zéro warmup, il est déjà payé), puis le
+    programme du graph émulé. C'est le calendrier exact du runner rebondi —
+    un runner frais (warmup plein) suivrait un AUTRE calendrier, ULP-divergent."""
+    from deepseek_v4_mini import attention
+    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    r = GraphDecodeRunner(model, bank, warmup=0)
+    r.eager_only = True                         # jamais de capture : eager pur
+    toks = []
+    with torch.no_grad():
+        o = r.step(prefix)
+        fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+        toks.append(fed)
+        while not r._enter_ready():
+            o = r.step(fed)
+            fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+            toks.append(fed)
+        r._enter_full()
+        r._in_buf.copy_(fed)
+        r._wptr.zero_()
+        rest = n_tokens - len(toks)
+        for _ in range(rest):
+            attention._ROPE_OVERRIDE = r._rope_bufs
+            try:
+                r._graph_head()
+                o = r._eager(r._in_buf)
+                r._graph_tail(o)
+            finally:
+                attention._ROPE_OVERRIDE = None
+        out = torch.cat([torch.cat(toks, dim=1),
+                         r._out_toks[:rest].t()], dim=1).clone()
+    r.close()
+    return out, len(toks)
+
+
+def run_rebind(raw, a):
+    """Le rebind, prouvé puis chronométré sur les replays réels.
+
+    Verify : decode 1 (arme + capture), rebind(banque neuve), decode 2 —
+    torch.equal contre la trajectoire eager largeur-pleine au MÊME calendrier
+    (`_rebound_eager_ref`). Deux préfixes : COURT (~6 tokens, le cas a_open
+    des rollouts — la garde de régime établi doit retenir puis converger) et
+    long (a.prefix). Plus le contrat stop_id post-rebind (chain vs step).
+
+    Chrono : K appels successifs `rebind + decode` sur banques différentes vs
+    le coût d'armement d'un runner FRAIS — le surcoût par appel est ce qui
+    décide si le gain graphs existe en rollout."""
+    if a.device != "cuda":
+        sys.exit("[bench] --rebind : GPU requis (on teste les replays réels)")
+    _gpu_guard(a.force)
+    if a.amp != "none":
+        sys.exit("[bench] --rebind : fp32 seulement (référence eager comparable)")
+    from deepseek_v4_mini.decode import trim
+    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    flags = _parse_flags(a.flags)
+    model, cfg, prefix, bank = _mk_model(raw, a, flags)
+    N, warm = a.tokens, 8
+    g2 = torch.Generator().manual_seed(a.bank_seed + 1)
+    bank2 = torch.rand(a.batch, cfg.max_mem, cfg.mem_dim,
+                       generator=g2).to(a.device)
+    print(f"\n== rebind GPU (B={a.batch}, {N} tokens/bras) ==")
+
+    fails = 0
+    for label, pr2 in (("préfixe court", prefix[:, :6]),
+                       ("préfixe long ", prefix)):
+        r = GraphDecodeRunner(model, bank, warmup=warm)
+        r.decode(prefix, max_new=N)             # decode 1 : arme + capture
+        armed = not r.eager_only and len(r.graphs) == r.lcm
+        if not armed:
+            print(f"{label} : graphs INACTIFS après decode 1 — test nul")
+            fails += 1
+            r.close(); del r; torch.cuda.empty_cache()
+            continue
+        r.rebind(bank2)
+        g, l = r.decode(pr2, max_new=N)         # decode 2 : replays
+        r.close(); del r; torch.cuda.empty_cache()
+        ref, n_eager = _rebound_eager_ref(model, bank2, pr2, N)
+        same = torch.equal(g, ref)
+        print(f"{label} : "
+              + (f"OK — decode 2 == eager largeur pleine au bit "
+                 f"({n_eager} tokens eager avant bascule)" if same
+                 else "DIVERGE de la référence eager"))
+        if not same:
+            d = (g != ref).any(0).int().argmax().item()
+            print(f"        première divergence au token {d}/{g.size(1)}\n"
+                  f"        rebind : {g[:, max(0, d - 2):d + 3]}\n"
+                  f"        eager  : {ref[:, max(0, d - 2):d + 3]}")
+            fails += 1
+
+    # contrat stop_id POST-rebind : chaîne par tranches vs pilotage step
+    sid = None
+    r3 = GraphDecodeRunner(model, bank, chain=True, warmup=warm)
+    r3.decode(prefix, max_new=N)
+    r3.rebind(bank2)
+    g3, l3 = r3.decode(prefix[:, :6], max_new=N)
+    sid = int(g3[0, N * 2 // 3])
+    r3.rebind(bank2)
+    g3, l3 = r3.decode(prefix[:, :6], max_new=N, stop_id=sid, chunk=8)
+    r3.close(); del r3; torch.cuda.empty_cache()
+    r4 = GraphDecodeRunner(model, bank, chain=False, warmup=warm)
+    r4.decode(prefix, max_new=N)
+    r4.rebind(bank2)
+    g4, l4 = r4.decode(prefix[:, :6], max_new=N, stop_id=sid)
+    r4.close(); del r4; torch.cuda.empty_cache()
+    ok = torch.equal(l3, l4) and all(
+        torch.equal(x, y) for x, y in zip(trim(g3, l3), trim(g4, l4)))
+    print(f"  stop : {'OK — tranches == step post-rebind' if ok else 'DIVERGE'}"
+          f"  (stop_id={sid}, lens={l3.tolist()})")
+    fails += 0 if ok else 1
+    print("rebind verify:", "TOUT OK" if fails == 0 else f"{fails} ÉCHEC(S)")
+
+    # ── chrono : armement frais vs rebind+decode ─────────────────────────────
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    r = GraphDecodeRunner(model, bank, warmup=32)
+    r.decode(prefix, max_new=64)                # warmup + 16 captures + solde
+    torch.cuda.synchronize()
+    t_fresh = time.perf_counter() - t0
+    K, t_reb, t_dec = 8, [], []
+    gk = torch.Generator().manual_seed(a.bank_seed + 7)
+    for _ in range(K):
+        bk = torch.rand(a.batch, cfg.max_mem, cfg.mem_dim,
+                        generator=gk).to(a.device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        r.rebind(bk)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        r.decode(prefix[:, :6], max_new=N)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        t_reb.append(t1 - t0)
+        t_dec.append(t2 - t1)
+    r.close(); del r; torch.cuda.empty_cache()
+    reb = sum(t_reb[1:]) / (K - 1)              # le 1er paie d'éventuels alloc
+    dec = sum(t_dec[1:]) / (K - 1)
+    per = reb + dec
+    print(f"\nchrono : runner frais (warmup 32 + captures + 64 tokens) "
+          f"{t_fresh * 1e3:8.1f} ms")
+    print(f"         rebind seul (moy {K - 1} appels)              "
+          f"{reb * 1e3:8.1f} ms")
+    print(f"         decode {N} tokens post-rebind                "
+          f"{dec * 1e3:8.1f} ms  = {dec / N / a.batch * 1e3:.2f} ms/token-ligne")
+    print(f"         appel complet (rebind + decode)              "
+          f"{per * 1e3:8.1f} ms  ({a.batch * N / per:,.0f} tok/s agrégés)")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _parse_flags(spec: str) -> list[str]:
@@ -591,6 +742,10 @@ def main(argv=None):
     p.add_argument("--verify", action="store_true",
                    help="A/B GPU des replays réels : graphs (chain+step+stop) "
                         "vs eager largeur pleine, torch.equal")
+    p.add_argument("--rebind", action="store_true",
+                   help="rebind GPU : decode→rebind→decode == eager largeur "
+                        "pleine au bit (préfixes court+long, stop) + chrono "
+                        "du coût par appel vs runner frais")
     p.add_argument("--fingerprint", action="store_true")
     p.add_argument("--ab-check", dest="ab_check", action="store_true")
     p.add_argument("--report", default="text", choices=("text", "md"))
@@ -610,9 +765,11 @@ def main(argv=None):
         run_ab(raw, a)
     if a.verify:
         run_verify(raw, a)
+    if a.rebind:
+        run_rebind(raw, a)
     if a.time:
         run_time(raw, a)
-    if not (a.fingerprint or a.ab_check or a.verify or a.time):
+    if not (a.fingerprint or a.ab_check or a.verify or a.rebind or a.time):
         run_census(raw, a, md=(a.report == "md"))
 
 
