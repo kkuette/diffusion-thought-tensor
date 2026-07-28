@@ -76,6 +76,8 @@ class GraphDecodeRunner:
     Usage :
         runner = GraphDecodeRunner(model, bank)          # exige les 3 flags
         gen = runner.decode(prefix, max_new=64, stop_id=eos)
+        runner.rebind(bank2)         # décodage suivant : graphs CONSERVÉS,
+        gen2 = runner.decode(...)    # warmup et captures jamais repayés
 
     Sur CPU (ou si la capture échoue) : eager pur en mode statique NORMAL,
     strictement identique à decode.generate — c'est le self-test. La bascule
@@ -108,9 +110,13 @@ class GraphDecodeRunner:
         if amp not in (None, "bf16"):
             raise ValueError(f"amp={amp!r} : seul 'bf16' (ou None) est supporté")
         self.model = model
-        self.bank = bank
+        # le runner POSSÈDE ses buffers de banque : les graphs (et le mémo
+        # fw_A/fw_B) voient ces adresses-là, et rebind() y recopie l'état du
+        # décodage suivant — jamais de réallocation
+        self.bank = bank.detach().clone()
         self.B = int(bank.size(0))
-        self.layer_banks = layer_banks
+        self.layer_banks = None if layer_banks is None else [
+            None if x is None else x.detach().clone() for x in layer_banks]
         self.warmup = int(warmup)
         self.amp = amp
         self.chain = bool(chain)
@@ -151,13 +157,20 @@ class GraphDecodeRunner:
             raise RuntimeError(f"génération > max_seq_len={self.max_pos} : "
                                f"les caches statiques sont dimensionnés dessus")
 
-        if self.eager_only or fed.size(1) > 1 or self._singles < self.warmup:
+        graphs_ok = not (self.eager_only or fed.size(1) > 1
+                         or self._singles < self.warmup)
+        if graphs_ok and not self._full:
+            # armement (ou RÉ-armement post-rebind) : n'entrer en largeur
+            # pleine que si l'état eager reproduit les largeurs hist bakées
+            # dans les graphs — sinon rester en singles eager statiques
+            graphs_ok = self._enter_ready()
+            if graphs_ok:
+                self._enter_full()
+        if not graphs_ok:
             out = self._eager(fed)
             if fed.size(1) == 1:
                 self._singles += 1
         else:
-            if not self._full:
-                self._enter_full()
             phase = self.pos % self.lcm
             if phase not in self.graphs:
                 out = self._capture(phase, fed)
@@ -233,11 +246,34 @@ class GraphDecodeRunner:
                               layer_banks=self.layer_banks,
                               write=False, cache=self.cache)
 
+    def _enter_ready(self) -> bool:
+        """Les largeurs hist sont-elles en RÉGIME ÉTABLI à cette position ?
+
+        `hist_len` est un int python baké comme taille de slice à la capture
+        (attention.py, mode full) — la SEULE dépendance de forme au temps qui
+        ne soit pas un tenseur device. En régime établi elle vaut
+        `m + (pos % m)` (atteint dès pos ≥ m) : une fonction PÉRIODIQUE de la
+        position, la condition pour qu'un graph capturé à la phase p soit
+        rejouable à toute position ultérieure ≡ p (mod lcm). Armement ET
+        ré-armement post-rebind attendent cette condition en singles eager —
+        sinon un graph lirait au-delà du rempli, faux en silence (un préfixe
+        court post-rebind, le cas a_open des rollouts, y passerait)."""
+        cfg = self.model.cfg
+        for li, c in enumerate(self.cache):
+            m_l = int(cfg.csa_m) if li % 2 == 0 else int(cfg.hca_m)
+            w = c.hist_len if c.full else (
+                0 if c.hist is None else c.hist.size(1))
+            if w != m_l + (self.pos % m_l):
+                return False
+        return True
+
     def _enter_full(self):
         cfg = self.model.cfg
         for li, c in enumerate(self.cache):
             # hist_cap = 2m selon la parité de la couche (même règle que
-            # model.make_cache) — le cache ne connaît pas son m
+            # model.make_cache) — le cache ne connaît pas son m ; à la
+            # ré-entrée (rebind) enter_full_width recopie l'état dans les
+            # sbufs EXISTANTS, les adresses que les graphs connaissent
             m_l = int(cfg.csa_m) if li % 2 == 0 else int(cfg.hca_m)
             c.enter_full_width(hist_cap=2 * m_l)
         # le gate du MoE dense s'élargit à B — attribut runtime, PAS un flag de
@@ -246,24 +282,30 @@ class GraphDecodeRunner:
         for mod in self.model.modules():
             if hasattr(mod, "dense_max_bt"):
                 mod.dense_max_bt = self.B
-        half = self.d_head // 2
         dev = self.bank.device
-        self._rope_bufs = (torch.zeros(1, half, device=dev),
-                           torch.zeros(1, half, device=dev))
-        # table RoPE forcée à pleine capacité PUIS référencée : la tête de
-        # graph la lit par index_select — si _rope_at_cached la reconstruisait
-        # plus tard, le graph pointerait sur l'ancien storage. Capacité ≥
-        # max_pos + garde-fou step() sur max_pos ⇒ jamais de reconstruction.
-        _rope_at_cached(self.max_pos - 1, 1, self.d_head, dev)
-        self._rope_tab = attention._ROPE_TABLES[(str(dev), self.d_head)]
-        # buffers du graph étendu : entrée partagée entre toutes les phases
-        # (le tail de l'une nourrit la tête de la suivante), journal des
-        # tokens produits, compteurs device (le python ne tourne pas au replay)
-        self._in_buf = torch.zeros(self.B, 1, dtype=torch.long, device=dev)
-        self._out_toks = torch.zeros(self.max_pos, self.B, dtype=torch.long,
-                                     device=dev)
-        self._wptr = torch.zeros(1, dtype=torch.long, device=dev)
-        self._pos_dev = torch.tensor([self.pos], dtype=torch.long, device=dev)
+        if self._rope_bufs is None:     # ── première fois : allouer ──────────
+            half = self.d_head // 2
+            self._rope_bufs = (torch.zeros(1, half, device=dev),
+                               torch.zeros(1, half, device=dev))
+            # table RoPE forcée à pleine capacité PUIS référencée : la tête de
+            # graph la lit par index_select — si _rope_at_cached la
+            # reconstruisait plus tard, le graph pointerait sur l'ancien
+            # storage. Capacité ≥ max_pos + garde-fou step() sur max_pos ⇒
+            # jamais de reconstruction.
+            _rope_at_cached(self.max_pos - 1, 1, self.d_head, dev)
+            self._rope_tab = attention._ROPE_TABLES[(str(dev), self.d_head)]
+            # buffers du graph étendu : entrée partagée entre toutes les
+            # phases (le tail de l'une nourrit la tête de la suivante),
+            # journal des tokens produits, compteurs device
+            self._in_buf = torch.zeros(self.B, 1, dtype=torch.long, device=dev)
+            self._out_toks = torch.zeros(self.max_pos, self.B,
+                                         dtype=torch.long, device=dev)
+            self._wptr = torch.zeros(1, dtype=torch.long, device=dev)
+            self._pos_dev = torch.tensor([self.pos], dtype=torch.long,
+                                         device=dev)
+        else:                           # ── ré-entrée (rebind) : en place ────
+            self._wptr.zero_()
+            self._pos_dev.fill_(self.pos)
         self._full = True
 
     def _graph_head(self):
@@ -347,6 +389,54 @@ class GraphDecodeRunner:
             self.graphs[self.pos % self.lcm][0].replay()
             self.pos += 1
         return self._out_toks[:n].t().clone()           # [B, n]
+
+    @torch.no_grad()
+    def rebind(self, bank: torch.Tensor, layer_banks=None) -> None:
+        """Réarme le runner pour un NOUVEAU décodage sans repayer warmup ni
+        captures : l'état neuf est recopié DANS les objets que les graphs
+        connaissent, jamais réalloué.
+
+          * banque (et layer_banks) : `copy_` dans les buffers possédés —
+            mêmes shapes/dtype/device exigés (un runner = une signature) ;
+          * caches : `AttnCache.reset()` (comp/dead/idx/sbufs préservés) ;
+          * A/Bm mémoïsés (entrées des graphs, bakés à la capture) :
+            `_fw_refresh` recalcule et recopie en place ;
+          * gate MoE dense restauré à 1 : les singles post-rebind empruntent
+            le chemin eager statique NORMAL (le même qu'un runner frais),
+            `_enter_full` ré-élargira à la bascule.
+
+        Les graphs, le pool, les buffers RoPE et le compteur de warmup
+        survivent — c'est tout l'intérêt. La bascule largeur pleine ne
+        réarme qu'aux positions où les largeurs hist eager coïncident avec
+        les valeurs bakées (voir `_enter_ready`)."""
+        if (bank.shape != self.bank.shape or bank.dtype != self.bank.dtype
+                or bank.device != self.bank.device):
+            raise ValueError(
+                f"rebind : banque {tuple(bank.shape)}/{bank.dtype} ≠ buffer "
+                f"{tuple(self.bank.shape)}/{self.bank.dtype} — un runner est "
+                f"baké sur UNE signature, en construire un autre")
+        if (layer_banks is None) != (self.layer_banks is None) or (
+                layer_banks is not None
+                and (len(layer_banks) != len(self.layer_banks)
+                     or any((a is None) != (b is None)
+                            for a, b in zip(layer_banks, self.layer_banks)))):
+            raise ValueError(
+                "rebind : structure de layer_banks ≠ celle du constructeur")
+        self.bank.copy_(bank)
+        if layer_banks is not None:
+            for buf, nb in zip(self.layer_banks, layer_banks):
+                if buf is not None:
+                    buf.copy_(nb)
+        if self.cache is not None:
+            for c in self.cache:
+                c.reset()
+        self.pos = 0
+        self._full = False
+        for mod in self.model.modules():
+            if hasattr(mod, "dense_max_bt"):
+                mod.dense_max_bt = 1
+            if hasattr(mod, "_fw_refresh"):
+                mod._fw_refresh()
 
     def close(self):
         """Rend la main proprement : override RoPE (module-level) et gate du
@@ -432,10 +522,9 @@ def _selftest() -> None:
             f"runner eager ≠ generate (B={Bt})\n  runner  : {g1}\n  generate: {g2}"
         # …et le contrat stop_id (arrêt par ligne, lens stop-inclus,
         # remplissage après) : un stop tiré DES tokens générés garantit le
-        # hit. Runner FRAIS : un runner porte l'état d'UN décodage (rebind à
-        # venir pour la réutilisation).
-        runner.close()
-        runner = GraphDecodeRunner(m_on, bank_t)
+        # hit. Le second décodage passe par rebind() — le chemin eager
+        # post-rebind doit être EXACTEMENT generate, comme un runner frais.
+        runner.rebind(bank_t)
         sid = int(g2[Bt - 1, 7])
         g3, l3 = runner.decode(pr, max_new=17, stop_id=sid)
         g4, l4 = generate(m_on, pr, bank=bank_t, max_new=17, stop_id=sid,
@@ -582,14 +671,125 @@ def _selftest() -> None:
                    if hasattr(mod, "dense_max_bt")), \
             "close() doit restaurer le gate MoE dense"
 
+    # 7. rebind : le programme du graph (émulé) survit au changement de
+    #    décodage — mêmes adresses partout, garde de régime établi qui retient
+    #    la bascule sur préfixe court, tokens == runner FRAIS au bit
+    def _argmax(o):
+        return o["logits"][:, -1].argmax(-1, keepdim=True)
+
+    def _drive_full(r, n):
+        """le programme du graph étendu, bouclé — l'émulation CPU des replays"""
+        for _ in range(n):
+            attention._ROPE_OVERRIDE = r._rope_bufs
+            try:
+                r._graph_head()
+                o = r._eager(r._in_buf)
+                r._graph_tail(o)
+            finally:
+                attention._ROPE_OVERRIDE = None
+            r.pos += 1
+
+    for B3 in (1, 2):
+        torch.manual_seed(31 + B3)
+        bank_a = torch.randn(B3, 3, 16, dtype=torch.float64)
+        bank_b = torch.randn(B3, 3, 16, dtype=torch.float64)
+        ra = GraphDecodeRunner(m_on, bank_a, warmup=2)
+        pr_a = torch.randint(0, 61, (B3, 6))
+        with torch.no_grad():
+            f = _argmax(ra.step(pr_a))
+            for _ in range(2):
+                f = _argmax(ra.step(f))
+            assert ra._enter_ready(), "régime établi attendu ici (pos ≥ m)"
+            ra._enter_full()
+            ra._in_buf.copy_(f)
+            ra._wptr.zero_()
+            _drive_full(ra, lcm + 3)                    # « décodage 1 »
+        addrs = [(id(c.comp), id(c.dead), id(c.idx), *map(id, c.sbufs))
+                 for c in ra.cache]
+        io_ids = (id(ra._in_buf), id(ra._out_toks), id(ra._wptr),
+                  id(ra._pos_dev), id(ra.bank))
+        memo_ids = [(id(b._fw_memo[2]), id(b._fw_memo[3]))
+                    for b in m_on.blocks if b._fw_memo is not None]
+        assert memo_ids, "le mémo fw doit être chaud (entrées des graphs)"
+
+        ra.rebind(bank_b)                               # banque NEUVE
+        assert all(mod.dense_max_bt == 1 for mod in m_on.modules()
+                   if hasattr(mod, "dense_max_bt")), \
+            "rebind doit restaurer le gate MoE (singles = chemin normal)"
+        pr_b = torch.randint(0, 61, (B3, 2))            # préfixe COURT (< m)
+        with torch.no_grad():
+            f = _argmax(ra.step(pr_b))
+            n_sing = 0
+            while not ra._enter_ready():
+                f = _argmax(ra.step(f))
+                n_sing += 1
+                assert n_sing < 4 * lcm, "garde de régime établi : divergence"
+            assert n_sing >= 1, "préfixe court : la garde devait RETENIR"
+            ra._enter_full()
+            assert addrs == [(id(c.comp), id(c.dead), id(c.idx),
+                              *map(id, c.sbufs)) for c in ra.cache] \
+                and io_ids == (id(ra._in_buf), id(ra._out_toks), id(ra._wptr),
+                               id(ra._pos_dev), id(ra.bank)) \
+                and memo_ids == [(id(b._fw_memo[2]), id(b._fw_memo[3]))
+                                 for b in m_on.blocks
+                                 if b._fw_memo is not None], \
+                "le rebind a réalloué un objet vu par les graphs"
+            ra._in_buf.copy_(f)
+            ra._wptr.zero_()
+            n2 = lcm + 2
+            _drive_full(ra, n2)                         # « décodage 2 »
+            got = ra._out_toks[:n2].t().clone()
+
+        # référence : runner FRAIS sur bank_b, MÊME calendrier d'armement —
+        # le décodage post-rebind doit lui être identique au bit
+        rf = GraphDecodeRunner(m_on, bank_b, warmup=0)
+        with torch.no_grad():
+            f2 = _argmax(rf.step(pr_b))
+            for _ in range(n_sing):
+                f2 = _argmax(rf.step(f2))
+            rf._enter_full()
+            rf._in_buf.copy_(f2)
+            rf._wptr.zero_()
+            _drive_full(rf, n2)
+            want = rf._out_toks[:n2].t()
+        assert torch.equal(f, f2), \
+            f"singles post-rebind ≠ runner frais (B={B3})"
+        assert torch.equal(want, got), (
+            f"décodage post-rebind ≠ runner frais (B={B3})\n"
+            f"  frais  : {want}\n  rebind : {got}")
+        ra.close()
+        rf.close()
+
+    # …et rebind refuse une mauvaise signature
+    r_sig = GraphDecodeRunner(m_on, torch.randn(1, 3, 16, dtype=torch.float64))
+    for bad in (torch.randn(2, 3, 16, dtype=torch.float64),
+                torch.randn(1, 4, 16, dtype=torch.float64),
+                torch.randn(1, 3, 16)):
+        try:
+            r_sig.rebind(bad)
+            raise SystemExit(f"rebind aurait dû refuser {tuple(bad.shape)}/"
+                             f"{bad.dtype}")
+        except ValueError as e:
+            assert "signature" in str(e)
+    try:
+        r_sig.rebind(torch.randn(1, 3, 16, dtype=torch.float64),
+                     layer_banks=[None])
+        raise SystemExit("rebind aurait dû refuser des layer_banks inattendus")
+    except ValueError as e:
+        assert "layer_banks" in str(e)
+    r_sig.close()
+
     print(f"decode_graphs self-test: OK (refus sans flags/banque/amp inconnu, "
           f"eager CPU == generate au bit à B∈{{1,2}}, injection RoPE "
           f"bit-identique, programme du graph étendu : signature ops+shapes "
           f"CONSTANTE par phase sur 2×lcm={2 * lcm} pas, comptabilité de "
           f"blocs device == python, chaînage émulé == pilotage python au bit "
           f"à B∈{{1,2}} avec état inter-pas à ADRESSES STABLES (couture du "
-          f"cycle fermée) + gate MoE dense élargi/restauré ; la capture "
-          f"réelle attend un GPU libre)")
+          f"cycle fermée) + gate MoE dense élargi/restauré ; REBIND : "
+          f"décodage 2 == runner frais au bit à B∈{{1,2}}, toutes adresses "
+          f"(caches, buffers I/O, banque, mémo A/Bm) inchangées, garde de "
+          f"régime établi qui retient la bascule sur préfixe court, refus "
+          f"des mauvaises signatures ; la capture réelle attend un GPU libre)")
 
 
 if __name__ == "__main__":
