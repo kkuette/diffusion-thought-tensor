@@ -167,6 +167,13 @@ class RolloutStore:
             try:
                 got.append(torch.load(dst, map_location="cpu",
                                       weights_only=False))
+            except Exception as e:
+                # groupe illisible (typique : NAS coupé entre le rename et le
+                # sync serveur — le fichier existe, les octets non). Il est
+                # perdu de toute façon ; le jeter vaut mieux que tuer le
+                # learner. Vécu 2026-07-28 : EOFError post-coupure.
+                print(f"rollout corrompu jeté: {name} ({type(e).__name__}: "
+                      f"{e})", flush=True)
             finally:
                 try:
                     os.remove(dst)
