@@ -82,7 +82,8 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
         "rl": (
             {"disagg", "init_from", "steps"},
             {"amp", "cascade_depth", "cascade_map", "clip_high", "clip_low",
-             "decode_cache", "explore_floor", "grad_clip", "group_size",
+             "decode_cache", "decode_graphs", "explore_floor", "grad_clip",
+             "group_size",
              "groups_per_step", "kl_coef",
              "lambda_write", "lr", "max_episodes_per_life", "max_new",
              "max_resample", "min_reward_std", "n_lives_per_worker", "save_every",

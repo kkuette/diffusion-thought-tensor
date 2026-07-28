@@ -360,6 +360,17 @@ class Worker:
         # ULP y est aussi légitime qu'un autre tirage, alors qu'en éval elle
         # rendrait les chiffres incomparables. Voir decode.generate.
         self.decode_cache = bool(r.get("decode_cache", False))
+        # decode_graphs : le tour de réponse par GraphDecodeRunner (CUDA
+        # graphs + rebind — même classe ULP que decode_cache, opt-in). Exige
+        # les 3 flags decode_* dans la config modèle ; s'arme au premier
+        # bucket banque-pleine et se DÉSARME bruyamment au premier pépin,
+        # generate reprend — jamais un rollout perdu. fp32 dans les graphs
+        # (bf16-autocast = perte mesurée, FINDINGS 2026-07-27).
+        self.decode_graphs = bool(r.get("decode_graphs", False))
+        self._graph_runner = None
+        self._graph_dead = False
+        self._graph_p0 = None       # data_ptr des poids à l'armement (belt :
+        #                             un load_state_dict assign les changerait)
         stop = "<|im_end|>"
         self.stop_id = (self.tok.convert_tokens_to_ids(stop)
                         if stop in self.tok.get_vocab() else -1)
@@ -416,6 +427,76 @@ class Worker:
             time.sleep(self.poll_s)
 
     # ── reward ───────────────────────────────────────────────────────────────
+    def _graphs_decode(self, bank, lb, max_new):
+        """Le tour de réponse d'un bucket par GraphDecodeRunner, ou None si ce
+        bucket doit passer par `generate` (banque en croissance, signature
+        atypique, runner désarmé). UN runner par worker, baké B=G : les
+        buckets partiels sont PADÉS à G (le batch est quasi gratuit — 9,0 vs
+        6,5 ms/pas, FINDINGS 2026-07-28) et les lignes de bourrage jetées.
+        Warmup + 16 captures payés au premier bucket ; ensuite chaque appel =
+        rebind (copies en place) + replays."""
+        if self._graph_dead or self.device.type != "cuda":
+            return None
+        if bank.size(1) != self.max_mem or bank.size(0) > self.G:
+            return None                     # vie pas encore établie : eager
+        from .decode_graphs import GraphDecodeRunner
+        B = bank.size(0)
+        if B < self.G:
+            pad = self.G - B
+            bank = torch.cat([bank, bank[:1].expand(pad, -1, -1)], dim=0)
+            lb = None if lb is None else [
+                None if x is None
+                else torch.cat([x, x[:1].expand(pad, *x.shape[1:])], dim=0)
+                for x in lb]
+        if self._graph_runner is None:
+            try:
+                self._graph_runner = GraphDecodeRunner(
+                    self.model, bank, layer_banks=lb)
+            except ValueError as e:     # flags decode_* absents de la config
+                print(f"worker {self.wid}: decode_graphs DÉSARMÉ ({e})",
+                      flush=True)
+                self._graph_dead = True
+                return None
+            self._graph_p0 = next(self.model.parameters()).data_ptr()
+            print(f"worker {self.wid}: decode_graphs ARMÉ (B={self.G})",
+                  flush=True)
+        try:
+            if next(self.model.parameters()).data_ptr() != self._graph_p0:
+                raise RuntimeError(
+                    "les poids ont changé d'adresse (load_state_dict "
+                    "assign ?) — les graphs pointent sur l'ancien storage")
+            self._graph_runner.rebind(bank, layer_banks=lb)
+            gen, lens = self._graph_runner.decode(
+                self.a_open.expand(self.G, -1), max_new=max_new,
+                stop_id=self.stop_id)
+        except ValueError:
+            # signature inattendue (structure layer_banks d'un autre bucket) :
+            # CE bucket repasse par generate, le runner reste armé
+            return None
+        except Exception as e:                          # noqa: BLE001
+            print(f"worker {self.wid}: decode_graphs DÉSARMÉ ({e}) — "
+                  f"retour à generate", flush=True)
+            self._graph_dead = True
+            if self._graph_runner is not None:
+                self._graph_runner.close()
+                self._graph_runner = None
+            return None
+        # le gate MoE dense revient à 1 entre deux appels : les autres
+        # forwards du worker (rollout, decode_lb) gardent leur chemin
+        for mod in self.model.modules():
+            if hasattr(mod, "dense_max_bt"):
+                mod.dense_max_bt = 1
+        if self._graph_runner.eager_only:
+            # capture ratée : les tokens rendus sont valides (eager largeur
+            # pleine) mais le gain est perdu — désarmer pour ne pas payer
+            # l'eager élargi à chaque bucket
+            print(f"worker {self.wid}: decode_graphs DÉSARMÉ (fallback eager "
+                  f"du runner, voir warning) — retour à generate", flush=True)
+            self._graph_dead = True
+            self._graph_runner.close()
+            self._graph_runner = None
+        return gen[:B], lens[:B]
+
     def _decode_calls(self, env, cands) -> list[str]:
         """Le tour d'appel de plusieurs rollouts, décodé EN UN SEUL batch.
 
@@ -452,10 +533,16 @@ class Worker:
                 None if ref[l] is None
                 else torch.cat([lbs[i][l] for i in idx], dim=0)
                 for l in range(len(ref))]
-            gen, lens = generate(self.model, self.a_open.expand(len(idx), -1),
-                                 bank=bank, layer_banks=lb, max_new=max_new,
-                                 stop_id=self.stop_id, amp=self.amp,
-                                 use_cache=self.decode_cache)
+            got = (self._graphs_decode(bank, lb, max_new)
+                   if self.decode_graphs else None)
+            if got is not None:
+                gen, lens = got
+            else:
+                gen, lens = generate(self.model,
+                                     self.a_open.expand(len(idx), -1),
+                                     bank=bank, layer_banks=lb,
+                                     max_new=max_new, stop_id=self.stop_id,
+                                     amp=self.amp, use_cache=self.decode_cache)
             for j, i in enumerate(idx):
                 texts[i] = self.tok.decode(gen[j, :int(lens[j])].tolist())
         return texts
@@ -1002,10 +1089,34 @@ def _self_test():
     probe = w.xdom_probe()
     assert {"r_own", "r_xdom", "r_always", "r_never"} <= set(probe)
 
+    # 8. decode_graphs : OFF par défaut (le chemin historique ne voit rien) ;
+    #    ON sur CPU = dégradation propre — _graphs_decode rend None (pas de
+    #    CUDA), generate reprend, un groupe sort quand même
+    assert w.decode_graphs is False and w._graph_runner is None
+    raw_g = copy.deepcopy(raw)
+    raw_g["rl"]["decode_graphs"] = True
+    wg = Worker(raw_g, 1, tok=tok, model=copy.deepcopy(model), envs=envs,
+                device=torch.device("cpu"))
+    wg.ids = (THINK, BLANK)
+    wg.stop_id, wg.max_new = IM_END, 4
+    wg.a_open = torch.tensor([[5]], dtype=torch.long)
+    wg.wait_weights()
+    assert wg.decode_graphs is True
+    assert wg._graphs_decode(torch.rand(2, wg.max_mem, 4), None, 4) is None, \
+        "sur CPU _graphs_decode doit rendre None (generate reprend)"
+    got = None
+    for _ in range(20):
+        got = wg.one_group()
+        if got:
+            break
+    assert got is not None and wg._graph_runner is None, \
+        "decode_graphs ON sur CPU : les groupes doivent sortir via generate"
+
     shutil.rmtree(root)
     print(f"rl_disagg self-test: OK (hub, store+staleness, worker groups "
           f"[{', '.join(sorted(envs_seen))}], learner step+republish, "
-          f"refresh, lives, xdom probe)")
+          f"refresh, lives, xdom probe, decode_graphs OFF défaut / ON-CPU "
+          f"dégrade en generate)")
 
 
 if __name__ == "__main__":
