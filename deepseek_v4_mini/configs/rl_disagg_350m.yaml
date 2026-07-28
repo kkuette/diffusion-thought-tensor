@@ -42,6 +42,12 @@ model:                                     # = v350 386M (sft_sota_350m verbatim
   mem_read_swiglu: true
   use_dual_stream: true
   balance_loss_weight: 1.0e-4
+  # decode_* : prérequis du GraphDecodeRunner (rl.decode_graphs ci-dessous).
+  # Bit-identiques au chemin historique partout ailleurs (prouvés torch.equal
+  # f64+f32, FINDINGS 2026-07-27) ; inertes à l'entraînement (gates no-grad).
+  decode_fuse: true
+  decode_dense_moe: true
+  decode_static_cache: true
 
 data:
   seq_len: 512
@@ -160,6 +166,13 @@ rl:
                                            # bascule MoE due aux ULP y est aussi
                                            # légitime qu'un autre tirage (déc.
                                            # 07-25) ; ×1.6 sur le goulot worker
+  decode_graphs: true                      # tour de réponse par CUDA graphs +
+                                           # rebind (même classe ULP, fp32 dans
+                                           # les graphs) : 400 tok/s agrégés
+                                           # par appel vs 82 eager — 4,9× sur
+                                           # le goulot worker (jobs 34-36,
+                                           # FINDINGS 07-28) ; dégrade en
+                                           # generate au moindre pépin
   disagg:
     root: ${TB_ROOT}/rl/disagg_350m
     publish_every: 1
