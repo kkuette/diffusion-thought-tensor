@@ -167,34 +167,56 @@ class GraphDecodeRunner:
         return out
 
     def decode(self, prefix: torch.Tensor, *, max_new: int = 48,
-               stop_id: int | None = None):
-        """Greedy, une ligne. Rend (gen [1, n], len utile) — contrat trim-é
-        de decode.generate, sans la machinerie multi-lignes.
+               stop_id: int | None = None, chunk: int = 16):
+        """Greedy batché — même contrat que decode.generate : rend
+        (gen [B, n], lens [B]), `stop_id` INCLUS dans lens, ce qui suit
+        `lens[i]` est du remplissage produit pendant que les autres lignes
+        finissaient. L'arrêt est par ligne, la boucle s'arrête quand TOUTES
+        ont émis stop_id (ou au plafond).
 
-        Mode croisière : dès que les lcm phases sont capturées et que stop_id
-        est None (pas de test d'arrêt ⇒ pas de sync par token), le reste de la
-        génération part en `_chain` — replays purs, argmax dans le graph."""
-        assert stop_id is None or self.B == 1, \
-            "stop_id à B > 1 : pas encore servi (arrêt par tranches à venir)"
+        Mode croisière : dès que les lcm phases sont capturées, le reste part
+        en `_chain` — replays purs, argmax dans le graph. Avec stop_id, la
+        chaîne avance par tranches de `chunk` tokens et scanne le JOURNAL une
+        fois par tranche (une sync par tranche, pas par token) ; le dépassement
+        au-delà du stop est du remplissage, comme dans generate."""
+        B, dev = self.B, prefix.device
         toks = []
         fed = prefix
-        left = max_new
-        while left > 0:
-            if (stop_id is None and self.chain and self._full
-                    and not self.eager_only and len(self.graphs) == self.lcm
-                    and fed.size(1) == 1):
-                toks.append(self._chain(fed, left))
-                left = 0
-                break
+        done = torch.zeros(B, dtype=torch.bool, device=dev)
+        lens = torch.full((B,), max_new, dtype=torch.long, device=dev)
+        n = 0
+        while n < max_new:
+            if (self.chain and self._full and not self.eager_only
+                    and len(self.graphs) == self.lcm and fed.size(1) == 1):
+                k = max_new - n if stop_id is None else min(chunk, max_new - n)
+                seg = self._chain(fed, k)               # [B, k]
+                toks.append(seg)
+                fed = seg[:, -1:]
+                if stop_id is not None:
+                    hits = seg == stop_id
+                    hit_any = hits.any(1) & ~done
+                    first = hits.int().argmax(1)        # 1er hit de la tranche
+                    lens = torch.where(hit_any, n + first + 1, lens)
+                    done = done | hit_any
+                    n += k
+                    if bool(done.all()):
+                        break
+                else:
+                    n += k
+                continue
             out = self.step(fed)
             nt = out["logits"][:, -1].argmax(-1, keepdim=True)
             toks.append(nt)
             fed = nt
-            left -= 1
-            if stop_id is not None and int(nt) == stop_id:
-                break
+            n += 1
+            if stop_id is not None:
+                hit = (nt.squeeze(1) == stop_id) & ~done
+                lens = torch.where(hit, torch.full_like(lens, n), lens)
+                done = done | hit
+                if bool(done.all()):
+                    break
         gen = torch.cat(toks, dim=1)
-        return gen, gen.size(1)
+        return gen, lens.clamp(max=n)
 
     # ── chemins internes ─────────────────────────────────────────────────────
 
@@ -404,10 +426,23 @@ def _selftest() -> None:
         pr = torch.randint(0, 61, (Bt, 5))
         runner = GraphDecodeRunner(m_on, bank_t)
         assert runner.eager_only or torch.cuda.is_available()
-        g1, n1 = runner.decode(pr, max_new=17)
+        g1, l1 = runner.decode(pr, max_new=17)
         g2, l2 = generate(m_on, pr, bank=bank_t, max_new=17, use_cache=True)
-        assert torch.equal(g1, g2[:, :n1]), \
+        assert torch.equal(g1, g2) and torch.equal(l1, l2), \
             f"runner eager ≠ generate (B={Bt})\n  runner  : {g1}\n  generate: {g2}"
+        # …et le contrat stop_id (arrêt par ligne, lens stop-inclus,
+        # remplissage après) : un stop tiré DES tokens générés garantit le
+        # hit. Runner FRAIS : un runner porte l'état d'UN décodage (rebind à
+        # venir pour la réutilisation).
+        runner.close()
+        runner = GraphDecodeRunner(m_on, bank_t)
+        sid = int(g2[Bt - 1, 7])
+        g3, l3 = runner.decode(pr, max_new=17, stop_id=sid)
+        g4, l4 = generate(m_on, pr, bank=bank_t, max_new=17, stop_id=sid,
+                          use_cache=True)
+        assert torch.equal(g3, g4) and torch.equal(l3, l4), \
+            f"contrat stop_id ≠ generate (B={Bt}, stop={sid})\n" \
+            f"  runner  : {g3} lens={l3}\n  generate: {g4} lens={l4}"
         runner.close()
 
     # 3. injection RoPE : buffers remplis = calcul en place, au bit
