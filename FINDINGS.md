@@ -37,6 +37,54 @@ test this — before scale.
 
 ---
 
+## 2026-07-28 — runner rollout : VÉRIFIÉ AU BIT sur GPU, B=8 à 1,13 ms/token-ligne (10,8× l'eager batché) ; 3e bug trouvé et fermé (couture du cycle)
+
+Chantier ouvert sur décision user (banque FIFO fixe ⇒ plus d'obstacle de
+shape). La lecture du vrai chemin rollout a d'abord tout simplifié : le
+décodage des workers est GREEDY (`temp` ne sert qu'à boundary_step), sans
+write en vol (writes aux frontières de chunks), batché par groupe — la cible
+est le `generate` batché du tour de réponse (« le goulot de ce worker »).
+
+**3e bug, trouvé par analyse — la COUTURE DU CYCLE.** L'état inter-pas
+(wk/wv/hist) circulait par réassignation python (cat ⇒ nouveau tenseur pool à
+chaque pas) : le graph de la PREMIÈRE phase capturée lisait pour toujours les
+tenseurs eager du warmup, jamais réécrits par la dernière phase du cycle —
+1 pas sur lcm attendait sur des fenêtres FIGÉES à la capture, dans tous les
+runs graphs antérieurs. Invisible au chrono ET au self-test CPU (émulation
+eager). Fix : en largeur pleine, l'état vit dans des buffers STABLES écrits
+en place (`_cache_advance`, `sbufs` + `hist_len` par phase) — chaque graph
+lit/écrit les MÊMES adresses. C'est aussi le prérequis du rebind (réutiliser
+les graphs d'un décodage au suivant).
+
+**Leçon de méthode** : chain vs step (deux runners graphs) ne détecte PAS
+cette classe — les deux gèlent les mêmes adresses et restent d'accord entre
+eux même faux. La référence qui l'attrape est l'EAGER LARGEUR PLEINE sur GPU
+(le programme du graph émulé hors capture) — c'est le mode `--verify` du
+bench, désormais dans le protocole.
+
+**Job 34 (rig gpu5, ckpt valsif_stair, fp32)** :
+
+| bras | B=1 | B=8 |
+|---|---|---|
+| verify chain/step/stop vs eager largeur pleine | **TOUT OK (au bit)** | **TOUT OK (au bit)** |
+| graphs (step ou chain), ms/pas batché | 6,5–6,6 | 9,0 |
+| eager cache=on batché, ms/pas | 75,2 | 97,5 |
+
+Lecture B=8 : 9,0 ms pour 8 lignes = **1,13 ms/token-ligne = 888 tok/s
+agrégés par GPU**, contre 12,2 ms/token-ligne (82 tok/s) pour l'eager batché
+actuel des workers — **10,8×**, et le batch est quasi gratuit (9,0 vs 6,5 :
+launch-bound, le calcul en plus se cache sous la latence). Non-régression
+B=1 : 6,5 ms inchangé, les copies des buffers stables ne coûtent rien.
+
+Livré (commits dc723c9..0116b2b) : B baké au constructeur + gate MoE
+`dense_max_bt` runtime (élargi/restauré par le runner, le chemin eager
+bit-exact reste BT==1), `decode()` au contrat exact de `decode.generate`
+(stop par ligne, lens stop-inclus, scan par tranche = 1 sync/tranche),
+`--verify` + `--batch` au bench. Reste : rebind (reset des caches en place,
+graphs capturés UNE fois par worker), intégration rl_disagg au prochain run.
+
+---
+
 ## 2026-07-27 (nuit) — le régime établi des graphs est à 6,5 ms/token (153 tok/s) ; bf16-autocast est une PERTE ; un bug de capture et un bug de mémo corrigés
 
 Job 33 (rig gpu5, 3070 Ti, ckpt `v350_sft_valsif_stair`, B=1, 192 tokens,
