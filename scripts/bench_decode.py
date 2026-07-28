@@ -385,8 +385,6 @@ def run_time(raw, a):
         # bras CUDA graphs : GraphDecodeRunner (B=1, greedy). Sur CPU il
         # dégrade en eager et le dit — c'est le « préparé, pas lancé ».
         from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
-        if a.batch != 1:
-            sys.exit("[bench] --cuda-graphs : B == 1 requis (gate MoE dense)")
         amp = None if a.amp == "none" else a.amp
         runner = GraphDecodeRunner(model, bank, amp=amp)
         if runner.eager_only:
@@ -459,6 +457,106 @@ def run_time(raw, a):
               f"{a.tokens / dt:.2f} tok/s  ({1e3 * dt / a.tokens:.1f} ms/token)")
 
 
+# ── verify GPU (runner graphs vs eager largeur-pleine) ───────────────────────
+
+def _full_eager_ref(model, bank, prefix, n_tokens, warmup):
+    """Le programme du graph étendu, exécuté EAGER en largeur pleine sur GPU —
+    la référence qui attrape la classe « couture du cycle » : un graph qui lit
+    des adresses périmées diverge d'elle, alors que chain vs step (deux
+    runners graphs) gèlent les mêmes adresses et restent d'accord entre eux."""
+    from deepseek_v4_mini import attention
+    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    assert n_tokens > warmup + 1, "verify : tokens ≤ warmup, rien à comparer"
+    r = GraphDecodeRunner(model, bank, warmup=warmup)
+    toks = []
+    with torch.no_grad():
+        o = r.step(prefix)
+        fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+        toks.append(fed)
+        while r._singles < r.warmup:            # même gate que decode() : la
+            o = r.step(fed)                     # trajectoire s'aligne 1:1
+            fed = o["logits"][:, -1].argmax(-1, keepdim=True)
+            toks.append(fed)
+        r.eager_only = True                     # PAS de capture : eager pur
+        r._enter_full()
+        r._in_buf.copy_(fed)
+        r._wptr.zero_()
+        rest = n_tokens - len(toks)
+        for _ in range(rest):
+            attention._ROPE_OVERRIDE = r._rope_bufs
+            try:
+                r._graph_head()
+                o = r._eager(r._in_buf)
+                r._graph_tail(o)
+            finally:
+                attention._ROPE_OVERRIDE = None
+        out = torch.cat([torch.cat(toks, dim=1),
+                         r._out_toks[:rest].t()], dim=1).clone()
+    r.close()
+    return out
+
+
+def run_verify(raw, a):
+    """A/B GPU des replays réels : graphs (chain ET step) vs eager largeur
+    pleine — trois trajectoires greedy du même préfixe, torch.equal exigé.
+    Ni le chrono ni le self-test CPU (émulation eager) ne voient cette classe
+    de bugs. fp32 seulement (sous autocast, eager et graph recastent
+    différemment — la référence n'est plus comparable)."""
+    if a.device != "cuda":
+        sys.exit("[bench] --verify : GPU requis (on teste les replays réels)")
+    _gpu_guard(a.force)
+    if a.amp != "none":
+        sys.exit("[bench] --verify : fp32 seulement (référence eager comparable)")
+    from deepseek_v4_mini.decode import trim
+    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    flags = _parse_flags(a.flags)
+    model, cfg, prefix, bank = _mk_model(raw, a, flags)
+    N, warm = a.tokens, 8
+    print(f"\n== verify GPU (B={a.batch}, {N} tokens/bras) ==")
+    ref = _full_eager_ref(model, bank, prefix, N, warm)
+
+    fails = 0
+    runs = {}
+    for label, chain in (("chain", True), ("step", False)):
+        r = GraphDecodeRunner(model, bank, chain=chain, warmup=warm)
+        g, l = r.decode(prefix, max_new=N)
+        armed = not r.eager_only and len(r.graphs) == r.lcm
+        r.close()
+        del r
+        torch.cuda.empty_cache()
+        if not armed:
+            print(f"{label:>6} : graphs INACTIFS — test nul")
+            fails += 1
+            continue
+        same = torch.equal(g, ref)              # trajectoires alignées 1:1
+        runs[label] = g
+        print(f"{label:>6} : "
+              + ("OK — == eager largeur pleine au bit" if same
+                 else "DIVERGE de la référence eager"))
+        if not same:
+            d = (g != ref).any(0).int().argmax().item()
+            print(f"        première divergence au token {d}/{g.size(1)}\n"
+                  f"        graphs : {g[:, max(0, d - 2):d + 3]}\n"
+                  f"        eager  : {ref[:, max(0, d - 2):d + 3]}")
+            fails += 1
+
+    # contrat stop_id : chaîne par tranches vs pilotage step, lens compris
+    if "chain" in runs:
+        sid = int(runs["chain"][0, ref.size(1) * 2 // 3])
+        r3 = GraphDecodeRunner(model, bank, chain=True, warmup=warm)
+        g3, l3 = r3.decode(prefix, max_new=N, stop_id=sid, chunk=8)
+        r3.close(); del r3; torch.cuda.empty_cache()
+        r4 = GraphDecodeRunner(model, bank, chain=False, warmup=warm)
+        g4, l4 = r4.decode(prefix, max_new=N, stop_id=sid)
+        r4.close(); del r4; torch.cuda.empty_cache()
+        ok = torch.equal(l3, l4) and all(
+            torch.equal(x, y) for x, y in zip(trim(g3, l3), trim(g4, l4)))
+        print(f"  stop : {'OK — tranches == step (lens + lignes trimées)' if ok else 'DIVERGE'}"
+              f"  (stop_id={sid}, lens={l3.tolist()})")
+        fails += 0 if ok else 1
+    print("verify:", "TOUT OK" if fails == 0 else f"{fails} ÉCHEC(S)")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _parse_flags(spec: str) -> list[str]:
@@ -490,6 +588,9 @@ def main(argv=None):
     p.add_argument("--amp", default="none", choices=("none", "bf16"),
                    help="autocast bf16 dans le bras --cuda-graphs (classe ULP)")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--verify", action="store_true",
+                   help="A/B GPU des replays réels : graphs (chain+step+stop) "
+                        "vs eager largeur pleine, torch.equal")
     p.add_argument("--fingerprint", action="store_true")
     p.add_argument("--ab-check", dest="ab_check", action="store_true")
     p.add_argument("--report", default="text", choices=("text", "md"))
@@ -507,9 +608,11 @@ def main(argv=None):
         run_fingerprint(raw, a)
     if a.ab_check:
         run_ab(raw, a)
+    if a.verify:
+        run_verify(raw, a)
     if a.time:
         run_time(raw, a)
-    if not (a.fingerprint or a.ab_check or a.time):
+    if not (a.fingerprint or a.ab_check or a.verify or a.time):
         run_census(raw, a, md=(a.report == "md"))
 
 
