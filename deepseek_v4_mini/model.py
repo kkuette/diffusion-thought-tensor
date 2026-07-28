@@ -346,6 +346,26 @@ class DualModalBlock(nn.Module):
         self._fw_memo = (bank, bank._version, A, Bm) if memo_ok else None
         return A, Bm
 
+    @torch.no_grad()
+    def _fw_refresh(self) -> None:
+        """Rebind du GraphDecodeRunner : la banque mémoïsée a été réécrite EN
+        PLACE (copy_ dans le buffer du runner) — son contenu a changé mais les
+        graphs capturés lisent A/Bm à leurs adresses de capture. Recalculer et
+        recopier DANS ces tenseurs (jamais réallouer), puis re-signer le mémo
+        avec la version courante pour que les forwards eager suivants (préfixe
+        du prochain décodage) fassent HIT. Appelé par le runner uniquement —
+        le forward garde sa logique miss-⇒-nouveaux-tenseurs."""
+        if self._fw_memo is None:
+            return
+        mb, _, A, Bm = self._fw_memo
+        B, M, _ = mb.shape
+        r = self.read_rank
+        _na = 2 if self.fw_swiglu else 1
+        d = self.fw_B.out_features // r
+        A.copy_(self.fw_A(mb).view(B, M, _na, r, d))
+        Bm.copy_(self.fw_B(mb).view(B, M, d, r))
+        self._fw_memo = (mb, mb._version, A, Bm)
+
     def _cross_modal(self, h: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
         """
         h    : [B, T, d]         – current text representations
@@ -707,6 +727,32 @@ def _selftest() -> None:
     assert le.dtype == torch.float32 and \
         m32.blocks[0]._fw_memo[2].dtype == torch.float32, \
         "mémo autocast servi à un forward eager (garde dtype morte)"
+    # _fw_refresh (rebind du GraphDecodeRunner) : la banque mémoïsée réécrite
+    # EN PLACE, le refresh recalcule A/Bm DANS les tenseurs mémoïsés — mêmes
+    # adresses (les graphs les lisent), mêmes valeurs qu'un recalcul frais, et
+    # le mémo re-signé fait HIT au forward suivant
+    with torch.no_grad():
+        bank_r = bank64.clone()
+        m_on.eval()
+        m_on(pr, init_mem=bank_r, write=False)          # mémo chaud
+        blk = m_on.blocks[0]
+        _, _, A0, B0 = blk._fw_memo
+        ida, idb = id(A0), id(B0)
+        bank_r.copy_(torch.randn_like(bank_r))          # rebind : copy_ en place
+        for b in m_on.blocks:
+            b._fw_refresh()
+        mb2, mv2, A2, B2 = blk._fw_memo
+        assert id(A2) == ida and id(B2) == idb, \
+            "_fw_refresh a réalloué A/Bm — les graphs pointent sur l'ancien storage"
+        assert mb2 is bank_r and mv2 == bank_r._version, "mémo mal re-signé"
+        lf = m_on(pr, init_mem=bank_r, write=False)["logits"]
+        lg = m_off(pr, init_mem=bank_r, write=False)["logits"]
+        assert torch.equal(lf, lg), "_fw_refresh : valeurs ≠ recalcul frais"
+        assert id(blk._fw_memo[2]) == ida, \
+            "le forward post-refresh devait faire HIT (mémo re-signé)"
+        blk._fw_memo = None
+        blk._fw_refresh()                               # mémo froid : no-op
+
     # sous gradient, le mémo est purgé : l'entraînement reprojette à chaque pas
     bg = bank64.clone().requires_grad_(True)
     m_on.train()
@@ -719,7 +765,9 @@ def _selftest() -> None:
           "déterminisme eval, pad_mask, read swiglu/SN, poids liés, "
           "decode_fuse : fw_A/fw_B hoistés BIT-identiques — mémo servi 1×/"
           "generate, invalidé par write (identité), mutation (_version) ET "
-          "autocast (dtype), purgé sous gradient)")
+          "autocast (dtype), purgé sous gradient ; _fw_refresh : A/Bm recopiés "
+          "EN PLACE aux mêmes adresses, valeurs == recalcul frais, mémo "
+          "re-signé qui fait hit)")
 
 
 if __name__ == "__main__":
