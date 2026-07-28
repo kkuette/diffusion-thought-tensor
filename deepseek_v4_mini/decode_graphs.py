@@ -363,8 +363,14 @@ class GraphDecodeRunner:
                 pass
             return self._eager(fed)
         finally:
-            if self.eager_only:
-                attention._ROPE_OVERRIDE = None
+            # TOUJOURS rendre l'override : il ne sert qu'à l'ENREGISTREMENT
+            # (les replays ne font pas tourner le python, la capture suivante
+            # le repose). Le laisser posé empoisonnait tout forward eager
+            # ultérieur du même process — les singles post-rebind lisaient la
+            # RoPE de la DERNIÈRE position du décodage précédent (job 35 :
+            # divergence au 1er single sur préfixe court, invisible sur
+            # préfixe long qui n'a aucun single).
+            attention._ROPE_OVERRIDE = None
 
     def _replay(self, phase, fed):
         g, out = self.graphs[phase]
@@ -432,6 +438,9 @@ class GraphDecodeRunner:
                 c.reset()
         self.pos = 0
         self._full = False
+        # ceinture : aucun override RoPE ne doit survivre jusqu'aux singles
+        # eager du prochain décodage (la leçon du job 35)
+        attention._ROPE_OVERRIDE = None
         for mod in self.model.modules():
             if hasattr(mod, "dense_max_bt"):
                 mod.dense_max_bt = 1
@@ -712,7 +721,14 @@ def _selftest() -> None:
                     for b in m_on.blocks if b._fw_memo is not None]
         assert memo_ids, "le mémo fw doit être chaud (entrées des graphs)"
 
+        # sur GPU, _capture laisse l'override RoPE posé entre deux captures —
+        # le simuler AVANT le rebind : les singles eager du décodage 2 ne
+        # doivent pas lire la RoPE de la dernière position du décodage 1
+        # (job 35 : divergence au 1er single sur préfixe court)
+        attention._ROPE_OVERRIDE = ra._rope_bufs
         ra.rebind(bank_b)                               # banque NEUVE
+        assert attention._ROPE_OVERRIDE is None, \
+            "rebind doit rendre l'override RoPE (singles eager empoisonnés)"
         assert all(mod.dense_max_bt == 1 for mod in m_on.modules()
                    if hasattr(mod, "dense_max_bt")), \
             "rebind doit restaurer le gate MoE (singles = chemin normal)"
