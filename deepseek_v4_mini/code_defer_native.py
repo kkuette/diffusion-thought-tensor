@@ -118,13 +118,69 @@ def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None,
     return loss, o["mem_bank"], ce_t, ce_lane
 
 
-def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False):
+def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False,
+            pool=None):
     """Greedy-decode max_new tokens after prefix from the CURRENT bank (reads
     only). Une seule ligne : l'éval décode conv par conv. Voir decode.generate
-    pour la boucle (et pour le décodage batché, qui sert au RL)."""
+    pour la boucle (et pour le décodage batché, qui sert au RL).
+
+    `pool` (opt-in `training.decode_graphs`) : décodage par CUDA graphs via un
+    _GraphPool — ~14x sur le pas de décodage (bench 2026-07-28). Classe ULP
+    (largeur pleine, cf. decode_graphs) : les DEUX bras d'un palier passent par
+    le même chemin, la comparaison reste interne. Le bras ablaté (bank None)
+    reste eager : GraphDecodeRunner exige une banque explicite, et ce bras est
+    décodé UNE fois par palier de toute façon."""
+    if pool is not None and bank is not None:
+        out = pool.decode(prefix, bank, max_new, stop_id)
+        if out is not None:
+            return out
     gen, lens = generate(model, prefix, bank=bank, max_new=max_new,
                          stop_id=stop_id, amp=amp, use_cache=use_cache)
     return gen[:, :int(lens[0])]
+
+
+class _GraphPool:
+    """Pool de GraphDecodeRunner pour les décodages d'éval — un runner par
+    forme de banque (B=1, slots 5..max_mem sans cascade), armement payé à la
+    première rencontre de chaque forme puis rebind. Vie = UN appel
+    d'evaluate_math (close() en sortie) : pas de VRAM résidente entre paliers,
+    et les poids ayant bougé entre deux paliers, on ne rejoue jamais des
+    graphs capturés sous d'anciens A/Bm sans rebind. Tout échec bascule
+    l'éval en repli eager BRUYANT et définitif (piège WSL2 : jamais
+    silencieux)."""
+
+    def __init__(self, model):
+        self.model = model
+        self.pool = {}
+        self.dead = False
+
+    def decode(self, prefix, bank, max_new, stop_id):
+        if self.dead:
+            return None
+        try:
+            from .decode_graphs import GraphDecodeRunner
+            key = (tuple(bank.shape), str(bank.dtype))
+            r = self.pool.get(key)
+            if r is None:
+                r = self.pool[key] = GraphDecodeRunner(self.model, bank)
+            else:
+                r.rebind(bank)
+            gen, lens = r.decode(prefix, max_new=max_new, stop_id=stop_id)
+            return gen[:, :int(lens[0])]
+        except Exception:
+            import traceback
+            print(f"decode_graphs KO — repli eager pour le reste du palier\n"
+                  f"{traceback.format_exc()}", flush=True)
+            self.dead = True
+            self.close()
+            return None
+
+    def close(self):
+        for r in self.pool.values():
+            r.close()
+        self.pool.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _age_bucket(age):
@@ -139,7 +195,7 @@ AGE_BUCKETS = ("<=4", "5-8", "9-16", ">16")
 
 @torch.no_grad()
 def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
-                  use_cache=False, decode=True):
+                  use_cache=False, decode=True, graphs=False):
     """Chat eval (math_school | persona): canonical segments advance the bank
     (teacher-forced writes). Only the GRADED assistant turns (the last
     len(truths) — the answers to memory queries) are greedy-decoded TWICE —
@@ -181,6 +237,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     agg = {}
     by_age = {}                       # bucket -> [n, dg_sum, dnll_sum, n_dg]
     abl_txt1 = None                   # le bras ablaté, décodé une fois (docstring)
+    pool = _GraphPool(model) if (graphs and decode
+                                 and next(model.parameters()).is_cuda) else None
     for _ in range(n_conv):
         conv = stream.next_conv()
         info = conv.get("info", {})
@@ -203,7 +261,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                         model, a_open, None, max_new, stop_id, amp,
                         use_cache)[0].tolist())
                 live_txt.append(tok.decode(_greedy(
-                    model, a_open, bank, max_new, stop_id, amp, use_cache)[0].tolist()))
+                    model, a_open, bank, max_new, stop_id, amp, use_cache,
+                    pool=pool)[0].tolist()))
                 abl_txt.append(abl_txt1)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 o = model(x, init_mem=bank)
@@ -241,6 +300,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
             a[3] += grade(conv, abl_txt)
             a[8] += 1
         a[4] += 1
+    if pool is not None:
+        pool.close()                  # pas de VRAM graphs résidente entre paliers
     model.train()
     out = {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / max(v[8], 1),
                "grade_abl": v[3] / max(v[8], 1), "n": v[4], "n_dec": v[8],
@@ -542,6 +603,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
     decode_cache = bool(t.get("decode_cache", False))
     if decode_cache:
         print("decode_cache: ON (cache KV aux décodages d'éval)", flush=True)
+    # decode_graphs (opt-in) : les décodages du bras LIVE d'evaluate_math
+    # passent par CUDA graphs (_GraphPool) — exige les 3 flags decode_* dans
+    # le bloc model. Classe ULP (cf. decode_graphs.py) : cohérent PAR RUN,
+    # ne pas comparer un grade graphs à un grade cache d'un autre run.
+    decode_graphs = bool(t.get("decode_graphs", False))
+    if decode_graphs:
+        missing = [f for f in ("decode_fuse", "decode_dense_moe",
+                               "decode_static_cache")
+                   if not bool(getattr(cfg, f, False))]
+        assert not missing, \
+            f"training.decode_graphs exige les flags model {missing}"
+        print("decode_graphs: ON (CUDA graphs aux décodages d'éval live)",
+              flush=True)
 
     # B4 (backlog 2026-07-13) : canal DeltaNet inter-tours À LA PLACE du carry
     # de banque — modèle strictement inchangé, seul le canal inter-chunks change
@@ -686,7 +760,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
         _ChatStream = chat_stream_class(sname)
         gen_kw = dict(chat_cfg.get("gen", {}) or {})
         chat_stream = _ChatStream(tok, seed=train_seed + 1, **gen_kw)
-        chat_eval = _ChatStream(tok, seed=1234, **gen_kw)
+        # chat.eval_gen (opt-in) : bloc gen COMPLET de remplacement pour le
+        # stream d'ÉVAL — pas un merge (les gen sont imbriqués). Cas d'usage :
+        # pool_split train/eval du stream persona — l'éval en palier porte
+        # alors sur des valeurs JAMAIS vues du train (rappel, pas recognition).
+        eval_kw = dict(chat_cfg.get("eval_gen") or {}) or gen_kw
+        chat_eval = _ChatStream(tok, seed=1234, **eval_kw)
         print(f"chat mode ON: {sname} p_chat {p_chat} weight {chat_w} "
               f"eval_convs {chat_eval_convs} (masked-CE SFT convs in the "
               f"life carry)", flush=True)
@@ -1525,7 +1604,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                           or step == steps)
                 mm = evaluate_math(model, chat_eval, tok, device, amp,
                                    chat_eval_convs, chat_max_new,
-                                   use_cache=decode_cache, decode=dec_on)
+                                   use_cache=decode_cache, decode=dec_on,
+                                   graphs=decode_graphs)
                 by_age = mm.pop("_by_age", {})
                 for kind in sorted(mm):
                     v = mm[kind]

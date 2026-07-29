@@ -65,20 +65,89 @@ from .paths import load_yaml
 PET_TYPES = ["dog", "cat", "parrot", "hamster", "rabbit"]
 PET_NAMES = ["Biscuit", "Waffles", "Mochi", "Pretzel", "Noodle", "Pistachio",
              "Clementine", "Marzipan", "Turnip", "Gizmo", "Pumpernickel",
-             "Crouton", "Paprika", "Fondue", "Gnocchi"]
+             "Crouton", "Paprika", "Fondue", "Gnocchi", "Strudel", "Nimbus",
+             "Quibble", "Tapioca", "Whistle", "Barnacle", "Chutney", "Dumpling",
+             "Eclair", "Flapjack", "Gherkin", "Havarti", "Jicama", "Kumquat",
+             "Loofah", "Meringue", "Nutmeg", "Orzo", "Pierogi", "Quinoa",
+             "Rutabaga", "Saffron", "Tamarind", "Udon", "Vindaloo", "Wasabi",
+             "Yam", "Ziti", "Brioche", "Cannoli", "Danish", "Empanada",
+             "Focaccia", "Galette", "Hoagie", "Icicle", "Jalapeno", "Knish",
+             "Latke", "Muffin", "Nacho", "Oatcake", "Popover", "Quesadilla",
+             "Rugelach", "Scone", "Toffee", "Ugli", "Vol-au-vent", "Whoopie"]
 PEOPLE = ["Ottilie", "Barnaby", "Perpetua", "Ignatius", "Wilhelmina",
           "Thaddeus", "Euphemia", "Leopoldine", "Casimir", "Apollonia",
-          "Bartholomew", "Seraphina", "Archibald", "Philomena", "Montgomery"]
+          "Bartholomew", "Seraphina", "Archibald", "Philomena", "Montgomery",
+          "Anselme", "Brunhilde", "Cornelius", "Dorothea", "Evariste",
+          "Fernanda", "Gustave", "Henrietta", "Isidore", "Josephine",
+          "Kazimierz", "Lucretia", "Maximilian", "Nataliya", "Octavia",
+          "Percival", "Quentin", "Rosalind", "Sylvester", "Theodora",
+          "Ulysses", "Valentina", "Wendeline", "Xavier", "Yolanda",
+          "Zebediah", "Ambrosine", "Balthazar", "Celestine", "Demetrius",
+          "Ernestine", "Ferdinand", "Griselda", "Hieronymus", "Isolde",
+          "Jeremiah", "Katarzyna", "Lysander", "Morwenna", "Nikodem",
+          "Ophelia", "Prudence", "Quirinus", "Rembrandt", "Sigrid",
+          "Tobias", "Ursuline", "Vladimir", "Winifred"]
 CITIES = ["Ljubljana", "Tromso", "Valparaiso", "Guanajuato", "Fremantle",
           "Coimbra", "Rovaniemi", "Antofagasta", "Trondheim", "Ouarzazate",
-          "Matsumoto", "Bruges", "Cuenca", "Galway", "Dubrovnik"]
+          "Matsumoto", "Bruges", "Cuenca", "Galway", "Dubrovnik", "Aberdeen",
+          "Bariloche", "Cartagena", "Dunedin", "Esbjerg", "Fukuoka",
+          "Gdansk", "Haarlem", "Innsbruck", "Jodhpur", "Kagoshima",
+          "Lausanne", "Mendoza", "Nagasaki", "Oulu", "Palermo", "Quimper",
+          "Reykjavik", "Salamanca", "Tampere", "Uppsala", "Vilnius",
+          "Wellington", "Yerevan", "Zagreb", "Arequipa", "Bergamo",
+          "Cordoba", "Debrecen", "Eindhoven", "Fortaleza", "Groningen",
+          "Heidelberg", "Izmir", "Jaipur", "Kandy", "Leuven", "Maribor",
+          "Nantes", "Ostrava", "Plovdiv", "Quito", "Rosario", "Segovia",
+          "Tbilisi", "Utrecht", "Verona", "Winterthur", "Zaragoza"]
 JOBS = ["beekeeper", "luthier", "cartographer", "glassblower", "falconer",
-        "typesetter", "archivist", "milliner", "cooper", "saddler"]
+        "typesetter", "archivist", "milliner", "cooper", "saddler",
+        "apiarist", "blacksmith", "calligrapher", "distiller", "engraver",
+        "fletcher", "gilder", "horologist", "illustrator", "jeweler",
+        "knifemaker", "lacemaker", "mosaicist", "notary", "organist",
+        "potter", "quiltmaker", "roofer", "stonemason", "tanner",
+        "upholsterer", "vintner", "weaver", "woodturner", "zookeeper",
+        "auctioneer", "bookbinder", "chandler", "dyer", "embalmer",
+        "farrier", "goldsmith", "hatmaker", "ironmonger", "locksmith"]
 COLORS = ["crimson", "turquoise", "vermilion", "chartreuse", "indigo",
-          "ochre", "magenta", "cerulean"]
+          "ochre", "magenta", "cerulean", "amaranth", "burgundy", "cobalt",
+          "damson", "emerald", "fuchsia", "gamboge", "heliotrope",
+          "incarnadine", "jasper", "lilac", "mauve", "nankeen", "olivine",
+          "periwinkle", "russet", "sepia", "teal", "ultramarine", "viridian",
+          "wisteria", "xanadu", "saffron", "zaffre"]
 FOODS = ["lasagna", "gazpacho", "ratatouille", "moussaka", "tabbouleh",
-         "goulash", "paella", "borscht", "falafel", "tiramisu"]
+         "goulash", "paella", "borscht", "falafel", "tiramisu", "bibimbap",
+         "cassoulet", "dolma", "enchilada", "fondue", "gumbo", "harira",
+         "injera", "jambalaya", "kimchi", "laksa", "minestrone", "nasi goreng",
+         "okonomiyaki", "pho", "quiche", "risotto", "souvlaki", "tagine",
+         "udon", "vichyssoise", "wonton", "yakitori", "zabaglione",
+         "arancini", "bouillabaisse", "ceviche", "dumplings", "empanadas",
+         "frittata", "gnocchi", "hummus", "idli", "jollof rice"]
 SIBLINGS = ["sister", "brother"]
+
+# ── pools GÉNÉRÉS (slots combinatoires) ──────────────────────────────────────
+# Faits « codes » : l'espace de valeurs est combinatoire (~10^4-10^6), donc
+# effectivement inépuisable — l'analogue chat des clés OOV du keyed retrieval
+# dsv4mini. rng DÉDIÉ à seed FIXE : les pools sont identiques entre instances
+# (train / eval / resume), indépendants du seed du stream. Le grader
+# word-boundary ne peut pas false-positiver sur un code (jamais babbled).
+
+
+def _gen_pools(n: int = 2500):
+    g = random.Random(20260728)
+    codes = set()
+    while len(codes) < n:                       # code porte/casier : 4-6 chiffres
+        codes.add(str(g.randint(1000, 999999)))
+    refs = set()
+    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"        # sans I/O (lisibilité)
+    while len(refs) < n:                        # réf dossier : XX-12345
+        refs.add(f"{g.choice(letters)}{g.choice(letters)}-{g.randint(10000, 99999)}")
+    plates = set()
+    while len(plates) < n:                      # plaque : ABC-123
+        plates.add(f"{''.join(g.choice(letters) for _ in range(3))}-{g.randint(100, 999)}")
+    return sorted(codes), sorted(refs), sorted(plates)
+
+
+CODES, REFS, PLATES = _gen_pools()
 
 # slot -> (statements, questions, answers, update-statements, pool)
 # {v} = value, {p} = pet type / sibling word (fixed per conversation).
@@ -160,6 +229,42 @@ SLOTS = {
         ["My tastes changed, these days my favorite dish is {v}."],
         FOODS,
     ),
+    "code": (
+        ["The code for my building door is {v}.",
+         "I set my locker combination to {v}.",
+         "Just so you know, the garage code is {v}."],
+        ["What is the door code I told you?",
+         "Do you remember my locker combination?",
+         "What was that code I mentioned?"],
+        ["The code is {v}.",
+         "You told me the code is {v}."],
+        ["They changed the code, it's {v} now.",
+         "I had to reset the combination, it's {v} these days."],
+        CODES,
+    ),
+    "ref": (
+        ["My booking reference is {v}.",
+         "The case number they gave me is {v}.",
+         "For the record, my file reference is {v}."],
+        ["What is my booking reference?",
+         "Do you remember my case number?",
+         "What was the reference I gave you?"],
+        ["Your reference is {v}.",
+         "You said the reference is {v}."],
+        ["They reissued my booking, the new reference is {v}.",
+         "Update: the case number changed to {v}."],
+        REFS,
+    ),
+    "plate": (
+        ["My car's license plate is {v}.",
+         "I finally memorized my plate number: {v}."],
+        ["What is my license plate?",
+         "Do you remember my plate number?"],
+        ["Your license plate is {v}.",
+         "You said your plate is {v}."],
+        ["I got new plates, it reads {v} now."],
+        PLATES,
+    ),
 }
 
 ACK_TMPL = [
@@ -234,6 +339,16 @@ def extract_filler_pairs(rows, tok, *, max_tok: int = 96, cap: int = 20000):
     return pairs
 
 
+def _split_of(v: str) -> str:
+    """Partition DÉTERMINISTE des valeurs (indépendante de tout rng) :
+    ~20 % en 'eval'. Le held-out est la seule preuve que le rappel n'est pas
+    de la recognition de répertoire fermé (leçon dsv4mini : distill essential
+    + held-out fails)."""
+    import hashlib
+    h = int(hashlib.sha1(v.encode()).hexdigest(), 16)
+    return "eval" if h % 5 == 0 else "train"
+
+
 def _find_sub(seq: list, sub: list):
     """Premier span [i, j) où seq[i:j] == sub, sinon None."""
     if not sub:
@@ -278,9 +393,25 @@ class PersonaChatStream:
                  real_cache_dir: str = None,
                  surprisal_ref: str = None, surprisal_device: str = "cpu",
                  surprisal_alpha: float = 2.0, surprisal_mode: str = "nll",
-                 sif_a: float = 1e-4, seed: int = 0) -> None:
+                 sif_a: float = 1e-4, pool_split: str = "all",
+                 seed: int = 0) -> None:
         self.tok = tok
         self.rng = random.Random(seed)
+        # pools filtrés par split (val_split déterministe par valeur) : un run
+        # s'entraîne sur 'train' et s'évalue sur 'eval' — des valeurs JAMAIS
+        # vues. 'all' = comportement historique. Un slot dont le sous-pool est
+        # trop maigre pour fait + supersession est retiré de ce split.
+        assert pool_split in ("all", "train", "eval"), pool_split
+        self.pool_split = pool_split
+        if pool_split == "all":
+            self.slots = dict(SLOTS)
+        else:
+            self.slots = {}
+            for k, (st, qs, ans, upd, pool) in SLOTS.items():
+                sub = [v for v in pool if _split_of(v) == pool_split]
+                if len(sub) >= 4:
+                    self.slots[k] = (st, qs, ans, upd, sub)
+            assert self.slots, f"aucun slot ne survit au split {pool_split}"
         self.p_smalltalk = float(p_smalltalk)
         self.n_facts = tuple(int(v) for v in n_facts)
         self.n_queries = tuple(int(v) for v in n_queries)
@@ -495,8 +626,8 @@ class PersonaChatStream:
         return [self._user(u), self._assistant(a)]
 
     def _sample_fact(self, used_slots: set, used_vals: set):
-        slot = self.rng.choice([s for s in SLOTS if s not in used_slots])
-        st, qs, ans, upd, pool = SLOTS[slot]
+        slot = self.rng.choice([s for s in self.slots if s not in used_slots])
+        st, qs, ans, upd, pool = self.slots[slot]
         v = self.rng.choice([x for x in pool if x not in used_vals])
         p = self.rng.choice(PET_TYPES if slot == "pet"
                             else SIBLINGS if slot == "sibling" else [""])
