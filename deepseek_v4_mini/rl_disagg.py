@@ -64,7 +64,7 @@ from .rl_defer_grpo import pos_write_corr
 from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
-from .rl_rewards import make_exec_reward, make_tool_reward
+from .rl_rewards import make_exec_reward, make_recall_reward, make_tool_reward
 from .cfg_schema import check as check_cfg
 from .paths import load_yaml
 
@@ -227,7 +227,8 @@ def group_to_device(g: dict, device, dtype):
 def build_envs(d: dict, r: dict, tok, seed: int):
     """EnvSpecs from the config's data.envs. kind: code (CodeChunkStream,
     dense -ce), tool (ToolSessionStream + verifiable rubric), exec
-    (CodeExecStream + sandboxed unit tests), sota (SotaSessionStream, dense).
+    (CodeExecStream + sandboxed unit tests), sota (SotaSessionStream, dense),
+    recall (PersonaChatStream + grade_recall sur la dernière vérité plantée).
     Chat-kind streams return conv DICTS — sample_episode below normalizes
     both shapes."""
     from .code_data import CodeChunkStream
@@ -262,6 +263,9 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                 fn = make_exec_reward(int(r.get("think_nmax", 8)),
                                       float(r.get("think_floor", 0.4)),
                                       float(e.get("exec_timeout", 6.0)))
+            elif kind == "recall":
+                fn = make_recall_reward(int(r.get("think_nmax", 8)),
+                                        float(r.get("think_floor", 0.4)))
             else:
                 fn = None                      # sota : reward par défaut
             envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
@@ -568,11 +572,12 @@ class Worker:
         # envs read gold_calls, exec envs read tests)
         gold = (info.get("gold_calls") or [[]])[-1]
         tests = (info.get("tests") or [[]])[-1]
+        truth = (info.get("truths") or [""])[-1]
         # les payloads sont matérialisés (et pas construits dans la
         # comprehension) pour qu'on puisse relire info["raw"] : le succès brut
         # que la fonction de reward calcule puis dilue dans l'économie de think.
         pl = [{"text": txt, "n_think": c["n_writes"],
-               "gold_calls": gold, "tests": tests}
+               "gold_calls": gold, "tests": tests, "truth": truth}
               for c, txt in zip(cands, self._decode_calls(env, cands))]
         out = [env.reward(c["ce"], d) for c, d in zip(cands, pl)]
         self.last_raw = [d.get("raw") for d in pl]

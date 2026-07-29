@@ -39,6 +39,7 @@ RL_ENV_KIND_TO_STREAM: dict[str, str] = {
     "tool": "tool_session",
     "exec": "code_exec",
     "sota": "sota_session",
+    "recall": "persona",
 }
 
 

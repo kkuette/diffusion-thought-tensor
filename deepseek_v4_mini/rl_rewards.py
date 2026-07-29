@@ -233,6 +233,29 @@ def make_exec_reward(n_max: int, floor: float = 0.4, timeout: float = 6.0
     return fn
 
 
+def make_recall_reward(n_max: int, floor: float = 0.4
+                       ) -> Callable[[Optional[float], dict], float]:
+    """EnvSpec.reward_fn for persona recall envs: the decoded answer turn is
+    graded against the episode's LAST planted truth (word-boundary,
+    case-insensitive — persona_chat_data.grade_recall), then the same think
+    economy as the other rubric envs.
+
+    info: {"text": str, "truth": str, "n_think": int}
+
+    Écrit en retour info["raw"] = le grade AVANT économie de think (même
+    convention que tool/exec : c'est le taux que le suivi RL regarde)."""
+    from .persona_chat_data import grade_recall
+
+    def fn(ce, info):
+        truth = info.get("truth") or ""
+        # vérité vide (épisode smalltalk qui aurait fui dans l'env) : grade 0,
+        # pas 1 — le regex canonique d'une chaîne vide matche tout.
+        s = grade_recall([info["text"]], [truth]) if truth else 0.0
+        info["raw"] = s
+        return think_economy(s, int(info.get("n_think", 0)), n_max, floor)
+    return fn
+
+
 # ── self-test (hermetic) ─────────────────────────────────────────────────────
 
 def _self_test() -> None:
