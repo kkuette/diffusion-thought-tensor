@@ -73,7 +73,8 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
         "chat": (set(),
                  {"decode_every", "eval_convs", "eval_gen", "gen", "max_new",
                   "p_chat", "stream", "weight"}),
-        "teacher": (set(), {"anneal", "distill_weight", "enabled", "target"}),
+        "teacher": (set(), {"anneal", "distill_weight", "enabled", "target",
+                            "table_lr"}),
     },
     "rl_disagg": {
         "": ({"tokenizer", "model", "data", "rl"}, set()),

@@ -37,7 +37,8 @@ def atomic_save(obj, path: str) -> None:
 
 def save_train_state(path: str, *, step: int, model, cfg, opt, delta=None,
                      ema_ic=None, ema_d=None, train_stream=None,
-                     eval_stream=None, chat_stream=None) -> None:
+                     eval_stream=None, chat_stream=None,
+                     extra: dict | None = None) -> None:
     """L'état d'entraînement COMPLET : resume sûr sur GPU loué / spot.
 
     `model` est le module EAGER (`base`), jamais le compilé : `torch.compile`
@@ -61,7 +62,9 @@ def save_train_state(path: str, *, step: int, model, cfg, opt, delta=None,
                  # des sessions d'avance (chat_batch : pool de pavage, files de
                  # lane) doit dire ce qu'il a déjà en main, sinon le resume
                  # repart au milieu d'une autre session. Protocole optionnel.
-                 "chat_stream_state": _stream_state(chat_stream)}, path)
+                 "chat_stream_state": _stream_state(chat_stream),
+                 # états annexes du trainer (ex. tables du teacher value_table)
+                 **(extra or {})}, path)
 
 
 def _stream_state(stream):

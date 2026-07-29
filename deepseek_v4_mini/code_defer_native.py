@@ -25,6 +25,7 @@ and WSD decay (not the graft's spike-then-crash), while in-context ppl stays san
 """
 import os, sys, math, time, yaml, json
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
@@ -668,18 +669,49 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # `fromsif_exec_tiled` laisse toolcall à grade 0.00 aux quatre paliers gradés
     # pendant que la nll tombe de 26 % — la sélection ne s'ouvre pas toute seule,
     # et à 47M c'est un teacher discriminant qui l'avait ouverte (0.03 → 0.99).
+    # 'value_table' = teacher APPRIS à codes COMPOSÉS (recette 47M complète,
+    # train.py:2126-2178 — la pièce qui manquait au run recall_stair, verdict
+    # 07-29 : canal Δnll ouvert, copie argmax fermée). Trois nn.Embedding
+    # (slot interrogeable / attribut chien-chat-sœur-frère / valeur) sommées
+    # puis RMS-normées = le code d'un fait porte sa LIAISON, pas la valeur
+    # seule (contrainte user 07-29 : « le chien peut être un chat, le nom peut
+    # être la race »). Le blend β injecte ce code NON détaché dans la banque
+    # que les segs suivants lisent : la CE de la tâche traverse le read jusqu'aux
+    # tables — le codebook s'organise pour être ce que le read sait sélectionner
+    # ET décompresser. La distill (write→code DÉTACHÉ) reste un pull annealé.
     tf_target = str(tf_cfg.get("target", "chunk"))
-    assert tf_target in ("chunk", "value", "surprisal", "value_sif"), tf_target
+    assert tf_target in ("chunk", "value", "surprisal", "value_sif",
+                         "value_table"), tf_target
     tf_proj = None
+    tf_tables = tf_topt = None
     if tf_on:
         g = torch.Generator(device="cpu").manual_seed(1789)
         tf_proj = (torch.randn(cfg.d_model, cfg.mem_dim, generator=g) / cfg.d_model ** 0.5).to(device)
+        if tf_target == "value_table":
+            assert not (torch.distributed.is_available()
+                        and torch.distributed.is_initialized()), \
+                "value_table : tables locales, pas de réduction DDP implémentée"
+            from .persona_chat_data import fact_id_maps
+            _sm, _vm_ids, _am = fact_id_maps()
+            tf_tables = nn.ModuleDict({
+                "slot": nn.Embedding(len(_sm) + 1, cfg.mem_dim, padding_idx=0),
+                "attr": nn.Embedding(len(_am) + 1, cfg.mem_dim, padding_idx=0),
+                "val": nn.Embedding(len(_vm_ids) + 1, cfg.mem_dim,
+                                    padding_idx=0),
+            }).to(device).float()
+            tf_topt = torch.optim.AdamW(tf_tables.parameters(),
+                                        lr=float(tf_cfg.get("table_lr", 1e-3)))
         _tdesc = {"value": "proj embed valeur (discriminant)",
                   "surprisal": "proj pooling pondéré nll ref (label-free)",
                   "value_sif": "valeur si val_mask, sinon pooling pondéré",
+                  "value_table": "codes APPRIS composés slot+attr+valeur "
+                                 "(liaison), organisés via le read",
                   "chunk": "proj gist chunk"}[tf_target]
         print(f"teacher ON: distill_w {tf_dw}, anneal [{tf_a0},{tf_a1}], "
-              f"target={tf_target} ({_tdesc})", flush=True)
+              f"target={tf_target} ({_tdesc})"
+              + (f" | tables {len(_sm)}+{len(_am)}+{len(_vm_ids)} ids, "
+                 f"lr {float(tf_cfg.get('table_lr', 1e-3)):g}"
+                 if tf_tables is not None else ""), flush=True)
 
     def _beta(s):
         return beta_at(s, enabled=tf_on, anneal_start=tf_a0, anneal_end=tf_a1)
@@ -1016,7 +1048,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
         save_train_state(path, step=step, model=base, cfg=cfg, opt=opt,
                          delta=delta, ema_ic=ema_ic, ema_d=ema_d,
                          train_stream=train_stream, eval_stream=eval_stream,
-                         chat_stream=chat_stream)
+                         chat_stream=chat_stream,
+                         extra=(None if tf_tables is None else
+                                {"tf_tables": tf_tables.state_dict(),
+                                 "tf_topt": tf_topt.state_dict()}))
 
     def _save_bank(step, path):
         save_bank(path, step=step, bank=bank_carry, casc=casc_carry,
@@ -1048,6 +1083,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 chat_stream=chat_stream, ddp_rank=ddp_rank,
                 train_seed=train_seed, base_seed=sd["seed"],
                 start_step=start_step)
+            if tf_tables is not None and ck.get("tf_tables") is not None:
+                tf_tables.load_state_dict(ck["tf_tables"])
+                if ck.get("tf_topt") is not None:
+                    tf_topt.load_state_dict(ck["tf_topt"])
+                print("resume: tables teacher value_table restaurées",
+                      flush=True)
             _bp = os.path.join(save_dir, f"bank_step_{start_step}.pt")
             if os.path.exists(_bp):
                 _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = \
@@ -1083,6 +1124,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
 
     model.train(); t0 = time.time()
     _win_data = 0.0; _win_chunks = 0    # fenêtre log_every : temps d'attente data + chunks vus
+    _tf_gnorm = 0.0                     # value_table : dernier grad-norm des tables
     # carries hoisted out of the step loop: with nrf_never they persist across
     # optimizer steps (une vie = le run entier) ; sinon ils sont reset par step.
     bank_carry = _bank_loaded
@@ -1093,6 +1135,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
         _t_step0 = time.time()
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
+        if tf_topt is not None:
+            tf_topt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
         # dist ventilée porteur/filler : porteur = seg avec val_mask (fait
         # énoncé/màj). Si fait descend et fill reste ~1.0 = le write imite le
@@ -1223,6 +1267,39 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # cible = proj de l'embedding des tokens VALEUR (val_mask), code
                 # discriminant par valeur, et NE tire que les segs porteurs.
                 beta = _beta(step)
+                # ── target value_table : codes appris composés (liaison) ────
+                # Ne fire que sur les segs d'énonciation/update (fact_slot > 0
+                # sur au moins une lane). gist NON détaché dans le blend : la
+                # CE des segs suivants remonte au travers du read jusqu'aux
+                # tables. Distill = pull du write vers le code DÉTACHÉ (le
+                # teacher n'apprend pas de la distill — 47M verbatim). Gating
+                # PAR LANE : en chat batché les lanes non porteuses (filler,
+                # sota) gardent leur write natif.
+                if tf_target == "value_table":
+                    fs = s.get("fact_slot")
+                    if (tf_on and beta > 0.0 and fs is not None
+                            and int(fs.sum()) > 0):
+                        sid = fs.to(device).max(dim=1).values          # [B]
+                        vid = s["fact_val"].to(device).max(dim=1).values
+                        aid = s["fact_attr"].to(device).max(dim=1).values
+                        gist = (tf_tables["slot"](sid) + tf_tables["attr"](aid)
+                                + tf_tables["val"](vid))               # fp32
+                        gist = gist / gist.pow(2).mean(-1, keepdim=True) \
+                            .clamp_min(1e-12).sqrt()
+                        carrier = sid > 0                              # [B]
+                        w0 = bank[:, -1]
+                        per = 1.0 - F.cosine_similarity(
+                            w0.float(), gist.detach(), dim=1)
+                        distill = (per * carrier.float()).sum() \
+                            / carrier.sum().clamp_min(1)
+                        total = total + tf_dw * beta * distill
+                        distill_v += float(distill.detach()); distill_n += 1
+                        dist_c += float(distill.detach()); dist_cn += 1
+                        blended = torch.where(
+                            carrier.unsqueeze(1),
+                            beta * gist.to(w0.dtype) + (1.0 - beta) * w0,
+                            w0).unsqueeze(1)
+                        bank = torch.cat([bank[:, :-1], blended], dim=1)
                 # Cible PAR SEG. 'value_sif' prend le val_mask quand le seg en
                 # porte un (ici : le span des noms d'outils déclarés) et retombe
                 # sur le pooling pondéré sinon — les deux autres modes gardent
@@ -1468,8 +1545,16 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 print(f"[nan-guard] step {step}: grad norm non finie ({len(bad)} "
                       f"tenseurs: {bad[:6]}), opt.step SAUTÉ — repro {_dp}", flush=True)
             opt.zero_grad(set_to_none=True)
+            if tf_topt is not None:
+                tf_topt.zero_grad(set_to_none=True)
         else:
             opt.step()
+            if tf_topt is not None:
+                # norme de grad des tables AVANT le step : la sonde « le read
+                # vote le codebook » (0.0 = le blend ne fire pas / graphe coupé)
+                _tf_gnorm = float(torch.nn.utils.clip_grad_norm_(
+                    tf_tables.parameters(), 1.0e9))
+                tf_topt.step()
         if _prof:
             torch.cuda.synchronize()
             print(f"[prof step {step}] fwd+bwd {_t_bwd - _t_step0:.2f}s  "
@@ -1554,6 +1639,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     writer.add_scalar("train/distill_fait", dist_c / dist_cn, step)
                 if dist_fn:
                     writer.add_scalar("train/distill_fill", dist_f / dist_fn, step)
+                if tf_topt is not None:
+                    writer.add_scalar("train/table_gnorm", _tf_gnorm, step)
             _win_data = 0.0; _win_chunks = 0
         if (step % eval_every == 0
                 or (step == steps and not skip_final_eval)) and ddp_rank == 0:

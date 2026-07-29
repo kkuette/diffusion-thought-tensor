@@ -101,7 +101,10 @@ import torch
 # Clés par-token à padder. `input_ids` prend le pad_id, tout le reste prend 0 :
 # loss_mask/surp_w à 0 = aucune contribution à la CE ni au pooling du teacher,
 # val_mask à 0 = le seg n'est pas porteur sur ces positions.
-_ZERO_PAD_KEYS = ("loss_mask", "attention_mask", "val_mask", "surp_w")
+_ZERO_PAD_KEYS = ("loss_mask", "attention_mask", "val_mask", "surp_w",
+                  # identité du fait (teacher value_table) : [1,T] long,
+                  # 1-based — le pad 0 vaut « pas de fait » par construction
+                  "fact_slot", "fact_val", "fact_attr")
 
 
 class ChatBatchStream:

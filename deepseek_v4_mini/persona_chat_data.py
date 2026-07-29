@@ -363,6 +363,19 @@ def _canon(v: str) -> re.Pattern:
     return re.compile(r"\b" + re.escape(v.lower()) + r"\b")
 
 
+def fact_id_maps():
+    """Maps d'identité des faits pour le teacher appris (target value_table) :
+    {slot→id}, {valeur→id}, {attribut→id}, 1-based (0 = pas de fait = le pad
+    de chat_batch). SOURCE UNIQUE : le stream (canaux par-seg) et le trainer
+    (tailles des nn.Embedding) lisent la même fonction — pools COMPLETS triés,
+    indépendants du split, du seed et de l'instance."""
+    slot_ids = {k: i + 1 for i, k in enumerate(sorted(SLOTS))}
+    allv = sorted({v for _, _, _, _, pool in SLOTS.values() for v in pool})
+    val_ids = {v: i + 1 for i, v in enumerate(allv)}
+    attr_ids = {p: i + 1 for i, p in enumerate(sorted(PET_TYPES + SIBLINGS))}
+    return slot_ids, val_ids, attr_ids
+
+
 def grade_recall(answers: list[str], truths: list[str]) -> float:
     """Fraction of answers containing their truth value (word-boundary,
     case-insensitive)."""
@@ -412,6 +425,12 @@ class PersonaChatStream:
                 if len(sub) >= 4:
                     self.slots[k] = (st, qs, ans, upd, sub)
             assert self.slots, f"aucun slot ne survit au split {pool_split}"
+        # ids de faits pour le teacher appris (target value_table) — voir
+        # fact_id_maps : stables entre instances/splits/seeds
+        self.slot_ids, self.val_ids, self.attr_ids = fact_id_maps()
+        self.n_slot_ids = len(self.slot_ids) + 1
+        self.n_val_ids = len(self.val_ids) + 1
+        self.n_attr_ids = len(self.attr_ids) + 1
         self.p_smalltalk = float(p_smalltalk)
         self.n_facts = tuple(int(v) for v in n_facts)
         self.n_queries = tuple(int(v) for v in n_queries)
@@ -568,11 +587,17 @@ class PersonaChatStream:
                     return span
         return None
 
-    def _user_valued(self, text: str, v: str) -> dict:
+    def _user_valued(self, text: str, v: str, slot: str = "",
+                     p: str = "") -> dict:
         """Seg user qui ÉNONCE un fait : balise le span valeur avec un val_mask
         (séparé du loss_mask — le user n'est pas supervisé) pour que le teacher
         discriminant puisse pooler l'embedding de LA valeur (code propre par
-        valeur) au lieu du gist moyen du chunk. Run 7-resume."""
+        valeur) au lieu du gist moyen du chunk. Run 7-resume.
+
+        Porte aussi l'IDENTITÉ du fait en trois canaux [1, T] longs constants
+        (teacher appris value_table) : la LIAISON complète — quel slot la
+        question discriminera (nom/ville/pet…), l'attribut qui varie dans les
+        templates (chien vs chat, sœur vs frère), la valeur. 0 = pas de fait."""
         seg = self._user(text)
         ids = seg["input_ids"][0].tolist()
         vmask = torch.zeros(len(ids))
@@ -580,6 +605,13 @@ class PersonaChatStream:
         if span is not None:
             vmask[span[0]:span[1]] = 1.0
         seg["val_mask"] = vmask.unsqueeze(0)
+        T = len(ids)
+        seg["fact_slot"] = torch.full((1, T), self.slot_ids.get(slot, 0),
+                                      dtype=torch.long)
+        seg["fact_val"] = torch.full((1, T), self.val_ids.get(v, 0),
+                                     dtype=torch.long)
+        seg["fact_attr"] = torch.full((1, T), self.attr_ids.get(p, 0),
+                                      dtype=torch.long)
         return seg
 
     def _assistant(self, text: str) -> dict:
@@ -651,7 +683,8 @@ class PersonaChatStream:
             used_slots.add(f["slot"]); used_vals.add(f["v"])
             fact_seg[f["slot"]] = len(segs)
             segs.append(self._user_valued(self.rng.choice(f["st"])
-                                          .format(v=f["v"], p=f["p"]), f["v"]))
+                                          .format(v=f["v"], p=f["p"]), f["v"],
+                                          slot=f["slot"], p=f["p"]))
             if self.rng.random() < self.p_ack:
                 segs.append(self._assistant(self.rng.choice(ACK_TMPL)
                                             .format(v=f["v"])))
@@ -666,7 +699,8 @@ class PersonaChatStream:
             f["old_v"], f["v"], updated = f["v"], nv, f["slot"]
             fact_seg[f["slot"]] = len(segs)
             segs.append(self._user_valued(self.rng.choice(f["upd"])
-                                          .format(v=f["v"], p=f["p"]), f["v"]))
+                                          .format(v=f["v"], p=f["p"]), f["v"],
+                                          slot=f["slot"], p=f["p"]))
 
         beyond = self.rng.random() < self.p_beyond
         lo, hi = BEYOND_BIN if beyond else self.rng.choice(FILLER_BINS)
@@ -779,10 +813,28 @@ def _self_test() -> None:
             # values never collide across facts of one conversation
             vals = [v for _, v in info["facts"]]
             assert len(vals) == len(set(vals))
+            # canaux d'identité du fait : présents (constants, 1-based) sur
+            # chaque seg d'énonciation/update, absents partout ailleurs
+            for s in c["segs"]:
+                if "val_mask" in s:
+                    for k in ("fact_slot", "fact_val", "fact_attr"):
+                        ch = s[k]
+                        assert ch.shape == s["input_ids"].shape
+                        assert ch.dtype == torch.long
+                        assert int(ch.min()) == int(ch.max())  # constant
+                    assert int(s["fact_slot"][0, 0]) >= 1
+                    assert int(s["fact_val"][0, 0]) >= 1
+                else:
+                    assert "fact_slot" not in s
 
     assert kinds["smalltalk"] > 60 and kinds["recall"] > 300, kinds
     assert n_updated > 20 and n_beyond > 30
     assert max(ages) >= 16, f"no beyond-FIFO stratum sampled: {dict(ages)}"
+    # ids de faits STABLES entre instances, splits et seeds (tables du teacher)
+    ps2 = PersonaChatStream(tok, seed=99, pool_split="eval")
+    assert ps2.slot_ids == ps.slot_ids and ps2.val_ids == ps.val_ids \
+        and ps2.attr_ids == ps.attr_ids
+    assert ps.n_val_ids == len(ps.val_ids) + 1
     print(f"persona_chat self-test: OK ({dict(kinds)}, "
           f"age octaves {dict(sorted(ages.items()))}, "
           f"updated {n_updated}, beyond {n_beyond})")
