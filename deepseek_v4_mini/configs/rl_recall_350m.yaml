@@ -134,8 +134,15 @@ rl:
                                            # la diversité des motifs d'écriture
   grad_clip: 1.0
   save_every: 50
-  think_nmax: 8
-  think_floor: 0.4
+  # Économie de think NEUTRALISÉE pour ce cliquet (user 07-29) : le FIFO 8
+  # slots price déjà les writes (sur-écrire évince le fait à rappeler), et
+  # avec explore_floor 0.5 sur des sessions à 5-16 frontières, un n_max de 8
+  # aurait zéroté des rollouts POSITIFS (la ressource rare). floor 1.0 ⇒
+  # eff ≡ 1 ; n_max 16 = pur garde-fou anti-runaway au-dessus du max de
+  # frontières observable. Réintroduire l'économie façon MAI (pénalité
+  # pondérée pass-rate) quand la copie sera ouverte.
+  think_nmax: 16
+  think_floor: 1.0
   max_new: 64
   amp: true
   decode_cache: true
