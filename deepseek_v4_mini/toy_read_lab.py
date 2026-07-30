@@ -214,7 +214,17 @@ from .paths import load_yaml
 from .persona_chat_data import fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
-VARIANTS = ("r0", "r1", "r2", "r3")
+VARIANTS = ("r0", "r1", "r2", "r3", "r4")
+# r4 = INJECTION À SÉLECTION ORACLE : AUCUN module de read appris. Le groupe
+# toprows du fait interrogé est injecté en PRÉFIXE de pseudo-tokens et c'est le
+# backbone NU qui doit copier. Bras « le stack natif sait-il copier ? ».
+INJECT_VARIANTS = ("r4",)
+# les variantes qui LISENT UNE BANQUE (r4 n'en a pas : il lit une injection).
+BANK_VARIANTS = ("r0", "r1", "r2", "r3")
+# mélange des lignes par le readout de groupe (cf. GroupReadout) :
+#   linear = superposition DANS l'espace d'embedding puis UNE projection
+#   mos    = une distribution PAR LIGNE, puis mixture des DISTRIBUTIONS
+READOUT_MIXES = ("linear", "mos")
 CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif",
          "pack", "segpack", "toprows")
 # formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
@@ -309,6 +319,28 @@ class ToyCfg:
                               # 13 = MESURÉ : plus petit k dont la sélection SIF
                               # couvre ≥ 95 % des tokens de valeur de la strate
                               # `code` (97.0 % ; k=12 → 90.7 %). Cf. le YAML.
+    readout_mix: str = "linear"   # GroupReadout : comment les lignes du groupe
+                              # se combinent.
+                              # `linear` (DÉFAUT, rétro-compat bit-à-bit) :
+                              # u = Σ s·p·ligne PUIS u @ Ê^T — les lignes se
+                              # SUPERPOSENT dans l'espace d'embedding, et le
+                              # plus proche voisin d'une superposition de H/Q/B
+                              # est un token PLAUSIBLE FAUX (la machine à
+                              # HAB-719 → HQR-719).
+                              # `mos` : une distribution PAR LIGNE
+                              # (softmax(ligne @ Ê^T)) puis MIXTURE pondérée par
+                              # s·p, et log pour revenir en logits. Aucune
+                              # superposition ne peut fabriquer un token que
+                              # AUCUNE ligne ne porte. Coût : un tenseur
+                              # [B, G·k, V] par forward (les lignes ne dépendent
+                              # pas de t) + le mélange [B,T,V].
+    pos_entropy: float = 0.0  # pénalité d'ENTROPIE sur la porte-position p
+                              # (GroupReadout) ajoutée à la loss. 0 = OFF
+                              # (défaut, aucun terme n'est ajouté). > 0 pousse p
+                              # vers un choix DUR d'une ligne du groupe.
+    # ── axe INJECTION (variante r4) ─────────────────────────────────────────
+    inject_sep_id: int = 0    # token du vocab posé ENTRE le préfixe injecté et
+                              # le tour réel. Renseigné par main() (`<blank>`).
     row_pos_tag: bool = True  # `toprows` : marquer la ligne de contenu j par
                               # pos_emb[j] × oracle_ka_scale (0.2), comme le
                               # format `rows` dont le round-trip était à 100 %.
@@ -333,8 +365,10 @@ class ToyCfg:
                               # c'est le régime réel.
 
     def __post_init__(self):
-        if self.variant == "r3":
+        if self.variant in ("r3",) + INJECT_VARIANTS:
             # R3 : la banque VIT dans l'espace d'embedding — pas de projection.
+            # R4 : pas de banque du tout, mais les tokens injectés vivent eux
+            # aussi dans l'espace d'embedding.
             self.mem_dim = self.d_model
         if not self.x_dim:
             self.x_dim = self.d_model
@@ -343,11 +377,25 @@ class ToyCfg:
         assert self.x_dim % self.n_heads == 0
         assert self.variant in VARIANTS
         assert self.code in CODES, f"code inconnu {self.code!r} (∈ {CODES})"
+        assert self.readout_mix in READOUT_MIXES, (
+            f"readout_mix inconnu {self.readout_mix!r} (∈ {READOUT_MIXES})")
+        assert self.pos_entropy >= 0.0, self.pos_entropy
+        if self.variant in INJECT_VARIANTS:
+            # r4 n'a AUCUN read appris : ce qu'il lit, c'est le préfixe injecté,
+            # et ce préfixe EST le groupe toprows (mêmes tokens, même sélection
+            # SIF). Sans ce code il n'y aurait rien à injecter.
+            assert self.code == "toprows", (
+                f"--variant r4 injecte le GROUPE toprows : il exige "
+                f"--code toprows (reçu --code {self.code})")
+            assert self.write_mode == "fact", (
+                "--variant r4 est un bras fact-only (le régime `every` n'a pas "
+                "de sens : r4 n'a pas de banque, seulement une injection)")
         if self.code != "mean":
             # les nouveaux formats supposent banque == espace d'embedding et
             # pointer nu : c'est la définition de r3, on ne les porte pas
-            # ailleurs (r0/r1/r2 restent le contrôle de la phase 1).
-            assert self.variant == "r3", (
+            # ailleurs (r0/r1/r2 restent le contrôle de la phase 1). r4 les
+            # consomme autrement (injection), il est admis pour `toprows`.
+            assert self.variant in ("r3",) + INJECT_VARIANTS, (
                 f"--code {self.code} n'est supporté QUE par --variant r3 "
                 f"(banque en espace d'embedding + pointer nu) ; reçu "
                 f"--variant {self.variant}. Phase 1 = --code mean.")
@@ -547,13 +595,21 @@ class CausalSelfAttn(nn.Module):
         self.o = nn.Linear(d, d, bias=False)
         self.theta = cfg.rope_theta
 
-    def forward(self, x):
+    def forward(self, x, pos=None):
+        """`pos` [T] : index RoPE EXPLICITES. None = 0..T−1 (chemin par défaut,
+        bit-à-bit inchangé). La variante r4 s'en sert pour laisser un TROU de
+        position entre le préfixe injecté et le tour réel."""
         B, T, d = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.h, self.dh).transpose(1, 2)
         k = k.view(B, T, self.h, self.dh).transpose(1, 2)
         v = v.view(B, T, self.h, self.dh).transpose(1, 2)
-        cos, sin = _rope_tables(T, self.dh, self.theta, x.device, q.dtype)
+        if pos is None:
+            cos, sin = _rope_tables(T, self.dh, self.theta, x.device, q.dtype)
+        else:
+            c, s_ = _rope_tables(int(pos.max()) + 1, self.dh, self.theta,
+                                 x.device, q.dtype)
+            cos, sin = c[pos], s_[pos]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         # right-pad uniquement : une query non-pad n'attend que des clés non-pad
         # (causalité) ⇒ le masque causal suffit, pas de key-padding mask.
@@ -828,9 +884,11 @@ class GroupReadout(nn.Module):
         d = cfg.d_model
         self.gr = cfg.group_rows            # 1 + top_k
         self.k = cfg.top_k
+        self.mix = cfg.readout_mix
         self.last_gate = None       # σ(porte) du dernier forward (télémétrie)
         self.last_sel = None        # softmax de SÉLECTION DE GROUPE
         self.last_pos = None        # softmax de position DANS le groupe
+        self.last_pos_ent = None    # entropie de p (DÉRIVABLE : pénalité)
         self.norm = RMSNorm(d)
         self.wq = nn.Linear(d, d, bias=False)            # query de la clé
         self.wp = nn.Linear(d, self.k, bias=False)       # porte-position
@@ -863,7 +921,27 @@ class GroupReadout(nn.Module):
         # ── étage 2 : quelle LIGNE du groupe (porte-position) ───────────────
         p = self.wp(hn).softmax(-1)                         # [B,T,k]
         self.last_pos = p.detach()
+        self.last_pos_ent = -(p * p.clamp_min(1e-9).log()).sum(-1).mean()
         content = rows[:, :, 1:, :]                         # [B,G,k,d]
+        if self.mix == "mos":
+            # ── MoS : mélanger les DISTRIBUTIONS, pas les vecteurs ──────────
+            # Les lignes ne dépendent pas de t : on projette les G·k lignes au
+            # vocabulaire UNE fois, puis la mixture est un simple produit par
+            # les poids s·p. Un token que AUCUNE ligne ne porte reste à
+            # probabilité ~0, alors que la superposition linéaire pouvait le
+            # faire gagner (HAB-719 → HQR-719).
+            n = G * self.k
+            Pr = (content.reshape(B, n, d) @ rms_unit(embed_w).t()).softmax(-1)
+            w = (s[..., None] * p[:, :, None, :]).reshape(*s.shape[:2], n)
+            mix = torch.einsum("btn,bnv->btv", w, Pr)       # [B,T,V]
+            # clamp AVANT le log : une proba peut sous-déborder à 0 en fp32, et
+            # scale × (−inf) rendrait NaN alors que scale vaut 0 à l'init.
+            bias = self.scale * mix.clamp_min(1e-20).log()
+            if empty is not None:
+                bias = bias * (~empty)[:, None, None].to(bias.dtype)
+            g = torch.sigmoid(self.gate(hn))
+            self.last_gate = g.detach()
+            return g * bias
         u = torch.einsum("btg,btj,bgjd->btd", s, p, content)
         if empty is not None:
             u = u * (~empty)[:, None, None].to(u.dtype)
@@ -891,8 +969,8 @@ class ToyBlock(nn.Module):
             elif cfg.uses_xattn:
                 self.read = CrossAttnRead(cfg, project_v=(cfg.variant != "r3"))
 
-    def forward(self, x, bank, bank_mask):
-        x = x + self.attn(self.n1(x))
+    def forward(self, x, bank, bank_mask, pos=None):
+        x = x + self.attn(self.n1(x), pos)
         if self.read is not None and bank is not None and bank.size(1) > 0:
             x = self.read(x, bank, bank_mask)
         x = x + self.mlp(self.n2(x))
@@ -932,6 +1010,11 @@ class ToyReadLM(nn.Module):
         self.blocks = nn.ModuleList(ToyBlock(cfg, i) for i in range(cfg.n_layers))
         self.norm_f = RMSNorm(cfg.d_model)
         self.ptr = None
+        # r4 : le SEUL paramètre « de read » du bras — un vecteur de TYPE
+        # ajouté aux lignes injectées (zéro-init : au step 0 la ligne injectée
+        # est EXACTEMENT l'embedding brut du token).
+        if cfg.variant in INJECT_VARIANTS:
+            self.inject_type = nn.Parameter(torch.zeros(cfg.d_model))
         if cfg.uses_ptr:
             # les PACK ont leur PROPRE readout (deux étages) ; tous les autres
             # codes gardent PointerReadout à l'identique (rétro-compat bit-à-bit
@@ -1308,10 +1391,42 @@ class ToyReadLM(nn.Module):
         return cand, cm
 
     # ── forward ─────────────────────────────────────────────────────────────
-    def forward(self, ids, bank=None, bank_mask=None):
+    def forward(self, ids, bank=None, bank_mask=None, inject=None):
+        """`inject` [B, k] (variante r4) : les tokens du groupe toprows du fait
+        interrogé, posés en PRÉFIXE de pseudo-tokens devant le tour.
+
+        Layout (spec) : les k lignes injectées prennent les positions RoPE
+        0..k−1, le séparateur la position k, et le tour RÉEL démarre à k+2 —
+        la position k+1 reste VIDE, c'est un trou délibéré qui marque la
+        frontière (une position qu'aucun token n'occupe jamais).
+
+        Les lignes injectées sont les embeddings BRUTS, NON RMS-normés : la
+        norme porte de l'information, et la RMS-norm de `toprows_rows` était une
+        contrainte de BANQUE (des lignes comparables entre elles), pas
+        d'injection. Un vecteur de TYPE appris (zéro-init) est ajouté à chacune
+        pour que le backbone puisse les distinguer d'un vrai token.
+
+        Les logits rendus sont ceux du TOUR RÉEL seulement : l'appelant
+        (train_step, evaluate, greedy) ne voit aucune différence de forme.
+        """
         x = self.embed(ids)
+        pos = None
+        npre = 0
+        if inject is not None:
+            assert self.cfg.variant in INJECT_VARIANTS, self.cfg.variant
+            B, T = ids.shape
+            k = inject.shape[1]
+            pre = self.embed(inject) + self.inject_type    # [B,k,d], NON normé
+            sep = self.embed(torch.full((B, 1), int(self.cfg.inject_sep_id),
+                                        dtype=torch.long, device=ids.device))
+            x = torch.cat([pre, sep, x], dim=1)
+            npre = k + 1
+            pos = torch.cat([torch.arange(k + 1, device=ids.device),
+                             torch.arange(T, device=ids.device) + k + 2])
         for blk in self.blocks:
-            x = blk(x, bank, bank_mask)
+            x = blk(x, bank, bank_mask, pos)
+        if npre:
+            x = x[:, npre:]                    # seul le TOUR RÉEL sort
         x = self.norm_f(x)
         logits = x @ self.embed.weight.t()             # embeddings tiés
         if self.ptr is not None and bank is not None and bank.size(1) > 0:
@@ -1333,11 +1448,13 @@ class ToyReadLM(nn.Module):
 
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
     @torch.no_grad()
-    def greedy(self, prefix, bank, bank_mask, max_new: int, stop_id: int):
+    def greedy(self, prefix, bank, bank_mask, max_new: int, stop_id: int,
+               inject=None):
         ids = prefix
         out = []
         for _ in range(max_new):
-            lg = self.forward(ids[:, -self.cfg.max_seq_len:], bank, bank_mask)
+            lg = self.forward(ids[:, -self.cfg.max_seq_len:], bank, bank_mask,
+                              inject=inject)
             nxt = int(lg[0, -1].argmax())
             if nxt == stop_id:
                 break
@@ -1356,6 +1473,8 @@ def param_report(model: ToyReadLM) -> dict:
             b = "embed"
         elif n.startswith("ptr."):
             b = "pointer"
+        elif n.startswith("inject_type"):
+            b = "read"          # r4 : le SEUL paramètre de « read » du bras
         elif ".read." in n:
             b = "read"
         elif ".attn." in n:
@@ -1480,6 +1599,49 @@ class OracleEnv:
         bank = bank + list(rows)
         return bank[-self.max_mem:]
 
+    def inject_plan(self, model: ToyReadLM, conv: dict) -> tuple:
+        """(plan, n_absent) pour la variante r4 : quel GROUPE injecter devant
+        quel segment de RÉPONSE.
+
+        plan = {index de seg → LongTensor[k] des tokens du groupe toprows du
+        fait interrogé}. La sélection est la MÊME que celle du write (top_k SIF
+        du segment porteur, dans l'ordre du segment) : r4 ne change pas ce que
+        la mémoire retient, il change QUI le lit — ici, le backbone nu, sans
+        aucun module appris.
+
+        Un FIFO de max_mem groupes est simulé à l'identique : si le fait
+        interrogé en est déjà SORTI (rare en fact-only), on n'injecte RIEN et
+        la réponse est comptée à part — sinon r4 s'offrirait une mémoire
+        infinie que les autres bras n'ont pas.
+        """
+        truths = (conv.get("info") or {}).get("truths") or []
+        q_slots = (conv.get("info") or {}).get("q_slots") or []
+        a_idx = [i for i, s in enumerate(conv["segs"])
+                 if s["role"] == "assistant"]
+        graded = a_idx[-len(truths):] if truths else []
+        qpos = {ix: qi for qi, ix in enumerate(graded)}
+        plan: dict = {}
+        absent = 0
+        fifo: list = []                      # [(slot_id, tokens)] résidents
+        for i, seg in enumerate(conv["segs"]):
+            qi = qpos.get(i)
+            if qi is not None:
+                sl = self.slot_ids.get(q_slots[qi]) if qi < len(q_slots) else None
+                hit = None
+                for s_, tk in reversed(fifo):     # le write le PLUS RÉCENT
+                    if s_ == sl:
+                        hit = tk
+                        break
+                if hit is None:
+                    absent += 1
+                else:
+                    plan[i] = hit
+            f = self.fact_of(seg)
+            if f is not None:
+                fifo.append((f[0], model.toprows_sel(self.seg_tokens(seg))))
+                fifo = fifo[-self.max_mem:]
+        return plan, absent
+
     def value_group(self, slot: str | None, truth: str) -> str:
         """Strate de la valeur gradée : `code` (slots code/ref/plate, valeur
         arbitraire sans prior LM), `short` (≤2 tokens), `word` (3+ tokens
@@ -1536,7 +1698,18 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
     """Un pas = un groupe de convs. Backward PAR GROUPE DE SEGS, banque
     détachée entre segs — strictement le même gradient que le backward
     monolithique (le write est oracle, aucun gradient ne traverse la banque)
-    pour une fraction de la VRAM."""
+    pour une fraction de la VRAM.
+
+    r4 : pas de banque du tout. Les segs de RÉPONSE à un fait reçoivent le
+    groupe injecté en préfixe (teacher-forcé, même sélection oracle qu'à
+    l'éval) ; les autres segs passent nus. Comme la longueur du préfixe doit
+    être uniforme dans un forward, les lanes sont scindées en DEUX sous-lots
+    (avec / sans injection) — deux forwards au lieu d'un, gradient identique.
+    """
+    cfg = model.cfg
+    r4 = cfg.variant in INJECT_VARIANTS
+    plans = [env.inject_plan(model, c)[0] for c in convs] if r4 else None
+    ent_c = float(cfg.pos_entropy) if isinstance(model.ptr, GroupReadout) else 0.0
     banks = [[] for _ in convs]
     total_w = sum(float(s["loss_mask"][0][1:max_len].sum())
                   for c in convs for s in c["segs"]) or 1.0
@@ -1546,19 +1719,35 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
         lanes = [i for i, c in enumerate(convs) if j < len(c["segs"])]
         if not lanes:
             continue
-        segs = [convs[i]["segs"][j] for i in lanes]
-        X, W = pad_segs(segs, device, max_len)
-        bank, bmask = pad_bank([banks[i] for i in lanes], device)
-        with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
-                            enabled=amp):
-            logits = model(X, bank, bmask)
-        s, n = seg_ce(logits, X, W)
-        if float(n) > 0:
-            (s / total_w * scale_by).backward()
-            loss_sum += float(s.detach())
-            tok_sum += float(n)
-        for i, seg in zip(lanes, segs):
-            banks[i] = env.write(model, banks[i], seg)
+        if r4:
+            subsets = [[i for i in lanes if j in plans[i]],
+                       [i for i in lanes if j not in plans[i]]]
+        else:
+            subsets = [lanes]
+        for sub in subsets:
+            if not sub:
+                continue
+            segs = [convs[i]["segs"][j] for i in sub]
+            X, W = pad_segs(segs, device, max_len)
+            inj = None
+            if r4 and j in plans[sub[0]]:
+                inj = torch.stack([plans[i][j] for i in sub]).to(device)
+            bank, bmask = pad_bank([banks[i] for i in sub], device)
+            with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
+                                enabled=amp):
+                logits = model(X, bank, bmask, inject=inj)
+            s, n = seg_ce(logits, X, W)
+            if float(n) > 0:
+                obj = s / total_w * scale_by
+                if ent_c > 0 and model.ptr.last_pos_ent is not None:
+                    # pousse la porte-position vers un choix DUR d'une ligne
+                    obj = obj + ent_c * model.ptr.last_pos_ent
+                obj.backward()
+                loss_sum += float(s.detach())
+                tok_sum += float(n)
+        if not r4:                       # r4 n'a pas de banque
+            for i in lanes:
+                banks[i] = env.write(model, banks[i], convs[i]["segs"][j])
     return loss_sum / max(tok_sum, 1.0)
 
 
@@ -1568,10 +1757,18 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
 def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
              max_new, max_len, amp, n_show=3):
     """Replay teacher-forcé (la banque oracle avance) + décodage greedy des
-    tours gradés, bras LIVE (banque) vs ABLATÉ (banque vide)."""
+    tours gradés, bras LIVE (banque) vs ABLATÉ (banque vide).
+
+    r4 : pas de banque — LIVE = tour PRÉCÉDÉ du groupe injecté (sélection
+    oracle), ABLATÉ = le même tour sans injection, c'est-à-dire le backbone nu.
+    Le contraste garde donc exactement le même sens qu'ailleurs.
+    """
     model.eval()
+    r4 = model.cfg.variant in INJECT_VARIANTS
     stream.rng = random.Random(seed)
     live_ans, abl_ans, truths_all, groups = [], [], [], []
+    resident = []                        # fait encore en banque ? (aligné)
+    n_absent = 0                         # r4 : faits SORTIS du FIFO (0 inject)
     ages = []                            # writes entre le fait et sa query
     dnll_num, dnll_den = 0.0, 0.0
     gate_num, gate_den = 0.0, 0.0
@@ -1599,14 +1796,22 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         # déjà évincés au moment de la question.
         wcount = 0
         slot_w: dict = {}
+        plan = env.inject_plan(model, conv)[0] if r4 else {}
         for i, seg in enumerate(conv["segs"]):
             X = seg["input_ids"][:, :max_len].to(device)
             W = seg["loss_mask"][:, :max_len].to(device)
             b, bm = pad_bank([bank], device)
             if i in graded:
+                inj = None
+                if r4:
+                    tk = plan.get(i)
+                    if tk is None:
+                        n_absent += 1     # fait ÉVINCÉ : aucune injection
+                    else:
+                        inj = tk[None].to(device)
                 with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
                                     enabled=amp):
-                    lg_live = model(X, b, bm)
+                    lg_live = model(X, b, bm, inject=inj)
                     lg_abl = model(X, None, None)
                 sl, nl = seg_ce(lg_live, X, W)
                 sa, _ = seg_ce(lg_abl, X, W)
@@ -1622,7 +1827,8 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 if abl_txt is None:
                     abl_txt = tok.decode(model.greedy(a_open, None, None,
                                                       max_new, stop_id))
-                live = tok.decode(model.greedy(a_open, b, bm, max_new, stop_id))
+                live = tok.decode(model.greedy(a_open, b, bm, max_new, stop_id,
+                                               inject=inj))
                 tr = truths[qi] if qi < len(truths) else "?"
                 live_ans.append(live)
                 abl_ans.append(abl_txt)
@@ -1630,17 +1836,28 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 q_slot = q_slots[qi] if qi < len(q_slots) else None
                 groups.append(env.value_group(q_slot, tr))
                 sid = env.slot_ids.get(q_slot) if q_slot else None
-                if sid in slot_w:
-                    ages.append(wcount - slot_w[sid])
+                # RÉSIDENCE, alignée sur truths_all (une entrée par réponse) :
+                # True  = le fait est encore dans le FIFO au moment de la query
+                # False = ÉVINCÉ (le read ne peut structurellement plus répondre)
+                # None  = inconnue (fait jamais écrit dans cette conv)
+                if r4:
+                    resident.append(inj is not None)
+                elif sid in slot_w:
+                    age_i = wcount - slot_w[sid]
+                    ages.append(age_i)
+                    resident.append(age_i < env.max_mem)
+                else:
+                    resident.append(None)
                 if len(shown) < n_show:
                     shown.append((prev.strip(), tr, live.strip(),
                                   abl_txt.strip()))
                 qi += 1
-            bank = env.write(model, bank, seg)
-            wcount += env.last_added
-            f = OracleEnv.fact_of(seg)
-            if f is not None and env.last_added:
-                slot_w[f[0]] = wcount        # instant du write DE CE FAIT
+            if not r4:                        # r4 n'a pas de banque
+                bank = env.write(model, bank, seg)
+                wcount += env.last_added
+                f = OracleEnv.fact_of(seg)
+                if f is not None and env.last_added:
+                    slot_w[f[0]] = wcount    # instant du write DE CE FAIT
             prev = tok.decode(seg["input_ids"][0].tolist())
     model.train()
     out = {
@@ -1658,6 +1875,20 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         "age_evicted": (sum(1 for x in ages if x >= env.max_mem) / len(ages))
                        if ages else float("nan"),
     }
+    # GRADE CONDITIONNÉ À LA RÉSIDENCE : en `every`, le flux évince une bonne
+    # part des faits AVANT leur query — le grade brut est alors plafonné par
+    # l'éviction et ne dit plus rien du READ. `grade_resident` ne grade que les
+    # réponses dont le fait était ENCORE là : c'est le chiffre qui juge le read.
+    # (r4 : « résident » = un groupe a bien été injecté.)
+    ridx = [i for i, x in enumerate(resident) if x is True]
+    out["n_resident"] = len(ridx)
+    out["n_absent"] = n_absent
+    out["grade_resident"] = (
+        grade_recall([live_ans[i] for i in ridx],
+                     [truths_all[i] for i in ridx]) if ridx else float("nan"))
+    out["grade_resident_abl"] = (
+        grade_recall([abl_ans[i] for i in ridx],
+                     [truths_all[i] for i in ridx]) if ridx else float("nan"))
     # grade PAR STRATE de valeur (short / word / code)
     for gname in GROUPS:
         idx = [i for i, x in enumerate(groups) if x == gname]
@@ -1722,6 +1953,16 @@ def main(argv=None):
                     dest="no_row_pos_tag",
                     help="toprows : lignes de contenu STRICTEMENT natives "
                          "(sans le tag de position ×0.2)")
+    ap.add_argument("--readout-mix", choices=READOUT_MIXES, default=None,
+                    dest="readout_mix",
+                    help="surcharge code.readout_mix (GroupReadout) : linear = "
+                         "superposition des lignes puis UNE projection "
+                         "(défaut) ; mos = une distribution PAR LIGNE puis "
+                         "mixture (aucun token hybride possible)")
+    ap.add_argument("--final-eval-convs", type=int, default=None,
+                    dest="final_eval_convs",
+                    help="surcharge training.final_eval_convs (passe d'éval "
+                         "élargie en fin de run ; 0 = désactivée)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -1733,7 +1974,7 @@ def main(argv=None):
         return
 
     assert a.config, "config YAML requise (ou --selftest)"
-    if a.code != "mean" and a.variant != "r3":
+    if a.code != "mean" and a.variant not in ("r3",) + INJECT_VARIANTS:
         raise SystemExit(
             f"--code {a.code} n'est supporté QUE par --variant r3 (banque en "
             f"espace d'embedding + pointer nu). Les variantes r0/r1/r2 sont le "
@@ -1758,6 +1999,12 @@ def main(argv=None):
         mc["top_k"] = int(cb["top_k"])
     if "row_pos_tag" in cb:
         mc["row_pos_tag"] = bool(cb["row_pos_tag"])
+    if "readout_mix" in cb:
+        mc["readout_mix"] = str(cb["readout_mix"])
+    if "pos_entropy" in cb:
+        mc["pos_entropy"] = float(cb["pos_entropy"])
+    if a.readout_mix is not None:          # la CLI gagne sur le YAML
+        mc["readout_mix"] = a.readout_mix
     if a.pos_offset is not None:           # la CLI gagne sur le YAML
         mc["pos_offset"] = int(a.pos_offset)
     if a.pack_blocks is not None:
@@ -1773,6 +2020,9 @@ def main(argv=None):
     eval_every = int(t.get("eval_every", 200))
     eval_convs = int(t.get("eval_convs", 24))
     max_new = int(t.get("max_new", 48))
+    # éval FINALE élargie (0 = désactivée) : le juge du run, cf. plus bas.
+    final_eval_convs = int(a.final_eval_convs if a.final_eval_convs is not None
+                           else t.get("final_eval_convs", 200))
     if a.smoke:
         mc.update(d_model=64, n_layers=2, n_heads=4, mem_dim=64, x_dim=0)
         steps, b_convs, eval_every, eval_convs, max_new = 2, 2, 1, 1, 8
@@ -1785,6 +2035,12 @@ def main(argv=None):
     mc["code"] = a.code
     mc["write_mode"] = a.write_mode
     mc["vocab_size"] = len(tok)
+    if a.variant in INJECT_VARIANTS:
+        # séparateur entre le préfixe injecté et le tour : `<blank>`, un token
+        # NATIF du vocab (ajouté par build_tokenizer) qui n'apparaît jamais
+        # dans les données du toy — il ne peut donc pas être confondu avec du
+        # contenu.
+        mc["inject_sep_id"] = int(tok.convert_tokens_to_ids("<blank>"))
     cfg = ToyCfg(**mc)
     P = chat_stream_class("persona")
     sif_w = None
@@ -1809,6 +2065,10 @@ def main(argv=None):
             run_name += f"_k{cfg.top_k}"       # sweep de k = run à part
         if not cfg.row_pos_tag:
             run_name += "_notag"
+    if cfg.readout_mix != ToyCfg.readout_mix:
+        run_name += f"_{cfg.readout_mix}"      # bras MoS = run à part
+    if cfg.pos_entropy:
+        run_name += f"_ent{cfg.pos_entropy:g}"
     if cfg.write_mode == "every":
         run_name += "_wev"
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
@@ -1884,6 +2144,26 @@ def main(argv=None):
           f"appariement de budget entre variantes via model.x_dim (référence "
           f"= le hypernetwork fast-weight de r0 ; r3 reste structurellement "
           f"plus léger, sa V n'est pas projetée).", flush=True)
+    if cfg.variant in INJECT_VARIANTS:
+        print(f"  INJECTION À SÉLECTION ORACLE : AUCUN module de read appris "
+              f"(ni cross-attn, ni pointer) — le backbone NU lit un préfixe de "
+              f"{cfg.top_k} pseudo-tokens (embeddings BRUTS, non normés, + un "
+              f"vecteur de type appris), séparateur id {cfg.inject_sep_id}, "
+              f"positions RoPE 0..{cfg.top_k - 1} puis tour réel décalé de "
+              f"{cfg.top_k + 2}. ABLATÉ = le même tour SANS préfixe. "
+              f"PRIVILÈGE DÉCLARÉ : la sélection du groupe est l'oracle, et "
+              f"l'injection est teacher-forcée à l'entraînement (aucun "
+              f"curriculum de copie in-context).", flush=True)
+    if cfg.code in GROUP_CODES and cfg.readout_mix == "mos":
+        print(f"  readout MoS : une distribution PAR LIGNE puis mixture "
+              f"pondérée s·p (aucune superposition dans l'espace d'embedding, "
+              f"donc aucun token hybride fabricable)"
+              + (f" | pénalité d'entropie sur p : {cfg.pos_entropy:g}"
+                 if cfg.pos_entropy else ""), flush=True)
+    print(f"  éval FINALE élargie : {final_eval_convs} convs "
+          + ("(désactivée)" if final_eval_convs <= 0 else
+             "en fin de run → final_metrics.csv (les paliers restent à "
+             f"{eval_convs})"), flush=True)
     print(f"  save_dir {save_dir}", flush=True)
 
     amp = bool(t.get("amp", True)) and device.startswith("cuda")
@@ -1993,6 +2273,54 @@ def main(argv=None):
                            os.path.join(save_dir, "best.pt"))
     torch.save({"step": steps, "model": model.state_dict(),
                 "cfg": cfg.__dict__}, os.path.join(save_dir, "final.pt"))
+
+    # ── ÉVAL FINALE ÉLARGIE ─────────────────────────────────────────────────
+    # Les paliers gradent ~30 réponses (strate `code` : n=10, IC95 d'un 3/10 =
+    # [0.07, 0.65]) — INADJUDICABLE. Une seule passe élargie en fin de run met
+    # l'erreur-type sous 0.03 pour un coût payé UNE fois. Même fonction, même
+    # stream held-out, même graine : seul n_convs change.
+    if final_eval_convs > 0:
+        fv = evaluate(model, env, ev_stream, 1234, final_eval_convs, device,
+                      tok, a_open, stop_id, max_new, max_len, amp, n_show=0)
+        se = math.sqrt(max(fv["grade_live"] * (1 - fv["grade_live"]), 1e-9)
+                       / max(fv["n"], 1))
+        print(f"  [final] HELD-OUT ({final_eval_convs} convs) grade live "
+              f"{fv['grade_live']:.3f} ± {se:.3f} (SE) abl "
+              f"{fv['grade_abl']:.3f} Δnll {fv['dnll']:+.4f} (n={fv['n']})",
+              flush=True)
+        print("    [final] strates : " + "  ".join(
+            f"{g} {fv['grade_' + g]:.3f} (n={fv['n_' + g]})" for g in GROUPS)
+            + f"  | porte pointer σ {fv['ptr_gate']:.4f}", flush=True)
+        if cfg.write_mode == "every" or cfg.variant in INJECT_VARIANTS:
+            lab = ("injecté" if cfg.variant in INJECT_VARIANTS
+                   else "NON ÉVINCÉ")
+            print(f"    [final] grade | {lab} {fv['grade_resident']:.3f} "
+                  f"(n={fv['n_resident']}/{fv['n']}) abl "
+                  f"{fv['grade_resident_abl']:.3f}"
+                  + (f" | sans injection (fait évincé) {fv['n_absent']}"
+                     if cfg.variant in INJECT_VARIANTS else
+                     f" | évincés {fv['age_evicted']:.3f}"), flush=True)
+        fp = os.path.join(save_dir, "final_metrics.csv")
+        with open(fp, "w", newline="") as f:
+            w = csv.writer(f)
+            cols = ["n_convs", "grade_live", "grade_live_se", "grade_abl",
+                    "dnll", "n", "grade_resident", "grade_resident_abl",
+                    "n_resident", "n_absent", "age_evicted"] \
+                + [c for g in GROUPS for c in
+                   (f"grade_{g}", f"grade_{g}_abl", f"n_{g}")] + ["ptr_gate"]
+            w.writerow(cols)
+
+            def _g(x):
+                return "" if x != x else f"{x:.4f}"
+            w.writerow([final_eval_convs, _g(fv["grade_live"]), f"{se:.4f}",
+                        _g(fv["grade_abl"]), _g(fv["dnll"]), fv["n"],
+                        _g(fv["grade_resident"]), _g(fv["grade_resident_abl"]),
+                        fv["n_resident"], fv["n_absent"],
+                        _g(fv["age_evicted"])]
+                       + [v for g in GROUPS for v in
+                          (_g(fv[f"grade_{g}"]), _g(fv[f"grade_{g}_abl"]),
+                           fv[f"n_{g}"])] + [_g(fv["ptr_gate"])])
+        print(f"  [final] écrit {fp}", flush=True)
     print(f"done — best grade held-out {best:.3f} | ckpt {save_dir}", flush=True)
 
 
@@ -2216,7 +2544,7 @@ def _selftest() -> None:
 
     # 5bis. lane SANS aucune ligne dans un groupe où d'autres en ont : le
     # softmax de r1/r2/r3 doit rester défini (bug NaN payé au premier smoke).
-    for var in VARIANTS:
+    for var in BANK_VARIANTS:
         cv = ToyCfg(vocab_size=512, d_model=32, n_layers=2, n_heads=4,
                     mem_dim=32, variant=var, max_seq_len=256)
         mv = ToyReadLM(cv, env.n_slots, env.n_attrs)
@@ -2235,7 +2563,7 @@ def _selftest() -> None:
         assert torch.allclose(a1, a2, atol=1e-5), f"lane vide != ablaté ({var})"
 
     # 6. comptage de params + forward de chaque variante
-    for var in VARIANTS:
+    for var in BANK_VARIANTS:
         cv = ToyCfg(vocab_size=512, d_model=32, n_layers=2, n_heads=4,
                     mem_dim=32, variant=var, max_seq_len=256)
         mv = ToyReadLM(cv, env.n_slots, env.n_attrs)
@@ -2881,6 +3209,153 @@ def _selftest() -> None:
     assert torch.equal(g_short[4], g_short[9]), \
         "groupe court : la dernière ligne de contenu doit être répétée"
 
+    # ═══ CHANTIER 2 : readout MoS (mélanger les DISTRIBUTIONS) ══════════════
+    torch.manual_seed(20260803)
+    # UN SEUL modèle, on ne bascule que le mode de mélange : la banque doit
+    # être faite des embeddings DE CE modèle, sinon les lignes sont des
+    # vecteurs étrangers, tous les softmax sont plats et la mesure ne veut
+    # plus rien dire (piège payé en écrivant ce test).
+    m_one = _mk("toprows", d=512, top_k=K6)
+    env_m = OracleEnv(tok, 8)
+    b_m: list = []
+    for kk in range(3):
+        s = dict(seg_tpl)
+        s["fact_val"] = torch.full_like(seg_tpl["fact_val"], 1 + kk)
+        s["input_ids"] = seg_tpl["input_ids"].clone()
+        s["input_ids"][0, 1] = 100 + kk
+        b_m = env_m.write(m_one, b_m, s)
+    bk_m = torch.stack(list(b_m))[None]
+    bm_m = torch.ones(1, bk_m.size(1), dtype=torch.bool)
+    h_m = torch.randn(1, 4, 512)
+    # 17a. porte fermée ⇒ biais EXACTEMENT nul aussi en MoS (le log ne doit pas
+    #      fabriquer de NaN : les probas sous-débordantes sont clampées)
+    m_one.ptr.mix = "mos"
+    with torch.no_grad():
+        bm_bias = m_one.ptr(h_m, bk_m, bm_m, m_one.embed.weight)
+    assert float(bm_bias.abs().max()) == 0.0 and torch.isfinite(bm_bias).all()
+    # 17b. porte OUVERTE : le MoS ne peut PAS élire un token qu'AUCUNE ligne ne
+    #      porte. On force le PIRE CAS de superposition : sélection de groupe et
+    #      porte-position UNIFORMES (wq/wp à zéro), donc le linéaire additionne
+    #      toutes les lignes de la banque avant de projeter.
+    with torch.no_grad():
+        m_one.ptr.scale.fill_(30.0)
+        m_one.ptr.gate.bias.fill_(8.0)
+        m_one.ptr.wp.weight.zero_()
+        m_one.ptr.wq.weight.zero_()
+        m_one.ptr.mix = "mos"
+        top_mos = [int(x) for x in
+                   m_one.ptr(h_m, bk_m, bm_m, m_one.embed.weight)[0].argmax(-1)]
+        m_one.ptr.mix = "linear"
+        top_lin = [int(x) for x in
+                   m_one.ptr(h_m, bk_m, bm_m, m_one.embed.weight)[0].argmax(-1)]
+    # tokens RÉELLEMENT présents dans la banque (toutes lignes de contenu)
+    Erms_g = rms_unit(m_one.embed.weight.float())
+    present = set()
+    for r in range(bk_m.size(1)):
+        if r % (1 + K6) == 0:
+            continue                          # ligne-clé : pas un token
+        present.add(int(torch.argmax(Erms_g @ bk_m[0, r])))
+    assert all(t in present for t in top_mos), (
+        f"MoS a élu un token ABSENT de la banque {top_mos} ⊄ {present}")
+    mos_hyb = 0                               # (le linéaire, lui, PEUT sortir
+    lin_hyb = sum(1 for t in top_lin if t not in present)   # du répertoire)
+    # 17c. le knob est bien porté par la config et refuse l'inconnu
+    assert _mk("toprows", d=32, top_k=3).cfg.readout_mix == "linear"
+    try:
+        ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32, variant="r3",
+               code="toprows", top_k=3, readout_mix="bogus")
+    except AssertionError as e:
+        assert "readout_mix" in str(e)
+    else:
+        raise AssertionError("readout_mix inconnu aurait dû être refusé")
+    # 17d. l'entropie de la porte-position est exposée et DÉRIVABLE (pénalité)
+    m_e2 = _mk("toprows", d=512, top_k=K6)
+    m_e2.ptr(h_m, bk_m, bm_m, m_e2.embed.weight)
+    assert m_e2.ptr.last_pos_ent.requires_grad
+    assert abs(float(m_e2.ptr.last_pos_ent) - math.log(K6)) < 1e-4, \
+        "porte-position zéro-init : l'entropie doit être log(k) (uniforme)"
+
+    # ═══ CHANTIER 3 : r4, injection à sélection oracle ══════════════════════
+    torch.manual_seed(20260804)
+    c_r4 = ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                  mem_dim=64, variant="r4", max_seq_len=64, code="toprows",
+                  seg_n_pos=8, sif_a=A_SIF, top_k=4, inject_sep_id=5)
+    m_r4 = ToyReadLM(c_r4, env.n_slots, env.n_attrs, sif_w=_sifw()).eval()
+    # 18a. AUCUN module de read appris : ni cross-attn, ni fast-weight, ni ptr
+    assert m_r4.ptr is None and all(b.read is None for b in m_r4.blocks)
+    assert [n for n, _ in m_r4.named_parameters() if "inject_type" in n] == \
+        ["inject_type"], "r4 doit avoir UN seul paramètre de read"
+    assert float(m_r4.inject_type.abs().max()) == 0.0, "inject_type zéro-init"
+    # 18b. l'injection CHANGE le forward, et l'ABLATÉ est le backbone NU
+    #      bit-à-bit (c'est le contraste que le run mesure)
+    ids4 = torch.randint(0, 512, (2, 7))
+    inj4 = torch.randint(0, 512, (2, 4))
+    with torch.no_grad():
+        o_inj = m_r4(ids4, None, None, inject=inj4)
+        o_abl = m_r4(ids4, None, None)
+        o_abl2 = m_r4(ids4)
+    assert o_inj.shape == o_abl.shape == (2, 7, 512), o_inj.shape
+    assert torch.equal(o_abl, o_abl2), "ablaté r4 ≠ backbone nu"
+    assert not torch.allclose(o_inj, o_abl, atol=1e-5), \
+        "l'injection ne change RIEN au forward"
+    # 18c. le contenu injecté COMPTE (deux préfixes différents ⇒ deux sorties)
+    with torch.no_grad():
+        o_inj2 = m_r4(ids4, None, None, inject=(inj4 + 1) % 512)
+    assert not torch.allclose(o_inj, o_inj2, atol=1e-5)
+    # 18d. POSITIONS : le tour réel est décalé de k+2 et la position k+1 reste
+    #      VIDE. On le vérifie par construction du vecteur d'index.
+    k4, T4 = 4, 7
+    pos_expect = list(range(k4 + 1)) + [k4 + 2 + i for i in range(T4)]
+    assert pos_expect[:k4] == [0, 1, 2, 3]        # injecté 0..k−1
+    assert pos_expect[k4] == 4                    # séparateur
+    assert pos_expect[k4 + 1] == 6                # tour réel : trou en 5
+    # et le modèle utilise BIEN ces positions : décaler la RoPE change la
+    # sortie, donc le trou n'est pas cosmétique.
+    with torch.no_grad():
+        cos, sin = _rope_tables(16, 16, c_r4.rope_theta, ids4.device,
+                                torch.float32)
+        assert not torch.allclose(cos[5], cos[6], atol=1e-6)
+    # 18e. lignes injectées = embeddings BRUTS (NON RMS-normés) + type
+    with torch.no_grad():
+        pre = m_r4.embed(inj4) + m_r4.inject_type
+        assert torch.equal(pre, m_r4.embed(inj4)), "type zéro-init : pre = brut"
+        nrm = pre.float().pow(2).mean(-1).sqrt()
+        assert float((nrm - 1.0).abs().max()) > 1e-3, \
+            "les lignes injectées ne doivent PAS être RMS-normées"
+    # 18f. le PLAN d'injection : un groupe par seg de réponse, sélection =
+    #      celle du write, et le fait ÉVINCÉ n'est pas injecté.
+    plan, absent = env.inject_plan(m_r4, conv)
+    for i, tk in plan.items():
+        assert conv["segs"][i]["role"] == "assistant"
+        assert tk.numel() <= c_r4.top_k
+    # un fait écrit APRÈS la réponse ne peut pas être injecté devant elle
+    assert all(i > min((j for j, s in enumerate(conv["segs"])
+                        if OracleEnv.fact_of(s)), default=0) for i in plan)
+    # 18g. r4 REFUSE ce qui n'a pas de sens : un autre code, le régime `every`
+    for bad, needle in ((dict(code="segsif"), "toprows"),
+                        (dict(code="toprows", write_mode="every"), "fact-only")):
+        try:
+            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                   variant="r4", seg_n_pos=8, sif_a=A_SIF, top_k=3, **bad)
+        except AssertionError as e:
+            assert needle in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"r4 aurait dû refuser {bad}")
+
+    # ═══ CHANTIER 1 : grade CONDITIONNÉ À LA RÉSIDENCE ══════════════════════
+    # 19. `resident` est aligné sur les réponses gradées : autant d'entrées que
+    #     de vérités, et grade_resident ne grade QUE les faits encore là.
+    #     (Test d'intégration mené sur le vrai `evaluate` au smoke ; ici on
+    #     vérifie l'invariant d'alignement sur une trace synthétique.)
+    _live = ["Palermo", "X", "Barnaby"]
+    _tru = ["Palermo", "Y", "Barnaby"]
+    _res = [True, False, True]
+    _idx = [i for i, x in enumerate(_res) if x is True]
+    assert len(_res) == len(_tru)
+    assert grade_recall([_live[i] for i in _idx],
+                        [_tru[i] for i in _idx]) == 1.0, \
+        "grade|non-évincé doit ignorer les réponses dont le fait est sorti"
+
     # 16. RÉTRO-COMPAT BIT-À-BIT des codes NON-pack. La constante ci-dessous a
     #     été relevée sur le commit 4daf6a6 (phase 4, AVANT le pack) avec la
     #     même graine et les mêmes entrées : si l'ajout du pack avait déplacé
@@ -2900,6 +3375,20 @@ def _selftest() -> None:
         f"RÉTRO-COMPAT ROMPUE : forward segsif {out_rc} ≠ {RC_REF_4DAF6A6} "
         f"(valeur du commit 4daf6a6) — l'ajout du pack a déplacé un chemin "
         f"partagé ou le tirage des poids")
+    # … et la MÊME garantie pour `toprows` en readout_mix=linear (le défaut),
+    # constante relevée sur le commit 1345f49 (phase 6, avant MoS et r4).
+    torch.manual_seed(4242)
+    m_r2 = _mk("toprows", d=64, n_pos=4, vocab=512, seg_n_pos=8, top_k=3)
+    rows_r2 = m_r2.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
+    with torch.no_grad():
+        out_r2 = float(m_r2(ids_rc, rows_r2[None].expand(2, -1, -1).contiguous(),
+                            torch.ones(2, rows_r2.shape[0], dtype=torch.bool)
+                            ).double().sum())
+    RC_REF_1345F49 = -18.753843640828563
+    assert abs(out_r2 - RC_REF_1345F49) < 1e-9, (
+        f"RÉTRO-COMPAT ROMPUE : forward toprows/linear {out_r2} ≠ "
+        f"{RC_REF_1345F49} (valeur du commit 1345f49) — le MoS ou r4 a touché "
+        f"le chemin par défaut du GroupReadout")
 
     print("toy_read_lab self-test: OK (write oracle déterministe & "
           "embedding-dépendant, FIFO 8, porte pointer fermée à l'init, "
@@ -2955,9 +3444,29 @@ def _selftest() -> None:
           f"complète après 8 segs vides ; GroupReadout biais EXACTEMENT 0 porte "
           f"fermée, cite une ligne du groupe porte ouverte, banque mal alignée "
           f"refusée ; groupe de taille FIXE même sur seg court")
+    print(f"  chantier 2 — readout MoS : biais EXACTEMENT 0 porte fermée (log "
+          f"clampé, aucun NaN), et dans le PIRE CAS de superposition (sélection "
+          f"et porte-position uniformes) le MoS n'élit QUE des tokens présents "
+          f"en banque — propriété GARANTIE, alors que le linéaire n'en offre "
+          f"aucune (il en sort {lin_hyb}/4 fois sur ce tirage) ; knob "
+          f"readout_mix (défaut linear) et entropie de p exposée/dérivable "
+          f"(= log k à l'init)")
+    print("  chantier 3 — r4 INJECTION ORACLE : aucun module de read (UN seul "
+          "paramètre, inject_type zéro-init), ablaté ≡ backbone nu BIT-À-BIT, "
+          "l'injection change le forward et son CONTENU compte, lignes "
+          "injectées NON RMS-normées, positions 0..k−1 / séparateur / tour "
+          "décalé de k+2 (trou en k+1), plan d'injection = sélection du write "
+          "avec FIFO max_mem (fait évincé ⇒ pas d'injection), r4 refuse un "
+          "autre code et le régime every")
+    print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
+          "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
+          "(training.final_eval_convs, défaut 200) écrite dans "
+          "final_metrics.csv avec son erreur-type")
     print("  rétro-compat — forward segsif identique BIT-À-BIT au commit "
           "4daf6a6 (constante figée dans le self-test) : l'ajout du pack n'a "
-          "déplacé ni un chemin partagé ni le tirage des poids")
+          "déplacé ni un chemin partagé ni le tirage des poids ; forward "
+          "toprows/linear identique BIT-À-BIT au commit 1345f49 (le MoS et r4 "
+          "n'ont pas touché le chemin par défaut)")
 
 
 if __name__ == "__main__":
