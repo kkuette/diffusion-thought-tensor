@@ -1310,6 +1310,29 @@ class ToyReadLM(nn.Module):
         return st[sel]
 
     @torch.no_grad()
+    def toprows_sel_fixed(self, seg_tok: torch.Tensor) -> torch.Tensor:
+        """Les tokens sélectionnés, TOUJOURS top_k — la version « injection ».
+
+        `toprows_sel` en rend min(top_k, |seg|) : un segment porteur plus court
+        que top_k (mesuré : les segs vont de 12 à 26 tokens, donc ça arrive dès
+        top_k = 13) donnait un groupe COURT, et empiler des plans de longueurs
+        différentes dans un batch plantait au premier pas (job 58).
+
+        Complétion : le DERNIER token est répété — exactement la convention du
+        chemin banque (`toprows_rows`, « TAILLE FIXE : le groupe fait TOUJOURS
+        1 + top_k lignes »). Un candidat en double est inerte.
+        """
+        t = self.toprows_sel(seg_tok)
+        k = self.cfg.top_k
+        n = int(t.numel())
+        if n == k:
+            return t
+        if n == 0:                    # segment vide (jamais observé)
+            return torch.zeros(k, dtype=torch.long,
+                               device=self.embed.weight.device)
+        return torch.cat([t, t[-1].repeat(k - n)])
+
+    @torch.no_grad()
     def toprows_rows(self, slot_id: int, attr_id: int,
                      seg_tok: torch.Tensor | None = None,
                      bare: bool = False) -> torch.Tensor:
@@ -1638,7 +1661,9 @@ class OracleEnv:
                     plan[i] = hit
             f = self.fact_of(seg)
             if f is not None:
-                fifo.append((f[0], model.toprows_sel(self.seg_tokens(seg))))
+                # TAILLE FIXE : les plans d'un batch s'empilent, ils doivent
+                # tous faire top_k (cf. toprows_sel_fixed).
+                fifo.append((f[0], model.toprows_sel_fixed(self.seg_tokens(seg))))
                 fifo = fifo[-self.max_mem:]
         return plan, absent
 
@@ -1719,18 +1744,23 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
         lanes = [i for i, c in enumerate(convs) if j < len(c["segs"])]
         if not lanes:
             continue
+        # Le drapeau « ce sous-lot est injecté » VOYAGE AVEC le sous-lot : le
+        # relire d'après convs[sub[0]] ferait dépendre TOUT le lot de la
+        # première conv (KeyError si elle seule n'a pas de plan à j, injections
+        # perdues en silence dans l'autre sens).
         if r4:
-            subsets = [[i for i in lanes if j in plans[i]],
-                       [i for i in lanes if j not in plans[i]]]
+            subsets = [([i for i in lanes if j in plans[i]], True),
+                       ([i for i in lanes if j not in plans[i]], False)]
         else:
-            subsets = [lanes]
-        for sub in subsets:
+            subsets = [(lanes, False)]
+        for sub, has_inj in subsets:
             if not sub:
                 continue
             segs = [convs[i]["segs"][j] for i in sub]
             X, W = pad_segs(segs, device, max_len)
             inj = None
-            if r4 and j in plans[sub[0]]:
+            if has_inj:
+                # toutes de MÊME longueur (top_k) : cf. toprows_sel_fixed
                 inj = torch.stack([plans[i][j] for i in sub]).to(device)
             bank, bmask = pad_bank([banks[i] for i in sub], device)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
@@ -3327,7 +3357,7 @@ def _selftest() -> None:
     plan, absent = env.inject_plan(m_r4, conv)
     for i, tk in plan.items():
         assert conv["segs"][i]["role"] == "assistant"
-        assert tk.numel() <= c_r4.top_k
+        assert tk.numel() == c_r4.top_k, (i, tk.numel())
     # un fait écrit APRÈS la réponse ne peut pas être injecté devant elle
     assert all(i > min((j for j, s in enumerate(conv["segs"])
                         if OracleEnv.fact_of(s)), default=0) for i in plan)
@@ -3341,6 +3371,57 @@ def _selftest() -> None:
             assert needle in str(e), (bad, str(e))
         else:
             raise AssertionError(f"r4 aurait dû refuser {bad}")
+    # 18h. RÉGRESSION job 58 — deux bugs payés au premier pas sur le rig :
+    #   (i)  un seg porteur PLUS COURT que top_k rendait un plan court, et
+    #        empiler [13] avec [12] plantait torch.stack ;
+    #   (ii) le sous-lot injecté se relisait d'après la PREMIÈRE conv du lot.
+    # Le test fait passer les deux par le VRAI train_step.
+    m_r4b = ToyReadLM(ToyCfg(vocab_size=512, d_model=64, n_layers=2,
+                             n_heads=4, mem_dim=64, variant="r4",
+                             max_seq_len=256, code="toprows", seg_n_pos=8,
+                             sif_a=A_SIF, top_k=6, inject_sep_id=5),
+                      env.n_slots, env.n_attrs, sif_w=_sifw())
+    short_seg = torch.tensor([11, 77, 200])          # 3 tokens < top_k 6
+    raw_sel = m_r4b.toprows_sel(short_seg)
+    fix_sel = m_r4b.toprows_sel_fixed(short_seg)
+    assert raw_sel.numel() == 3 and fix_sel.numel() == 6
+    assert torch.equal(fix_sel[:3], raw_sel) and \
+        bool((fix_sel[3:] == raw_sel[-1]).all()), fix_sel
+    # un seg DÉJÀ assez long n'est pas touché
+    assert torch.equal(m_r4b.toprows_sel_fixed(seg20),
+                       m_r4b.toprows_sel(seg20))
+    # conv B : MÊMES segs mais AUCUN fait ⇒ aucun plan (le lot est MIXTE)
+    convB = {"info": conv["info"], "segs": [dict(s) for s in conv["segs"]]}
+    for s in convB["segs"]:
+        s.pop("fact_slot", None)
+    # conv C : TOUS les segs porteurs tronqués à 3 tokens ⇒ toute sélection est
+    # courte, donc tout plan de cette conv DOIT avoir été complété.
+    convC = {"info": conv["info"], "segs": [dict(s) for s in conv["segs"]]}
+    for s in convC["segs"]:
+        if OracleEnv.fact_of(s):
+            for key in ("input_ids", "loss_mask", "attention_mask"):
+                if key in s:
+                    s[key] = s[key][:, :3]
+    pA = env.inject_plan(m_r4b, conv)[0]
+    pB = env.inject_plan(m_r4b, convB)[0]
+    pC = env.inject_plan(m_r4b, convC)[0]
+    assert pA and not pB, "le lot n'est pas mixte, le test ne prouve rien"
+    assert all(t.numel() == 6 for t in pA.values())
+    assert pC, "conv C sans plan : le cas du seg court n'est pas exercé"
+    for t in pC.values():
+        assert t.numel() == 6, ("plan d'un seg porteur court : la complétion "
+                                "n'a pas eu lieu", t.numel())
+        # ≤ 3 tokens réels complétés à 6 ⇒ la queue est forcément répétée
+        assert int(t[-1]) == int(t[-2]), t
+    # … et les trois traversent train_step ensemble SANS erreur (c'est le
+    # crash du job 58), dans les DEUX ordres (le bug (ii) dépendait de qui
+    # était en tête du lot).
+    for order in ([conv, convB, convC], [convB, conv, convC]):
+        m_r4b.zero_grad(set_to_none=True)
+        lo = train_step(m_r4b, env, order, "cpu", 256, False, 1.0)
+        assert lo == lo and lo > 0, lo               # ni NaN ni lot vide
+    assert m_r4b.inject_type.grad is not None, \
+        "aucun gradient n'a atteint l'injection : rien n'a été injecté"
 
     # ═══ CHANTIER 1 : grade CONDITIONNÉ À LA RÉSIDENCE ══════════════════════
     # 19. `resident` est aligné sur les réponses gradées : autant d'entrées que
