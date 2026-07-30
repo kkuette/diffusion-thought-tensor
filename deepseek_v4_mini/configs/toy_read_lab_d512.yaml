@@ -28,6 +28,7 @@
 #   --code mean|chunk|phase|rows        (phase 2, pool du SPAN VALEUR)
 #   --code segmean|segphase|segsif      (phase 3, pool du SEGMENT ENTIER)
 #   --code pack|segpack                 (phase 5, ligne PARTITIONNÉE en blocs)
+#   --code toprows                      (phase 6, GROUPES de lignes NATIVES)
 #
 # Axe RÉGIME DE WRITE :
 #   --write fact   (défaut) l'oracle n'écrit qu'après les segs PORTEURS
@@ -185,7 +186,56 @@ code:
                           # payé par une marge à +1.4σ seulement. Si le grade de
                           # r3_segpack plafonne par MANQUE DE CAPACITÉ (valeurs
                           # tronquées), 16 est le knob à tourner.
-  sif_a: 0.01             # `segsif`/`segpack` : le a de w = a/(a+p(token)).
+  # ── PHASE 6 : --code toprows (r3 seulement) ───────────────────────────────
+  # PRINCIPE : NE JAMAIS TRANSFORMER. Le write SÉLECTIONNE des embeddings et
+  # les stocke TELS QUELS. La banque devient une FIFO de GROUPES : un write
+  # dépose 1+top_k lignes — ligne 0 = CLÉ dédiée de la paire (slot, attr),
+  # lignes 1.. = les embeddings BRUTS des top_k tokens SIF du segment, dans
+  # l'ordre du segment. max_mem reste le nombre de GROUPES résidents (8), donc
+  # le même nombre de writes résidents que tous les autres codes ; l'éviction
+  # FIFO sort un groupe ENTIER et les âges restent comptés en writes.
+  # POURQUOI : les 4 bras pack ont montré que la ligne pack (concat de
+  # projections) est ÉTRANGÈRE à l'espace d'embedding et tue le canal contenu
+  # du CrossAttnRead — Δnll effondré à +1.5 contre +4.7 (phase) et +5.5 (mean),
+  # alors même que b16 donnait le meilleur grade sans-privilège (0.3-0.4).
+  # Des lignes natives rendent la banque lisible par le read de contenu ET par
+  # le readout de citation, sans rien dé-projeter.
+  top_k: 13               # lignes de CONTENU par groupe (⇒ groupes de 14
+                          # lignes, banque effective 8×14 = 112 lignes de 512).
+                          # MESURÉ (500 faits held-out, couverture = fraction
+                          # des tokens de VALEUR survivant à la sélection) :
+                          #    k    global   valeur complète   code  short  word
+                          #    4    47.9 %        50.8 %      19.5 %  96.4  89.0
+                          #    6    57.2 %        59.4 %      31.2 % 100.0  95.8
+                          #    8    71.1 %        61.8 %      53.1 % 100.0  98.5
+                          #   12    94.3 %        79.0 %      90.7 % 100.0  99.8
+                          #   13    98.2 %        92.6 %      97.0 % 100.0 100.0
+                          #   14    99.8 %        99.2 %      99.7 % 100.0 100.0
+                          # 13 = le plus petit k dont la strate `code` passe
+                          # 95 %. ⚠️ C'EST BEAUCOUP PLUS QUE LES 6 ATTENDUS, et
+                          # la raison est le BIAIS SIF déjà documenté : les
+                          # codes/refs/plaques sont faits de digrammes
+                          # FRÉQUENTS, donc le SIF les classe BAS. Rang médian
+                          # d'un token de valeur dans le tri SIF du segment :
+                          # strate code 7 (p90 11) contre 0 pour `short` et 1
+                          # pour `word`. Les segs porteurs faisant 18.6 tokens
+                          # en moyenne, k=13 revient à garder ~70 % du segment :
+                          # à ce régime la sélection SIF ne sélectionne presque
+                          # plus, elle ne fait qu'écarter le template.
+                          # ARBITRAGE : k=8 (groupes de 9, banque 72) garde
+                          # 100 % de `short` et 98.5 % de `word` pour 53 % de
+                          # `code` — c'est le bras économique si la strate code
+                          # n'est pas la cible. --top-k le change sans recommit
+                          # (suffixe _k<K> au save_dir).
+  row_pos_tag: true       # marquer la ligne de contenu j par pos_emb[j] × 0.2
+                          # (model.oracle_ka_scale), le tag du format `rows`
+                          # dont le round-trip était à 100 %. Quasi-non-
+                          # transformation : l'embedding domine, l'argmax ne
+                          # bouge pas (vérifié au self-test). false = lignes
+                          # STRICTEMENT natives, l'ordre ne tient plus qu'au
+                          # layout du groupe (--no-row-pos-tag, suffixe _notag).
+
+  sif_a: 0.01             # `segsif`/`segpack`/`toprows` : a de w = a/(a+p).
                           # La table unigram vient de _sif_table() de
                           # PersonaChatStream (300 convs, rng 4242) — MÊME
                           # recette que le write du 350M. Le stream d'entraîne-

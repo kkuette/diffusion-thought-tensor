@@ -216,11 +216,11 @@ from .streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3")
 CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif",
-         "pack", "segpack")
+         "pack", "segpack", "toprows")
 # formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
 # d'oracle sur le span valeur). Ils indexent la position DANS LE SEGMENT, donc
 # ils utilisent `seg_n_pos` et non `n_pos`.
-SEG_CODES = ("segmean", "segphase", "segsif", "segpack")
+SEG_CODES = ("segmean", "segphase", "segsif", "segpack", "toprows")
 # formats à binding DFT sur la position DANS LE SEGMENT (mêmes tables, mêmes
 # candidats pointer) — seule la PONDÉRATION du pool les distingue.
 SEG_PHASE_CODES = ("segphase", "segsif")
@@ -231,8 +231,12 @@ WRITE_MODES = ("fact", "every")
 # formats PARTITIONNÉS (phase 5) : la ligne est un PACK de blocs disjoints —
 # bloc 0 = clé dédiée, blocs 1..B−1 = un token chacun. Readout = PackReadout.
 PACK_CODES = ("pack", "segpack")
+# formats à BANQUE DE GROUPES (phase 6) : un write dépose 1+top_k LIGNES
+# NATIVES — ligne 0 = clé dédiée, lignes 1.. = les embeddings BRUTS des tokens
+# sélectionnés. Principe : NE JAMAIS TRANSFORMER. Le FIFO compte les GROUPES.
+GROUP_CODES = ("toprows",)
 # codes qui exigent la table SIF (pondération/sélection des tokens du segment).
-SIF_CODES = ("segsif", "segpack")
+SIF_CODES = ("segsif", "segpack", "toprows")
 # seed des tables ORACLE du pack (frames R_j ET clés par paire). FIGÉ : il est
 # celui de la campagne de mesure oracle (scratchpad/oracle_pack.py), garder la
 # continuité des chiffres.
@@ -292,6 +296,25 @@ class ToyCfg:
                               # entre positions (sous-espaces disjoints).
                               # 8 blocs × 64 dims = la géométrie mesurée à
                               # l'oracle (RT 100 % / +3.9σ à d=512).
+    # ── axe GROUPES DE LIGNES NATIVES (phase 6) ─────────────────────────────
+    top_k: int = 13           # `toprows` : lignes de CONTENU par groupe. Le
+                              # write dépose 1 + top_k lignes : la CLÉ de la
+                              # paire puis les embeddings BRUTS des top_k
+                              # tokens SIF du segment, dans l'ordre du segment.
+                              # AUCUNE projection, aucune rotation : la banque
+                              # reste dans l'espace d'embedding, ce qui est TOUT
+                              # le point (la ligne pack, concat de projections,
+                              # avait effondré le Δnll du CrossAttnRead à +1.5
+                              # contre +5.5 pour `mean`).
+                              # 13 = MESURÉ : plus petit k dont la sélection SIF
+                              # couvre ≥ 95 % des tokens de valeur de la strate
+                              # `code` (97.0 % ; k=12 → 90.7 %). Cf. le YAML.
+    row_pos_tag: bool = True  # `toprows` : marquer la ligne de contenu j par
+                              # pos_emb[j] × oracle_ka_scale (0.2), comme le
+                              # format `rows` dont le round-trip était à 100 %.
+                              # Quasi-non-transformation (l'embedding domine).
+                              # False = lignes STRICTEMENT natives, l'ordre ne
+                              # tient plus qu'au layout du groupe.
     pos_offset: int = 0       # DÉCALAGE de l'index de phase (formats `phase`,
                               # `segphase`, `segsif` uniquement). 0 = DÉFAUT,
                               # rétro-compat bit-à-bit. 1 = la position 0 n'a
@@ -334,6 +357,8 @@ class ToyCfg:
                 assert self.seg_n_pos >= 1
             if self.code in SIF_CODES:
                 assert self.sif_a > 0, f"sif_a doit être > 0 ({self.sif_a})"
+            if self.code in GROUP_CODES:
+                assert self.top_k >= 1, f"top_k doit être >= 1 ({self.top_k})"
             if self.code in PACK_CODES:
                 assert self.pack_blocks >= 2, self.pack_blocks
                 assert self.d_model % self.pack_blocks == 0, (
@@ -375,7 +400,16 @@ class ToyCfg:
         # LIGNE BRUTE (bloc-clé pour la sélection, blocs de contenu pour les
         # logits). Le readout à candidats plats ne les concerne pas.
         return 1 if self.code in ("mean", "rows", "segmean") + PACK_CODES \
-            else self.n_pos
+            + GROUP_CODES else self.n_pos
+
+    @property
+    def group_rows(self) -> int:
+        """Lignes par GROUPE de banque (`toprows`) : 1 clé + top_k contenus.
+
+        FIXE par construction : le readout indexe les clés à la FOULÉE
+        group_rows, un groupe court casserait le layout (cf. toprows_rows).
+        """
+        return 1 + self.top_k
 
     @property
     def pools_segment(self) -> bool:
@@ -760,6 +794,85 @@ class PackReadout(nn.Module):
         return g * bias
 
 
+# ── GROUPES : readout DEUX ÉTAGES sur des lignes NATIVES ─────────────────────
+
+class GroupReadout(nn.Module):
+    """Readout du format `toprows`. Même squelette que PackReadout (deux
+    décisions séparées) mais sur une banque de GROUPES de lignes NATIVES.
+
+    La banque est [B, G·(1+k), d] : dans chaque groupe, la ligne 0 est la CLÉ
+    de la paire (slot, attr) et les lignes 1..k sont les embeddings BRUTS des
+    tokens sélectionnés. Le layout est DÉTERMINISTE, donc les clés se lisent à
+    la foulée (1+k) — aucun apprentissage n'est dépensé à trouver où elles sont.
+
+    Étage 1 « quel groupe » : attention 1 tête sur les G lignes-clés,
+      query = W_q·RMSnorm(h_t), dk = d_model (la clé est une ligne PLEINE, pas
+      un bloc de 64 dims comme dans le pack).
+    Étage 2 « quelle ligne du groupe » : porte-position softmax sur les k
+      lignes de contenu, conditionnée sur h_t. La ligne retenue part AU
+      VOCABULAIRE TELLE QUELLE : logits = ligne @ Ê_rms^T, ZÉRO paramètre —
+      c'est tout le design. Rien n'est dé-projeté ni dé-tourné parce que rien
+      n'a jamais été projeté ni tourné.
+
+    Les deux étages sont SOFT (softmax) et linéaires jusqu'au produit final :
+    on mélange d'abord (u = Σ_g s_g Σ_j p_j ligne[g,j]), un seul produit
+    [B,T,d]×[d,V] ensuite — même coût qu'un LM head.
+
+    Porte globale σ(w·h + b), b = cfg.ptr_bias_init, et `scale` ZÉRO-init : le
+    biais de logits est EXACTEMENT nul au step 0 (même convention que
+    PackReadout), tout en recevant du gradient dès le premier backward.
+    """
+
+    def __init__(self, cfg: ToyCfg):
+        super().__init__()
+        d = cfg.d_model
+        self.gr = cfg.group_rows            # 1 + top_k
+        self.k = cfg.top_k
+        self.last_gate = None       # σ(porte) du dernier forward (télémétrie)
+        self.last_sel = None        # softmax de SÉLECTION DE GROUPE
+        self.last_pos = None        # softmax de position DANS le groupe
+        self.norm = RMSNorm(d)
+        self.wq = nn.Linear(d, d, bias=False)            # query de la clé
+        self.wp = nn.Linear(d, self.k, bias=False)       # porte-position
+        nn.init.zeros_(self.wp.weight)                   # lignes équiprobables
+        self.scale = nn.Parameter(torch.zeros(1))        # biais EXACTEMENT nul
+        self.gate = nn.Linear(d, 1, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, cfg.ptr_bias_init)
+
+    def forward(self, h, bank, bank_mask, embed_w):
+        B, M, d = bank.shape
+        gr = self.gr
+        assert M % gr == 0, (
+            f"banque de {M} lignes non découpable en groupes de {gr} : le "
+            f"layout du format `toprows` est violé")
+        G = M // gr
+        rows = bank.reshape(B, G, gr, d)
+        hn = self.norm(h)
+        # ── étage 1 : quel GROUPE (clés = ligne 0 de chaque groupe) ─────────
+        q = self.wq(hn)                                     # [B,T,d]
+        k = rows[:, :, 0, :]                                # [B,G,d]
+        att = torch.einsum("btd,bgd->btg", q, k) / math.sqrt(d)
+        gm = None if bank_mask is None else \
+            bank_mask.reshape(B, G, gr)[:, :, 0]            # [B,G]
+        sm, empty = safe_bank_mask(gm)
+        if sm is not None:
+            att = att.masked_fill(~sm[:, None, :], float("-inf"))
+        s = att.softmax(-1)
+        self.last_sel = s.detach()
+        # ── étage 2 : quelle LIGNE du groupe (porte-position) ───────────────
+        p = self.wp(hn).softmax(-1)                         # [B,T,k]
+        self.last_pos = p.detach()
+        content = rows[:, :, 1:, :]                         # [B,G,k,d]
+        u = torch.einsum("btg,btj,bgjd->btd", s, p, content)
+        if empty is not None:
+            u = u * (~empty)[:, None, None].to(u.dtype)
+        bias = self.scale * (u @ rms_unit(embed_w).t())     # [B,T,V]
+        g = torch.sigmoid(self.gate(hn))
+        self.last_gate = g.detach()
+        return g * bias
+
+
 # ── le modèle jouet ──────────────────────────────────────────────────────────
 
 class ToyBlock(nn.Module):
@@ -824,8 +937,12 @@ class ToyReadLM(nn.Module):
             # codes gardent PointerReadout à l'identique (rétro-compat bit-à-bit
             # : la construction du module ne change pas, donc le tirage des
             # poids non plus).
-            self.ptr = (PackReadout(cfg) if cfg.code in PACK_CODES
-                        else PointerReadout(cfg, project=(cfg.variant != "r3")))
+            if cfg.code in PACK_CODES:
+                self.ptr = PackReadout(cfg)
+            elif cfg.code in GROUP_CODES:
+                self.ptr = GroupReadout(cfg)
+            else:
+                self.ptr = PointerReadout(cfg, project=(cfg.variant != "r3"))
         # ── tables ORACLE (buffers, jamais apprises) ────────────────────────
         g = torch.Generator().manual_seed(cfg.oracle_seed)
         sd = cfg.mem_dim ** -0.5
@@ -858,6 +975,27 @@ class ToyReadLM(nn.Module):
         elif cfg.code == "rows":
             pos = torch.randn(cfg.n_pos, cfg.d_model, generator=g) * (cfg.d_model ** -0.5)
             self.register_buffer("pos_emb", pos)               # [n_pos, d]
+        elif cfg.code in GROUP_CODES:
+            # ── tables ORACLE des GROUPES (phase 6) ─────────────────────────
+            # MÊME clé dédiée par paire que le pack (même seed, même logique)
+            # mais NON PROJETÉE : elle occupe une LIGNE ENTIÈRE de la banque.
+            # ⚠️ PRIVILÈGE D'ORACLE ASSUMÉ, comme au pack : au 350M c'est le
+            # modèle qui devra émettre cette clé au write et la re-produire au
+            # read. Le toy mesure ce que la géométrie permet une fois la clé
+            # disponible.
+            keys = torch.zeros(n_slots, n_attrs, cfg.d_model)
+            for s in range(n_slots):
+                for a in range(n_attrs):
+                    gk = torch.Generator().manual_seed(
+                        PACK_SEED + 1000 * int(s) + int(a))
+                    keys[s, a] = rms_unit(
+                        torch.randn(cfg.d_model, generator=gk))
+            self.register_buffer("pack_key", keys)     # [n_slots, n_attrs, d]
+            # tag de position des lignes de CONTENU (knob row_pos_tag) : même
+            # table et même échelle que le format `rows` (×oracle_ka_scale).
+            pos = torch.randn(cfg.top_k, cfg.d_model,
+                              generator=g) * (cfg.d_model ** -0.5)
+            self.register_buffer("row_pos", pos)       # [top_k, d]
         elif cfg.code in PACK_CODES:
             # ── tables ORACLE du PACK (phase 5) ─────────────────────────────
             # Générateurs DÉDIÉS (seed PACK_SEED) : l'état de `g` vu par
@@ -941,6 +1079,9 @@ class ToyReadLM(nn.Module):
             assert not bare, "bare (write=every) exige un code de SEGMENT"
             return self.oracle_code(slot_id, attr_id, val_tok).unsqueeze(0)
         dev = self.embed.weight.device
+        if c.code in GROUP_CODES:
+            return self.toprows_rows(slot_id, attr_id, seg_tok=seg_tok,
+                                     bare=bare)
         if c.code in PACK_CODES:
             return self.pack_lines(slot_id, attr_id, val_tok, seg_tok=seg_tok,
                                    bare=bare)
@@ -1070,6 +1211,68 @@ class ToyReadLM(nn.Module):
             line[blk:blk + n * blk] = coeff.reshape(-1)
         return rms_unit(line).unsqueeze(0).detach()
 
+    # ── write ORACLE du format TOPROWS (groupes de lignes natives) ──────────
+    @torch.no_grad()
+    def toprows_sel(self, seg_tok: torch.Tensor) -> torch.Tensor:
+        """Les top_k tokens du segment au poids SIF le plus fort, DANS L'ORDRE
+        DU SEGMENT (le tri par poids détruirait l'ordre). Aucun privilège : le
+        write ne sait pas où est la valeur, il ne connaît que la table unigram.
+        """
+        c = self.cfg
+        st = seg_tok.to(self.embed.weight.device).reshape(-1)
+        if st.numel() == 0:
+            return st
+        w = self.sif_w[st].float()
+        sel = torch.topk(w, min(c.top_k, st.numel())).indices.sort().values
+        return st[sel]
+
+    @torch.no_grad()
+    def toprows_rows(self, slot_id: int, attr_id: int,
+                     seg_tok: torch.Tensor | None = None,
+                     bare: bool = False) -> torch.Tensor:
+        """LE GROUPE d'un write : [1 + top_k, d_model].
+
+        Ligne 0     = CLÉ dédiée de la paire (slot, attr) — ou ZÉRO si `bare`
+                      (--write every, seg sans fait : le groupe ne prétend
+                      indexer aucune paire, il ne peut donc pas gagner l'étage 1
+                      du readout ; même convention que la ligne nue du pack).
+        Ligne 1+j   = ê(t_j), l'embedding BRUT du j-ième token sélectionné,
+                      RMS-normé et RIEN D'AUTRE. C'est le principe du format :
+                      le write SÉLECTIONNE, il ne TRANSFORME pas. La banque
+                      reste dans l'espace d'embedding, donc le CrossAttnRead y
+                      retrouve un canal de contenu (ce que la ligne pack, concat
+                      de projections, avait détruit : Δnll +1.5 contre +5.5).
+                      Avec `row_pos_tag`, on ajoute pos_emb[j] × 0.2 AVANT la
+                      RMS-norm — le même tag que le format `rows` (round-trip
+                      100 %), assez faible pour que l'embedding domine.
+
+        TAILLE FIXE : le groupe fait TOUJOURS 1 + top_k lignes, parce que le
+        readout indexe les clés à cette foulée. Si le segment a moins de top_k
+        tokens (mesuré : segs porteurs ∈ [12, 26] tokens, donc jamais au défaut
+        k=13, mais possible en poussant k), la DERNIÈRE ligne de contenu est
+        RÉPÉTÉE pour compléter — un candidat en double est inerte, un groupe
+        court casserait le layout de toute la banque.
+        """
+        c = self.cfg
+        dev = self.embed.weight.device
+        assert seg_tok is not None, (
+            f"--code {c.code} sélectionne dans le SEGMENT : oracle_lines a "
+            f"besoin de seg_tok (tokens non-padés du seg porteur)")
+        out = torch.zeros(c.group_rows, c.d_model, dtype=torch.float32,
+                          device=dev)
+        if not bare:
+            out[0] = self.pack_key[slot_id, attr_id].float()
+        toks = self.toprows_sel(seg_tok)
+        n = int(toks.numel())
+        if n:
+            e = rms_unit(self.embed.weight[toks].float())      # [n, d], RMS 1
+            if c.row_pos_tag:
+                e = rms_unit(e + self.row_pos[:n].float() * c.oracle_ka_scale)
+            out[1:1 + n] = e
+            if n < c.top_k:            # complète le groupe (cf. docstring)
+                out[1 + n:] = e[-1]
+        return out.detach()
+
     # ── candidats du readout position-conscient ─────────────────────────────
     def candidates(self, bank, bank_mask):
         """Banque [B,M,d] → candidats [B, M·n_cand, d] (+ masque étendu).
@@ -1079,7 +1282,7 @@ class ToyReadLM(nn.Module):
         qui apprend l'alignement position↔décodage.
         """
         c = self.cfg
-        if c.code in ("mean", "rows", "segmean") + PACK_CODES:
+        if c.code in ("mean", "rows", "segmean") + PACK_CODES + GROUP_CODES:
             # la ligne EST le candidat (les PACK ne passent pas par ici : leur
             # readout consomme la ligne BRUTE, bloc par bloc).
             return bank, bank_mask
@@ -1112,7 +1315,12 @@ class ToyReadLM(nn.Module):
         x = self.norm_f(x)
         logits = x @ self.embed.weight.t()             # embeddings tiés
         if self.ptr is not None and bank is not None and bank.size(1) > 0:
-            if self.cfg.code in PACK_CODES:
+            if self.cfg.code in GROUP_CODES:
+                # TOPROWS : la banque est un empilement de GROUPES de lignes
+                # natives — le readout lit les clés à la foulée (1+top_k).
+                logits = logits + self.ptr(x, bank, bank_mask,
+                                           self.embed.weight)
+            elif self.cfg.code in PACK_CODES:
                 # PACK : pas de candidats plats — le readout lit la ligne par
                 # BLOCS (bloc 0 = clé pour choisir la ligne, blocs ≥ 1 = tokens)
                 logits = logits + self.ptr(x, bank, bank_mask,
@@ -1162,6 +1370,21 @@ def param_report(model: ToyReadLM) -> dict:
 
 
 # ── environnement : replay de conversations + write oracle ───────────────────
+
+class GroupBank(list):
+    """Banque du format `toprows` : une LISTE DE LIGNES qui se souvient de ses
+    GROUPES.
+
+    C'est une `list` ordinaire pour tout le reste du lab (`pad_bank` la stacke,
+    `len()` compte les LIGNES) — les autres codes ne la voient jamais. Elle
+    porte juste `.groups`, la liste des tailles, pour que le FIFO puisse
+    évincer un write ENTIER au lieu d'une ligne isolée.
+    """
+
+    def __init__(self, rows=(), groups=()):
+        super().__init__(rows)
+        self.groups = list(groups)
+
 
 class OracleEnv:
     """Rejoue une conv seg par seg et pose la banque à la place du modèle."""
@@ -1227,6 +1450,13 @@ class OracleEnv:
         `--code rows` appende PLUSIEURS lignes d'un coup (une par token de la
         valeur) : le FIFO reste à max_mem, donc un fait long évince les
         précédents. C'est le prix assumé de la borne haute.
+
+        `--code toprows` (phase 6) : le FIFO compte les GROUPES, pas les lignes
+        — max_mem GROUPES résidents de (1+top_k) lignes chacun, soit le MÊME
+        nombre de writes résidents que tous les autres codes (comparaison
+        propre), pour une banque effective de max_mem×(1+top_k) lignes.
+        L'éviction sort le groupe le plus ancien EN ENTIER, et `last_added`
+        vaut 1 : les âges restent comptés en WRITES, comme partout ailleurs.
         """
         f = self.fact_of(seg)
         if f is None:
@@ -1238,6 +1468,14 @@ class OracleEnv:
         else:
             rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]),
                                       seg_tok=self.seg_tokens(seg))
+        if model.cfg.code in GROUP_CODES:
+            self.last_added = 1                     # UN write = UN groupe
+            sizes = list(getattr(bank, "groups", [1] * len(bank)))
+            out = GroupBank(list(bank) + list(rows),
+                            sizes + [int(rows.shape[0])])
+            while len(out.groups) > self.max_mem:
+                del out[:out.groups.pop(0)]         # évince le groupe ENTIER
+            return out
         self.last_added = int(rows.shape[0])
         bank = bank + list(rows)
         return bank[-self.max_mem:]
@@ -1477,6 +1715,13 @@ def main(argv=None):
                     dest="pack_blocks",
                     help="surcharge code.pack_blocks (formats pack/segpack : "
                          "nombre TOTAL de blocs, CLÉ comprise)")
+    ap.add_argument("--top-k", type=int, default=None, dest="top_k",
+                    help="surcharge code.top_k (format toprows : lignes de "
+                         "CONTENU par groupe ; le groupe fait 1+k lignes)")
+    ap.add_argument("--no-row-pos-tag", action="store_true",
+                    dest="no_row_pos_tag",
+                    help="toprows : lignes de contenu STRICTEMENT natives "
+                         "(sans le tag de position ×0.2)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -1509,10 +1754,18 @@ def main(argv=None):
         mc["pos_offset"] = int(cb["pos_offset"])
     if "pack_blocks" in cb:
         mc["pack_blocks"] = int(cb["pack_blocks"])
+    if "top_k" in cb:
+        mc["top_k"] = int(cb["top_k"])
+    if "row_pos_tag" in cb:
+        mc["row_pos_tag"] = bool(cb["row_pos_tag"])
     if a.pos_offset is not None:           # la CLI gagne sur le YAML
         mc["pos_offset"] = int(a.pos_offset)
     if a.pack_blocks is not None:
         mc["pack_blocks"] = int(a.pack_blocks)
+    if a.top_k is not None:                # la CLI gagne sur le YAML
+        mc["top_k"] = int(a.top_k)
+    if a.no_row_pos_tag:
+        mc["row_pos_tag"] = False
     device = a.device or t.get("device") or ("cuda" if torch.cuda.is_available()
                                              else "cpu")
     steps = int(a.steps or t.get("steps", 3000))
@@ -1551,6 +1804,11 @@ def main(argv=None):
         run_name += f"_o{cfg.pos_offset}"
     if cfg.code in PACK_CODES and cfg.pack_blocks != ToyCfg.pack_blocks:
         run_name += f"_b{cfg.pack_blocks}"     # sweep de partition = run à part
+    if cfg.code in GROUP_CODES:
+        if cfg.top_k != ToyCfg.top_k:
+            run_name += f"_k{cfg.top_k}"       # sweep de k = run à part
+        if not cfg.row_pos_tag:
+            run_name += "_notag"
     if cfg.write_mode == "every":
         run_name += "_wev"
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
@@ -1566,7 +1824,16 @@ def main(argv=None):
           f"mem_dim {cfg.mem_dim} M {cfg.max_mem} x_dim {cfg.x_dim} "
           f"vocab {cfg.vocab_size}", flush=True)
     if a.code != "mean":
-        if cfg.code in PACK_CODES:
+        if cfg.code in GROUP_CODES:
+            head = (f"top_k {cfg.top_k} ⇒ groupes de {cfg.group_rows} LIGNES "
+                    f"NATIVES (ligne 0 = CLÉ dédiée, {cfg.top_k} embeddings "
+                    f"BRUTS des tokens SIF du segment, ordre du segment) ; "
+                    f"banque effective {cfg.max_mem}×{cfg.group_rows} = "
+                    f"{cfg.max_mem * cfg.group_rows} lignes pour {cfg.max_mem} "
+                    f"writes résidents ; tag de position "
+                    f"{'ON ×%g' % cfg.oracle_ka_scale if cfg.row_pos_tag else 'OFF'} "
+                    f"| privilège span-valeur RETIRÉ ")
+        elif cfg.code in PACK_CODES:
             head = (f"pack_blocks {cfg.pack_blocks} × "
                     f"{cfg.d_model // cfg.pack_blocks} dims (bloc 0 = CLÉ "
                     f"dédiée par paire, {cfg.pack_blocks - 1} tokens de "
@@ -1592,7 +1859,11 @@ def main(argv=None):
               + (f"pos_offset {cfg.pos_offset} (identité LIBRE, positions "
                  f"protégées 0..{(cfg.seg_n_pos if cfg.pools_segment else cfg.n_pos) - cfg.pos_offset - 1}) "
                  if cfg.pos_offset else "")
-              + (f"| readout PackReadout 2 étages : ligne parmi "
+              + (f"| readout GroupReadout 2 étages : groupe parmi "
+                 f"{cfg.max_mem} (clé, foulée {cfg.group_rows}), ligne parmi "
+                 f"{cfg.top_k} (porte-position), logits NATIFS (zéro param)"
+                 if cfg.code in GROUP_CODES else
+                 f"| readout PackReadout 2 étages : ligne parmi "
                  f"{cfg.max_mem} (clé), bloc parmi {cfg.pack_blocks - 1} "
                  f"(porte-position)"
                  if cfg.code in PACK_CODES else
@@ -1600,8 +1871,12 @@ def main(argv=None):
                  f"({cfg.max_mem}×{cfg.n_cand})"), flush=True)
     if cfg.write_mode == "every":
         print(f"  write EVERY : l'oracle écrit après CHAQUE seg (segs sans "
-              f"fait = même pool SANS K/A) — le FIFO {cfg.max_mem} évince les "
-              f"faits anciens, 2ᵉ privilège d'oracle RETIRÉ", flush=True)
+              f"fait = " + ("même sélection, CLÉ NULLE) — le FIFO "
+                            if cfg.code in GROUP_CODES else
+                            "même pool SANS K/A) — le FIFO ")
+              + f"{cfg.max_mem} "
+              + ("GROUPES évince " if cfg.code in GROUP_CODES else "évince ")
+              + f"les faits anciens, 2ᵉ privilège d'oracle RETIRÉ", flush=True)
     print("  params : " + "  ".join(f"{k} {v/1e6:.2f}M" for k, v in pr.items()),
           flush=True)
     print(f"  read+pointer = {(pr['read']+pr['pointer'])/1e6:.2f}M "
@@ -1745,6 +2020,28 @@ def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
     lines = model.oracle_lines(slot_id, attr_id, val_tok, seg_tok=seg_tok)
     cand, _ = model.candidates(lines.unsqueeze(0), None)      # [1, N, d]
     E = model.embed.weight.float()
+    if cfg.code in GROUP_CODES:
+        # TOPROWS : les lignes de contenu SONT des embeddings — le round-trip
+        # est trivial par construction, il ne teste qu'une chose : que le tag
+        # de position (row_pos_tag) ne déplace pas l'argmax. Positions testées =
+        # les positions de valeur AYANT SURVÉCU à la sélection top_k (la
+        # couverture est une mesure séparée, cf. le sweep).
+        assert seg_tok is not None and val_pos is not None, (
+            "round-trip toprows : seg_tok + val_pos requis")
+        st = seg_tok.reshape(-1)
+        w = model.sif_w[st].float()
+        sel = torch.topk(w, min(cfg.top_k, st.numel())).indices.sort().values
+        keep = {int(p): j for j, p in enumerate(sel)}
+        Erms = rms_unit(E)
+        ok = n = 0
+        for p in val_pos:
+            j = keep.get(int(p))
+            if j is None:
+                continue
+            ok += int(int(torch.argmax(lines[1 + j].float() @ Erms.t()))
+                      == int(st[int(p)]))
+            n += 1
+        return ok, n
     if cfg.code in PACK_CODES:
         # PACK : le lookup est PAR BLOC (table Ê R_j), pas par dé-projection
         # d'un candidat plat. Les positions testées sont les blocs OCCUPÉS.
@@ -1968,11 +2265,12 @@ def _selftest() -> None:
         return w
 
     def _mk(code, d=256, n_pos=8, vocab=512, base=0.0, seg_n_pos=32,
-            offset=0, pack_blocks=8):
+            offset=0, pack_blocks=8, top_k=13, row_pos_tag=True):
         c = ToyCfg(vocab_size=vocab, d_model=d, n_layers=1, n_heads=4,
                    mem_dim=d, variant="r3", max_seq_len=64, code=code,
                    n_pos=n_pos, rope_base=base, seg_n_pos=seg_n_pos,
-                   sif_a=A_SIF, pos_offset=offset, pack_blocks=pack_blocks)
+                   sif_a=A_SIF, pos_offset=offset, pack_blocks=pack_blocks,
+                   top_k=top_k, row_pos_tag=row_pos_tag)
         return ToyReadLM(c, env.n_slots, env.n_attrs,
                          sif_w=_sifw(vocab) if code in SIF_CODES
                          else None).eval()
@@ -2002,29 +2300,41 @@ def _selftest() -> None:
     # 8. lane vide ≡ ablaté, et forward fini, pour CHAQUE format
     seg20 = torch.randint(0, 512, (20,), generator=torch.Generator().manual_seed(3))
     for code in CODES:
-        m = _mk(code, d=32, n_pos=4, vocab=512, seg_n_pos=8)
+        # `toprows` : la banque est faite de GROUPES de (1+top_k) lignes — la
+        # remplir ligne à ligne violerait son layout. On prend top_k=3 pour
+        # garder des banques minuscules, et le « padding » est un groupe ENTIER.
+        grp3 = code in GROUP_CODES
+        m = _mk(code, d=32, n_pos=4, vocab=512, seg_n_pos=8, top_k=3)
         rows = m.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
-        bmix = torch.cat([torch.cat([rows[:1], torch.zeros(1, 32)])[None],
-                          torch.zeros(1, 2, 32)], dim=0)         # [2,2,32]
-        mmix = torch.tensor([[True, False], [False, False]])
+        nrow = rows.shape[0] if grp3 else 1
+        bmix = torch.cat([torch.cat([rows[:nrow],
+                                     torch.zeros(nrow, 32)])[None],
+                          torch.zeros(1, 2 * nrow, 32)], dim=0)
+        mmix = torch.tensor([[True] * nrow + [False] * nrow,
+                             [False] * (2 * nrow)])
         ids = torch.randint(0, 512, (2, 6))
         with torch.no_grad():
             lg = m(ids, bmix, mmix)
         assert torch.isfinite(lg).all(), f"NaN sur lane vide (code {code})"
         with torch.no_grad():
             i1 = torch.randint(0, 512, (1, 6))
-            a1 = m(i1, torch.zeros(1, 2, 32), torch.tensor([[False, False]]))
+            a1 = m(i1, torch.zeros(1, 2 * nrow, 32),
+                   torch.tensor([[False] * (2 * nrow)]))
             a2 = m(i1, None, None)
         assert torch.allclose(a1, a2, atol=1e-5), \
             f"lane vide != ablaté (code {code})"
         # 8bis. porte du pointer FERMÉE à l'init : biais ≈ 0
-        b1 = rows[:1][None].expand(1, -1, -1)
+        b1 = rows[:nrow][None].expand(1, -1, -1)
         bm1 = torch.ones(1, b1.size(1), dtype=torch.bool)
         cand, cm = m.candidates(b1, bm1)
         with torch.no_grad():
-            bias = (m.ptr(torch.randn(1, 5, 32), b1, bm1, m.embed.weight,
-                          m.pack_R) if code in PACK_CODES
-                    else m.ptr(torch.randn(1, 5, 32), cand, cm, m.embed.weight))
+            if code in PACK_CODES:
+                bias = m.ptr(torch.randn(1, 5, 32), b1, bm1, m.embed.weight,
+                             m.pack_R)
+            elif grp3:
+                bias = m.ptr(torch.randn(1, 5, 32), b1, bm1, m.embed.weight)
+            else:
+                bias = m.ptr(torch.randn(1, 5, 32), cand, cm, m.embed.weight)
         assert float(bias.abs().max()) < 1e-2, (code, float(bias.abs().max()))
         assert m.ptr.last_gate is not None and \
             float(m.ptr.last_gate.max()) < 1e-3, f"porte ouverte à l'init ({code})"
@@ -2049,7 +2359,7 @@ def _selftest() -> None:
     # 10. r0/r1/r2 REFUSENT les nouveaux formats (message clair)
     for var in ("r0", "r1", "r2"):
         for code in ("phase", "segmean", "segphase", "segsif", "pack",
-                     "segpack"):
+                     "segpack", "toprows"):
             try:
                 ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
                        variant=var, code=code, n_pos=4, seg_n_pos=8)
@@ -2120,17 +2430,21 @@ def _selftest() -> None:
     # 11quater. FIFO INCHANGÉ : 12 faits ⇒ 8 lignes, une ligne par fait
     for code in SEG_CODES:
         m_ = _mk(code, d=32, n_pos=4, vocab=512, seg_n_pos=8)
+        # `toprows` : le FIFO compte les GROUPES — 8 writes résidents comme
+        # partout, mais 8×(1+top_k) LIGNES.
+        gr = m_.cfg.group_rows if code in GROUP_CODES else 1
         b = []
         for k in range(12):
             s = dict(seg_tpl)
             s["fact_val"] = torch.full_like(seg_tpl["fact_val"], 1 + k)
             b = env.write(m_, b, s)
-        assert len(b) == 8, f"FIFO {code} : {len(b)} lignes"
+        assert len(b) == 8 * gr, f"FIFO {code} : {len(b)} lignes"
         ref = m_.oracle_lines(int(seg_tpl["fact_slot"][0, 0]),
                               int(seg_tpl["fact_attr"][0, 0]),
                               env.val_tokens(12),
                               seg_tok=OracleEnv.seg_tokens(seg_tpl))
-        assert torch.equal(b[-1], ref[0]), f"FIFO {code} : dernière ligne"
+        assert torch.equal(torch.stack(list(b)[-gr:]), ref), \
+            f"FIFO {code} : dernier write"
 
     # 12. segsif : le pool est PONDÉRÉ SIF (w = a/(a+p)) — recette du write du
     #     350M. Tokens 7/8/9 = « template très fréquent » (w ≈ 5e-4), le reste
@@ -2438,6 +2752,135 @@ def _selftest() -> None:
         else:
             raise AssertionError(f"pack_blocks={pb} aurait dû être refusé")
 
+    # ═══ PHASE 6 : TOPROWS (groupes de lignes NATIVES, jamais transformées) ══
+    torch.manual_seed(20260802)
+    K6 = 5
+    # seg de 20 tokens : 7 « rares » dont la valeur en 5-7, le reste = template
+    # fréquent (tokens 7/8/9). La sélection top-5 SIF retient donc 5 des 7
+    # rares — et comme le tri est stable sur les ex æquo, on vérifie AU CHIFFRE
+    # quels indices sortent plutôt que de le supposer.
+    seg_tr = torch.full((20,), 7, dtype=torch.long)
+    seg_tr[[1, 3, 5, 6, 7, 14, 18]] = torch.tensor([120, 301, 44, 199, 260,
+                                                    77, 410])
+    m_tr = _mk("toprows", d=512, top_k=K6)
+    sel_tr = m_tr.toprows_sel(seg_tr)
+    assert sel_tr.numel() == K6
+    # ORDRE DU SEGMENT préservé (pas l'ordre des poids)
+    pos_tr = [int(p) for p in torch.topk(
+        m_tr.sif_w[seg_tr].float(), K6).indices.sort().values]
+    assert pos_tr == sorted(pos_tr) and \
+        torch.equal(sel_tr, seg_tr[torch.tensor(pos_tr)])
+    # 15h. LE GROUPE : 1+k lignes, ligne 0 = clé, lignes 1.. = embeddings BRUTS
+    grp = m_tr.oracle_lines(3, 2, tok8, seg_tok=seg_tr)
+    assert grp.shape == (1 + K6, 512), grp.shape
+    assert torch.equal(grp[0], m_tr.pack_key[3, 2]), "ligne 0 ≠ clé de la paire"
+    # NATIVITÉ : chaque ligne de contenu est à cos ≥ 0.97 de l'embedding
+    # RMS-normé de son token (le tag de position ×0.2 ne fait que l'incliner).
+    for j, t in enumerate(sel_tr):
+        e = rms_unit(m_tr.embed.weight[int(t)].float())
+        c = float(torch.dot(grp[1 + j], e) / (grp[1 + j].norm() * e.norm()))
+        assert c > 0.97, (j, c)
+    # … et SANS tag, la ligne est l'embedding EXACT (zéro transformation)
+    m_nt = _mk("toprows", d=512, top_k=K6, row_pos_tag=False)
+    g_nt = m_nt.oracle_lines(3, 2, tok8, seg_tok=seg_tr)
+    for j, t in enumerate(m_nt.toprows_sel(seg_tr)):
+        assert torch.allclose(g_nt[1 + j],
+                              rms_unit(m_nt.embed.weight[int(t)].float()),
+                              atol=1e-6), j
+    # 15i. round-trip : le tag ne déplace PAS l'argmax (c'est tout ce que le RT
+    #      teste ici — les lignes SONT des embeddings)
+    ok_tr, n_tr = code_roundtrip(m_tr, 3, 2, tok8, seg_tok=seg_tr,
+                                 val_pos=[5, 6, 7])
+    assert (ok_tr, n_tr) == (3, 3), f"round-trip toprows : {ok_tr}/{n_tr}"
+    # le code ne regarde PAS val_tok (privilège retiré)
+    assert torch.equal(m_tr.oracle_lines(3, 2, tok8, seg_tok=seg_tr),
+                       m_tr.oracle_lines(3, 2, tok8[:2], seg_tok=seg_tr)), \
+        "toprows : le code regarde encore val_tok"
+    # 15j. FIFO PAR GROUPE : 12 writes ⇒ 8 GROUPES résidents (8×(1+k) lignes),
+    #      et c'est bien le groupe le plus ancien qui sort EN ENTIER.
+    env_g = OracleEnv(tok, 8)
+    b_g = []
+    firsts = []
+    for k in range(12):
+        s = dict(seg_tpl)
+        s["fact_val"] = torch.full_like(seg_tpl["fact_val"], 1 + k)
+        s["input_ids"] = seg_tpl["input_ids"].clone()
+        s["input_ids"][0, 1] = 100 + k          # segs DISTINCTS
+        b_g = env_g.write(m_tr, b_g, s)
+        firsts.append(b_g[-(1 + K6)].clone())   # la clé du groupe fraîchement
+        assert env_g.last_added == 1            # posé ; 1 write = 1 groupe
+        assert len(b_g) == min(k + 1, 8) * (1 + K6), (k, len(b_g))
+        assert b_g.groups == [1 + K6] * min(k + 1, 8)
+    # les 4 premiers groupes sont sortis, les 8 derniers sont là, dans l'ordre
+    for i in range(8):
+        assert torch.equal(b_g[i * (1 + K6)], firsts[4 + i]), i
+    # 15k. GroupReadout : porte fermée ⇒ biais EXACTEMENT nul ; layout lu à la
+    #      bonne foulée ; softmax des deux étages bien formés.
+    bk_g = torch.stack(list(b_g))[None]                    # [1, 8*(1+k), 512]
+    bm_g = torch.ones(1, bk_g.size(1), dtype=torch.bool)
+    with torch.no_grad():
+        bias = m_tr.ptr(torch.randn(1, 5, 512), bk_g, bm_g, m_tr.embed.weight)
+    assert float(bias.abs().max()) == 0.0, float(bias.abs().max())
+    assert float(m_tr.ptr.last_gate.max()) < 1e-3
+    assert m_tr.ptr.last_sel.shape[-1] == 8 and \
+        m_tr.ptr.last_pos.shape[-1] == K6
+    assert torch.allclose(m_tr.ptr.last_sel.sum(-1), torch.ones(1, 5))
+    # porte OUVERTE + étage 1 forcé sur UN groupe : le biais pointe un token de
+    # CE groupe — la citation est bien native.
+    with torch.no_grad():
+        m_tr.ptr.scale.fill_(50.0)
+        m_tr.ptr.gate.bias.fill_(8.0)
+        one = torch.stack(list(b_g)[:1 + K6])[None]
+        b2 = m_tr.ptr(torch.randn(1, 1, 512), one,
+                      torch.ones(1, 1 + K6, dtype=torch.bool),
+                      m_tr.embed.weight)
+    cand_g = set(int(torch.argmax(rms_unit(m_tr.embed.weight.float())
+                                  @ list(b_g)[1 + j])) for j in range(K6))
+    assert int(b2[0, 0].argmax()) in cand_g, int(b2[0, 0].argmax())
+    # 15l. banque mal alignée ⇒ erreur EXPLICITE (le layout est un invariant)
+    try:
+        m_tr.ptr(torch.randn(1, 2, 512), bk_g[:, :-1],
+                 torch.ones(1, bk_g.size(1) - 1, dtype=torch.bool),
+                 m_tr.embed.weight)
+    except AssertionError as e:
+        assert "layout" in str(e)
+    else:
+        raise AssertionError("banque non alignée : le readout aurait dû crier")
+    # 15m. --write every : groupe à clé NULLE pour un seg sans fait, et le flux
+    #      évince les groupes de faits (même sémantique qu'aux autres codes).
+    env_ge = OracleEnv(tok, 8, write_mode="every")
+    b_ge = env_ge.write(m_tr, [], nofact)
+    assert len(b_ge) == 1 + K6 and env_ge.last_added == 1
+    assert float(b_ge[0].abs().max()) == 0.0, "groupe bare : clé non nulle"
+    assert float(torch.stack(list(b_ge)[1:]).abs().max()) > 0
+    assert torch.equal(torch.stack(list(b_ge)),
+                       torch.stack(list(env_ge.write(m_tr, [], nofact)))), \
+        "groupe bare non déterministe"
+    b_ge = []
+    fr = []
+    for k in range(3):
+        s = dict(factseg)
+        s["fact_val"] = torch.full_like(factseg["fact_val"], 1 + k)
+        s["input_ids"] = factseg["input_ids"].clone()
+        s["input_ids"][0, 1] = 100 + k
+        b_ge = env_ge.write(m_tr, b_ge, s)
+        fr.append(b_ge[-(1 + K6)].clone())
+    for k in range(8):
+        b_ge = env_ge.write(m_tr, b_ge, nofact)
+    assert len(b_ge) == 8 * (1 + K6)
+    assert not any(any(torch.equal(x, y) for y in b_ge) for x in fr), \
+        "FIFO toprows every : 8 segs vides doivent purger tous les groupes"
+    # 15n. clé STABLE entre instanciations et SÉPARANT les paires
+    kk1 = _mk("toprows", d=512, top_k=K6).pack_key
+    assert torch.equal(kk1, m_tr.pack_key), "clé toprows non stable"
+    assert not torch.allclose(kk1[3, 2], kk1[3, 1], atol=1e-4)
+    # 15o. groupe TOUJOURS de taille fixe, même si le seg est plus court que k
+    m_big = _mk("toprows", d=512, top_k=9)
+    g_short = m_big.oracle_lines(3, 2, tok8, seg_tok=seg_tr[:4])
+    assert g_short.shape == (10, 512)
+    assert torch.equal(g_short[4], g_short[9]), \
+        "groupe court : la dernière ligne de contenu doit être répétée"
+
     # 16. RÉTRO-COMPAT BIT-À-BIT des codes NON-pack. La constante ci-dessous a
     #     été relevée sur le commit 4daf6a6 (phase 4, AVANT le pack) avec la
     #     même graine et les mêmes entrées : si l'ajout du pack avait déplacé
@@ -2502,6 +2945,16 @@ def _selftest() -> None:
           f"biais EXACTEMENT 0 porte fermée et pointe un token de la ligne "
           f"porte ouverte ; ligne bare (write every) SANS bloc-clé ; "
           f"pack_blocks non-diviseur / < 2 refusés")
+    print(f"  phase 6 — TOPROWS (GROUPES de lignes NATIVES, top_k {K6} ⇒ "
+          f"groupes de {1 + K6}) : sélection top-k SIF dans l'ORDRE DU SEGMENT, "
+          f"ligne 0 = clé de la paire, lignes de contenu à cos > 0.97 de "
+          f"l'embedding brut (EXACTES sans row_pos_tag) ; round-trip "
+          f"{ok_tr}/{n_tr} (le tag ne déplace pas l'argmax) ; FIFO PAR GROUPE "
+          f"(12 writes ⇒ 8 groupes, éviction du plus ancien EN ENTIER, "
+          f"last_added = 1 write) ; --write every ⇒ groupe à clé NULLE, purge "
+          f"complète après 8 segs vides ; GroupReadout biais EXACTEMENT 0 porte "
+          f"fermée, cite une ligne du groupe porte ouverte, banque mal alignée "
+          f"refusée ; groupe de taille FIXE même sur seg court")
     print("  rétro-compat — forward segsif identique BIT-À-BIT au commit "
           "4daf6a6 (constante figée dans le self-test) : l'ajout du pack n'a "
           "déplacé ni un chemin partagé ni le tirage des poids")
