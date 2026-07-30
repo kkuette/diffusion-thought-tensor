@@ -1,4 +1,18 @@
-# toy_read_lab — labo jouet « classe de fonctions du READ », WRITE ORACLE.
+# toy_read_lab — matrice d512 : RE-BASELINE de la largeur de banque.
+#
+# Clone de toy_read_lab.yaml avec model.d_model 256 → 512 (r3 force
+# mem_dim = d_model : la LIGNE de banque double de largeur) et un save_dir
+# séparé pour ne pas écraser la matrice d256.
+#
+# POURQUOI : le round-trip oracle (relire la valeur depuis la ligne SEULE,
+# sans modèle) plafonne à 59.9 % sur les codes segsif à d=256 — le code n'est
+# pas inversible, la limite est le SNR de la ligne, pas le read. À d=512 le
+# même round-trip remonte à 94.9 %. 512 est aussi le mem_dim RÉEL du 350M :
+# cette matrice est donc celle qui parle du modèle cible, la d256 devient une
+# étude de capacité.
+#
+# n_heads reste 8 (512/8 = 64 par tête) et code.n_pos reste 8 (blocs chunk de
+# 64 dims au lieu de 32). Coût : ~2.5× les params, runs ~2-3× plus lents.
 #
 # UNE config, quatre variantes (--variant r0|r1|r2|r3), un sous-dossier par
 # variante sous training.save_dir. Le backbone est VANILLA (aucun élément
@@ -28,7 +42,7 @@
 tokenizer: HuggingFaceTB/SmolLM2-135M
 
 model:
-  d_model: 256
+  d_model: 512            # RE-BASELINE (d256 : round-trip segsif 59.9 %)
   n_layers: 6
   n_heads: 8
   d_ff_mult: 4
@@ -62,7 +76,7 @@ code:
                           # 3 tok 27.4 %, 4 tok 9.3 %, 5 tok 1.7 %, 6 tok 8.3 %,
                           # 7 tok 17.0 %, 8 tok 4.8 % ⇒ n_pos=7 couvre 95.2 %,
                           # n_pos=8 couvre 100 %. 8 est aussi une puissance de 2
-                          # qui divise d_model=256 (blocs chunk de 32 dims) ET
+                          # qui divise d_model=512 (blocs chunk de 64 dims) ET
                           # le d_model=64 du smoke (blocs de 8).
   rope_base: 0.0          # binding `phase`. 0 (ou négatif) = DFT :
                           # θ_i = 2π·(i mod n_pos)/n_pos, la SEULE famille de
@@ -128,7 +142,7 @@ training:
   eval_every: 200
   eval_convs: 24          # convs gradées par bras (held-out ET train)
   max_new: 48
-  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab
+  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab_d512
 
 # kwargs de la branche persona de chat.eval_gen de sft_recall_350m_table2.yaml.
 # pool_split est SURCHARGÉ par le code : 'train' pour l'entraînement et le

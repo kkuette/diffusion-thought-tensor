@@ -79,6 +79,67 @@ elle-même), l'attention plate du pointer choisit parmi les M×n_pos candidats.
 Le modèle APPREND l'alignement position↔décodage — aucun compteur dur. La
 cross-attention de CONTENU de r3 reste inchangée (elle voit les lignes brutes).
 
+Phase 3 : RETRAIT DU PRIVILÈGE D'ORACLE SUR LE SPAN VALEUR
+----------------------------------------------------------
+Les 4 formats de la phase 2 gardent un privilège que le write du 350M n'a PAS :
+l'environnement sait quels tokens du segment sont LA VALEUR et ne binde qu'eux.
+Le vrai write poole le SEGMENT ENTIER (template ChatML inclus) sans savoir où
+est la valeur. Deux formats de plus retirent ce privilège — UNE variable à la
+fois : on GARDE l'autre privilège (savoir quels segs portent un fait, donc le
+write reste déclenché sur les segs porteurs seulement).
+
+  segmean   CONTRÔLE : ligne = RMSnorm(K + A + moyenne uniforme des embeddings
+            RMS-normés de TOUS les tokens du seg porteur). Identique à `mean`
+            mais sur le segment entier — mesure ce que le BRUIT DE TEMPLATE
+            coûte à lui seul, ordre toujours détruit.
+  segphase  LE TEST : ligne = RMSnorm(K + A + (1/T)·Σ_t rot(θ·pos_t)·ê(t)) où
+            pos_t est la position du token DANS LE SEGMENT et θ le binding DFT
+            de `phase` avec sa propre table de taille `seg_n_pos`. Le readout
+            expose M×seg_n_pos candidats rot(−θ·j)·ligne.
+  segsif    LA RECETTE CIBLE DU 350M : segphase PONDÉRÉ SIF —
+            ligne = RMSnorm(K + A + (1/Σw)·Σ_t w_t·rot(θ·pos_t)·ê(t)) avec
+            w_t = a/(a+p(t)), p = table unigram du stream (`_sif_table()` de
+            PersonaChatStream, réutilisée telle quelle par `sif_weight_table`).
+            Le SIF écrase les tokens fréquents (le template ChatML) ⇒ le nombre
+            EFFECTIF de tokens superposés T_eff = (Σw)²/Σw² chute et le SNR
+            monte. `a` est un knob DU TOY (`code.sif_a`) : le stream du toy
+            reste surp OFF, le SIF n'entre que dans le code de banque.
+
+Pool : seuls les tokens de PADDING sont exclus (masque `attention_mask` du
+seg ; en pratique les segs du stream persona ne sont pas padés). Les tokens
+ChatML de structure (<|im_start|>user … <|im_end|>) RESTENT dans le pool :
+ils font partie du bruit réaliste que le write du 350M avale.
+
+⚠️ ROUND-TRIP ORACLE À L'ÉCHELLE RÉELLE (vocab 49 154, embeddings à l'init,
+393 segs porteurs réels, seg_n_pos 32) — c'est la BORNE SUPÉRIEURE du pointer,
+mesurée avant tout entraînement. Seuil de déploiement : 70 % sur la strate
+`code` (celle qui n'a aucun prior LM).
+
+  d=256   format              ALL      `code`   T_eff   z médian
+          segmean             1.4 %     2.7 %   19.0     3.38
+          segphase           32.5 %    28.8 %   19.0     3.75
+          segsif a=1e-4      52.0 %  → 15.1 % ← 4.75     4.95   (code : z 1.59)
+          segsif a=3e-3      70.3 %    45.3 %  10.29     5.34
+          segsif a=1e-2      76.3 %    59.9 %  12.74     5.07   ← MEILLEUR
+          segsif a=3e-2      69.5 %    55.9 %  15.28     4.77
+          segsif a=1e-1      54.9 %    45.6 %  17.48     4.40
+          segsif a=1         36.0 %    30.9 %  18.94     3.88
+          (référence phase 2, privilège gardé) `phase` 98.6 % / 97.4 %
+  d=512   segphase           77.7 %    71.0 %  19.0      —
+          segsif a=1e-2      97.4 %    94.9 %  12.74     7.09
+
+Lecture : le format est SNR-LIMITÉ, pas cassé. z(bon token) ≈ √(d/(T_eff−1))
+contre le max de |V| gaussiennes concurrentes √(2·ln|V|) = 4.65 σ.
+
+PIÈGE CONFIRMÉ — le SIF à a=1e-4 (la valeur du 350M) DÉGRADE la strate `code`
+(28.8 % → 15.1 %, z 3.65 → 1.59) alors qu'il fait exploser `short` (39.6 % →
+97.0 %) : les codes/refs/plaques sont faits de digrammes FRÉQUENTS (w̄ 0.042
+sur les tokens chiffrés contre 0.62 sur les valeurs linguistiques), donc la
+pondération les écrase précisément là où on a besoin d'eux. a=1e-2 rétablit
+l'équilibre (w̄ chiffrés 0.81) et double `code` vs uniforme, sans atteindre 70 %
+à d=256. La conclusion tient : la condition de viabilité est d_model ≥ 512
+(avec SIF a=1e-2 : 94.9 % sur `code`).
+
 Usage
 -----
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r0
@@ -106,7 +167,14 @@ from .persona_chat_data import fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3")
-CODES = ("mean", "chunk", "phase", "rows")
+CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif")
+# formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
+# d'oracle sur le span valeur). Ils indexent la position DANS LE SEGMENT, donc
+# ils utilisent `seg_n_pos` et non `n_pos`.
+SEG_CODES = ("segmean", "segphase", "segsif")
+# formats à binding DFT sur la position DANS LE SEGMENT (mêmes tables, mêmes
+# candidats pointer) — seule la PONDÉRATION du pool les distingue.
+SEG_PHASE_CODES = ("segphase", "segsif")
 # slots dont la valeur est un CODE arbitraire (5-8 tokens, zéro prior LM) —
 # c'est la strate que le pool moyen ne peut structurellement pas rendre.
 CODE_SLOTS = ("code", "ref", "plate")
@@ -141,6 +209,18 @@ class ToyCfg:
                               # la distribution ÉCHANTILLONNÉE, cf. rapport)
     rope_base: float = 0.0    # <=0 : binding DFT (défaut, cf. phase_tables) ;
                               # >0 : forme RoPE littérale (ablation)
+    # ── axe SEGMENT ENTIER (phase 3) ────────────────────────────────────────
+    seg_n_pos: int = 32       # positions bindées DANS LE SEGMENT porteur.
+                              # MESURÉ sur le stream persona : longueur des segs
+                              # porteurs ∈ [12, 26], moyenne 18.5, p98 = 23 ⇒ 32
+                              # est la puissance de 2 qui couvre 100 %.
+                              # Les tokens au-delà (jamais observés ici) sont
+                              # poolés SANS rotation (contenu gardé, position
+                              # perdue), jamais tronqués.
+    sif_a: float = 1e-4       # `segsif` : a de la pondération SIF w = a/(a+p).
+                              # 1e-4 = la recette du 350M (PersonaChatStream
+                              # surprisal_mode='sif'). Knob du TOY, indépendant
+                              # du stream (qui tourne surp OFF ici).
 
     def __post_init__(self):
         if self.variant == "r3":
@@ -163,6 +243,10 @@ class ToyCfg:
                 f"--variant {self.variant}. Phase 1 = --code mean.")
             assert self.mem_dim == self.d_model
             assert self.n_pos >= 1
+            if self.code in SEG_CODES:
+                assert self.seg_n_pos >= 1
+            if self.code == "segsif":
+                assert self.sif_a > 0, f"sif_a doit être > 0 ({self.sif_a})"
             if self.code == "chunk":
                 assert self.d_model % self.n_pos == 0, (
                     f"chunk : d_model {self.d_model} doit être divisible par "
@@ -172,7 +256,14 @@ class ToyCfg:
     @property
     def n_cand(self) -> int:
         """Candidats engendrés PAR LIGNE par le readout position-conscient."""
-        return 1 if self.code in ("mean", "rows") else self.n_pos
+        if self.code in SEG_PHASE_CODES:
+            return self.seg_n_pos
+        return 1 if self.code in ("mean", "rows", "segmean") else self.n_pos
+
+    @property
+    def pools_segment(self) -> bool:
+        """Le code poole-t-il le SEG ENTIER (phase 3) au lieu du span valeur ?"""
+        return self.code in SEG_CODES
 
     @property
     def uses_fw(self) -> bool:
@@ -488,8 +579,32 @@ class ToyBlock(nn.Module):
         return x
 
 
+def sif_weight_table(stream_cls, tok, gen_kwargs: dict, vocab_size: int,
+                     a: float, seed: int = 0) -> torch.Tensor:
+    """[vocab_size] float : poids SIF w = a/(a+p(token)), recette du 350M.
+
+    On ne RÉIMPLÉMENTE rien : on instancie un PersonaChatStream en
+    `surprisal_mode='sif'` et on lui demande son `_sif_table()` — la même table
+    unigram (300 convs, rng dédié 4242, `_sif_unseen = 0.5/tot`) que celle qui
+    pondère le write du 350M. Les tokens jamais vus prennent le poids unseen.
+
+    Le stream d'ENTRAÎNEMENT du toy, lui, reste surp OFF (`persona_kwargs` pop
+    `surprisal_mode`/`sif_a`) : le SIF n'entre QUE dans le code de banque, il
+    ne touche ni la loss ni les données. Le `a` est un knob du toy.
+    """
+    st = stream_cls(tok, seed=seed,
+                    **{**gen_kwargs, "surprisal_mode": "sif", "sif_a": float(a)})
+    p = st._sif_table()
+    w = torch.full((vocab_size,), a / (a + st._sif_unseen), dtype=torch.float32)
+    for t, pv in p.items():
+        if 0 <= int(t) < vocab_size:
+            w[int(t)] = a / (a + pv)
+    return w
+
+
 class ToyReadLM(nn.Module):
-    def __init__(self, cfg: ToyCfg, n_slots: int, n_attrs: int):
+    def __init__(self, cfg: ToyCfg, n_slots: int, n_attrs: int,
+                 sif_w: torch.Tensor | None = None):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
@@ -529,6 +644,19 @@ class ToyReadLM(nn.Module):
         elif cfg.code == "rows":
             pos = torch.randn(cfg.n_pos, cfg.d_model, generator=g) * (cfg.d_model ** -0.5)
             self.register_buffer("pos_emb", pos)               # [n_pos, d]
+        elif cfg.code in SEG_PHASE_CODES:
+            # même binding DFT que `phase`, mais indexé sur la position DANS LE
+            # SEGMENT ⇒ sa propre table de seg_n_pos lignes.
+            c, s = phase_tables(cfg.seg_n_pos, cfg.d_model, cfg.rope_base)
+            self.register_buffer("sg_cos", c)                  # [seg_n_pos, d/2]
+            self.register_buffer("sg_sin", s)
+        if cfg.code == "segsif":
+            assert sif_w is not None, (
+                "--code segsif exige la table de poids SIF : "
+                "ToyReadLM(..., sif_w=sif_weight_table(...))")
+            assert sif_w.numel() == cfg.vocab_size, (sif_w.numel(),
+                                                     cfg.vocab_size)
+            self.register_buffer("sif_w", sif_w.float().clone())
 
     # ── write ORACLE ────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -548,14 +676,18 @@ class ToyReadLM(nn.Module):
         return rms_unit(code).detach()
 
     @torch.no_grad()
-    def oracle_lines(self, slot_id: int, attr_id: int, val_tok: torch.Tensor
-                     ) -> torch.Tensor:
+    def oracle_lines(self, slot_id: int, attr_id: int, val_tok: torch.Tensor,
+                     seg_tok: torch.Tensor | None = None) -> torch.Tensor:
         """LES LIGNES d'un fait : [n_lignes, mem_dim]. Dispatch sur cfg.code.
 
         `mean` en rend UNE et est bit-à-bit identique à la phase 1 ; `chunk` et
         `phase` en rendent une aussi (formats à ordre INTERNE) ; `rows` en rend
         une PAR TOKEN (borne haute de décodabilité, économie dégradée : le FIFO
         de max_mem lignes est inchangé, un fait long mange la banque).
+
+        PHASE 3 (`segmean`/`segphase`) : le code ne voit PLUS `val_tok` — il
+        poole `seg_tok`, le segment porteur ENTIER (template ChatML compris),
+        exactement comme le write du 350M qui ignore où est la valeur.
 
         Comme en phase 1 : recalculé à la volée sur les embeddings COURANTS,
         detach total, aucun gradient ne traverse la banque.
@@ -564,10 +696,39 @@ class ToyReadLM(nn.Module):
         if c.code == "mean":
             return self.oracle_code(slot_id, attr_id, val_tok).unsqueeze(0)
         dev = self.embed.weight.device
+        ka = self.K_slot[slot_id].float() + self.A_attr[attr_id].float()
+        if c.pools_segment:
+            assert seg_tok is not None, (
+                f"--code {c.code} poole le SEGMENT : oracle_lines a besoin de "
+                f"seg_tok (tokens non-padés du seg porteur)")
+            st = seg_tok.to(dev).reshape(-1)
+            es = rms_unit(self.embed.weight[st].float())       # [T, d], RMS 1
+            T = es.size(0)
+            # pondération du pool : uniforme, ou SIF w = a/(a+p) — la recette
+            # du write du 350M, qui écrase les tokens fréquents (template
+            # ChatML) et fait chuter le nombre EFFECTIF de tokens superposés.
+            if c.code == "segsif":
+                w = self.sif_w[st].float()                     # [T]
+            else:
+                w = torch.ones(T, dtype=torch.float32, device=dev)
+            wsum = float(w.sum())
+            if wsum <= 0:            # dégénéré (jamais observé) : uniforme
+                w = torch.ones_like(w)
+                wsum = float(T)
+            ew = es * w[:, None]
+            if c.code == "segmean":
+                pooled = ew.sum(0) / wsum                       # ordre détruit
+            else:                                    # segphase / segsif
+                n = min(T, c.seg_n_pos)
+                bound = rot_pairs(ew[:n], self.sg_cos[:n].float(),
+                                  self.sg_sin[:n].float()).sum(0)
+                if T > n:      # débordement : contenu gardé, position perdue
+                    bound = bound + ew[n:].sum(0)
+                pooled = bound / wsum
+            return rms_unit(ka + pooled).unsqueeze(0).detach()
         toks = val_tok.to(dev)[:c.n_pos]                       # troncature n_pos
         e = self.embed.weight[toks].float()                    # [n, d]
         e = rms_unit(e)                                        # ê(t_k), RMS 1
-        ka = self.K_slot[slot_id].float() + self.A_attr[attr_id].float()
         n = e.size(0)
         if c.code == "chunk":
             blk = c.d_model // c.n_pos
@@ -595,11 +756,15 @@ class ToyReadLM(nn.Module):
         qui apprend l'alignement position↔décodage.
         """
         c = self.cfg
-        if c.code in ("mean", "rows"):
+        if c.code in ("mean", "rows", "segmean"):
             return bank, bank_mask                 # la ligne EST le candidat
         B, M, d = bank.shape
-        n = c.n_pos
-        if c.code == "chunk":
+        n = c.n_cand
+        if c.code in SEG_PHASE_CODES:
+            cs = self.sg_cos.to(bank.dtype)[None, None]        # [1,1,n,d/2]
+            sn = self.sg_sin.to(bank.dtype)[None, None]
+            cand = rot_pairs(bank[:, :, None, :], cs, -sn)     # rot(−θj)
+        elif c.code == "chunk":
             blk = d // n
             blocks = bank.view(B, M, n, blk)
             # dé-projection EXACTE du bloc j par P_j^T (frame orthonormé)
@@ -690,6 +855,20 @@ class OracleEnv:
         return t
 
     @staticmethod
+    def seg_tokens(seg: dict) -> torch.Tensor:
+        """Tokens NON-PADÉS du seg (phase 3 : ce que poole le write réaliste).
+
+        Seul le padding est retiré (via `attention_mask` quand il existe) : les
+        tokens ChatML de structure RESTENT, ils sont le bruit de template que
+        le write du 350M avale sans savoir où est la valeur.
+        """
+        ids = seg["input_ids"][0]
+        am = seg.get("attention_mask")
+        if am is not None:
+            ids = ids[am[0].to(torch.bool)]
+        return ids
+
+    @staticmethod
     def fact_of(seg: dict):
         """(slot_id, attr_id, val_id) si le seg PORTE un fait, sinon None."""
         if "fact_slot" not in seg:
@@ -709,7 +888,8 @@ class OracleEnv:
         f = self.fact_of(seg)
         if f is None:
             return bank
-        rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]))
+        rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]),
+                                  seg_tok=self.seg_tokens(seg))
         bank = bank + list(rows)
         return bank[-self.max_mem:]
 
@@ -937,6 +1117,10 @@ def main(argv=None):
         mc["n_pos"] = int(cb["n_pos"])
     if "rope_base" in cb:
         mc["rope_base"] = float(cb["rope_base"])
+    if "seg_n_pos" in cb:
+        mc["seg_n_pos"] = int(cb["seg_n_pos"])
+    if "sif_a" in cb:
+        mc["sif_a"] = float(cb["sif_a"])
     device = a.device or t.get("device") or ("cuda" if torch.cuda.is_available()
                                              else "cpu")
     steps = int(a.steps or t.get("steps", 3000))
@@ -956,7 +1140,15 @@ def main(argv=None):
     mc["code"] = a.code
     mc["vocab_size"] = len(tok)
     cfg = ToyCfg(**mc)
-    model = ToyReadLM(cfg, env.n_slots, env.n_attrs).to(device)
+    P = chat_stream_class("persona")
+    sif_w = None
+    if cfg.code == "segsif":
+        # table SIF sur le split TRAIN (la vue du write). Le stream
+        # d'entraînement reste surp OFF : le SIF n'entre QUE dans le code.
+        sif_w = sif_weight_table(P, tok, persona_kwargs(raw, "train", a.smoke),
+                                 cfg.vocab_size, cfg.sif_a,
+                                 seed=int(t.get("seed", 0)))
+    model = ToyReadLM(cfg, env.n_slots, env.n_attrs, sif_w=sif_w).to(device)
 
     # phase 1 → <variant>/ (inchangé) ; phase 2 → <variant>_<code>/
     run_name = a.variant if a.code == "mean" else f"{a.variant}_{a.code}"
@@ -973,9 +1165,19 @@ def main(argv=None):
           f"mem_dim {cfg.mem_dim} M {cfg.max_mem} x_dim {cfg.x_dim} "
           f"vocab {cfg.vocab_size}", flush=True)
     if a.code != "mean":
-        print(f"  code {a.code} : n_pos {cfg.n_pos} "
+        head = (f"seg_n_pos {cfg.seg_n_pos} (pool du SEG ENTIER, "
+                f"privilège span-valeur RETIRÉ) " if cfg.pools_segment
+                else f"n_pos {cfg.n_pos} ")
+        print(f"  code {a.code} : " + head
               + (f"blk {cfg.d_model // cfg.n_pos} " if a.code == "chunk" else "")
-              + (f"rope_base {cfg.rope_base} " if a.code == "phase" else "")
+              + (f"rope_base {cfg.rope_base} "
+                 if a.code in ("phase",) + SEG_PHASE_CODES else "")
+              # w̄ porte sur TOUT le vocab (dominé par les tokens jamais vus,
+              # au poids unseen) ; w_min = l'écrasement du token le plus
+              # fréquent, c'est LUI qui dit si le SIF mord.
+              + (f"sif_a {cfg.sif_a:g} (w vocab moy {float(model.sif_w.mean()):.3f} "
+                 f"min {float(model.sif_w.min()):.4f}) "
+                 if a.code == "segsif" else "")
               + f"| candidats pointer {cfg.max_mem * cfg.n_cand} "
               f"({cfg.max_mem}×{cfg.n_cand})", flush=True)
     print("  params : " + "  ".join(f"{k} {v/1e6:.2f}M" for k, v in pr.items()),
@@ -1003,7 +1205,6 @@ def main(argv=None):
     max_len = int(cfg.max_seq_len)
     clip = float(t.get("grad_clip", 1.0))
 
-    P = chat_stream_class("persona")
     tr_stream = P(tok, seed=int(t.get("seed", 0)),
                   **persona_kwargs(raw, "train", a.smoke))
     ev_stream = P(tok, seed=1234, **persona_kwargs(raw, "eval", a.smoke))
@@ -1083,7 +1284,8 @@ def main(argv=None):
 
 @torch.no_grad()
 def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
-                   val_tok: torch.Tensor) -> tuple:
+                   val_tok: torch.Tensor, seg_tok: torch.Tensor | None = None,
+                   val_pos=None) -> tuple:
     """(top-1 exacts, positions testées) du décodage ORACLE d'un fait.
 
     Pose les lignes du fait, construit les candidats du readout, et vérifie
@@ -1091,11 +1293,28 @@ def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
     BORNE SUPÉRIEURE de ce que le pointer peut apprendre : si l'oracle
     lui-même ne rend pas l'ordre, aucun read ne le rendra (le verdict de la
     phase 1 en un chiffre).
+
+    PHASE 3 (`segmean`/`segphase`) : la ligne poole le SEG ENTIER, donc les
+    positions testées sont celles de la VALEUR DANS LE SEGMENT (`val_pos`,
+    issues du `val_mask` du seg), et la cible est `seg_tok[j]`. `segmean` n'a
+    qu'un candidat (la ligne) : il est confronté à chaque position, ce qui
+    DOIT échouer — c'est la sanity « l'ordre n'existe pas ».
     """
     cfg = model.cfg
-    lines = model.oracle_lines(slot_id, attr_id, val_tok)
+    lines = model.oracle_lines(slot_id, attr_id, val_tok, seg_tok=seg_tok)
     cand, _ = model.candidates(lines.unsqueeze(0), None)      # [1, N, d]
     E = model.embed.weight.float()
+    if cfg.pools_segment:
+        assert seg_tok is not None and val_pos is not None, (
+            "round-trip phase 3 : seg_tok + val_pos requis")
+        seg_tok = seg_tok.reshape(-1)
+        ok = 0
+        pos = [int(j) for j in val_pos]
+        for j in pos:
+            c = cand[0, min(j, cfg.seg_n_pos - 1)] \
+                if cfg.code in SEG_PHASE_CODES else cand[0, 0]
+            ok += int(int(torch.argmax(c.float() @ E.t())) == int(seg_tok[j]))
+        return ok, len(pos)
     n = len(val_tok) if cfg.code == "mean" else min(len(val_tok), cfg.n_pos)
     ok = 0
     for j in range(n):
@@ -1113,6 +1332,13 @@ def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
 
 def _selftest() -> None:
     from .persona_chat_data import PersonaChatStream, _StubTok
+
+    # Le self-test ne seedait RIEN : les embeddings de chaque modèle jouet
+    # étaient tirés au hasard du process, et les round-trips ORACLE (qui sont
+    # des argmax sur un vocab entier, donc bornés par le max d'un bruit
+    # gaussien) flambaient de temps en temps. Le seed rend le verdict
+    # reproductible — il ne rend rien plus facile.
+    torch.manual_seed(20260730)
 
     tok = _StubTok()
     tok.decode = lambda ids, **kw: "".join(chr(i) for i in ids)
@@ -1258,15 +1484,30 @@ def _selftest() -> None:
     # ════════════════ PHASE 2 : l'axe FORMAT DE CODE ════════════════════════
     # 7. round-trip ORACLE par format (embeddings figés, vocab jouet 512).
     #    d_model=256 / n_pos=8 = les dims RÉELLES du run (blocs chunk 32 dims).
-    def _mk(code, d=256, n_pos=8, vocab=512, base=0.0):
+    P2_CODES = ("mean", "chunk", "phase", "rows")   # formats à span-valeur
+
+    # table SIF SYNTHÉTIQUE (hermétique, pas de passe de 300 convs) : les
+    # tokens 7/8/9 jouent le « template très fréquent » (p = 0.2 ⇒ w ≈ 5e-4),
+    # tout le reste est rare (p = 1e-5 ⇒ w ≈ 0.91). C'est exactement la forme
+    # w = a/(a+p) que rend sif_weight_table.
+    A_SIF = 1e-4
+
+    def _sifw(vocab=512):
+        w = torch.full((vocab,), A_SIF / (A_SIF + 1e-5))
+        w[torch.tensor([7, 8, 9])] = A_SIF / (A_SIF + 0.2)
+        return w
+
+    def _mk(code, d=256, n_pos=8, vocab=512, base=0.0, seg_n_pos=32):
         c = ToyCfg(vocab_size=vocab, d_model=d, n_layers=1, n_heads=4,
                    mem_dim=d, variant="r3", max_seq_len=64, code=code,
-                   n_pos=n_pos, rope_base=base)
-        return ToyReadLM(c, env.n_slots, env.n_attrs).eval()
+                   n_pos=n_pos, rope_base=base, seg_n_pos=seg_n_pos,
+                   sif_a=A_SIF)
+        return ToyReadLM(c, env.n_slots, env.n_attrs,
+                         sif_w=_sifw(vocab) if code == "segsif" else None).eval()
 
     tok8 = torch.tensor([11, 77, 200, 41, 305, 9, 128, 460])   # 8 positions
     rt = {}
-    for code in CODES:
+    for code in P2_CODES:
         m = _mk(code)
         rt[code] = code_roundtrip(m, 3, 2, tok8)
     for code in ("chunk", "phase", "rows"):
@@ -1287,9 +1528,10 @@ def _selftest() -> None:
     assert ok_mean < n_mean, "mean ne devrait PAS décoder l'ordre"
 
     # 8. lane vide ≡ ablaté, et forward fini, pour CHAQUE format
+    seg20 = torch.randint(0, 512, (20,), generator=torch.Generator().manual_seed(3))
     for code in CODES:
-        m = _mk(code, d=32, n_pos=4, vocab=512)
-        rows = m.oracle_lines(3, 2, tok8[:3])
+        m = _mk(code, d=32, n_pos=4, vocab=512, seg_n_pos=8)
+        rows = m.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
         bmix = torch.cat([torch.cat([rows[:1], torch.zeros(1, 32)])[None],
                           torch.zeros(1, 2, 32)], dim=0)         # [2,2,32]
         mmix = torch.tensor([[True, False], [False, False]])
@@ -1331,13 +1573,134 @@ def _selftest() -> None:
 
     # 10. r0/r1/r2 REFUSENT les nouveaux formats (message clair)
     for var in ("r0", "r1", "r2"):
-        try:
-            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
-                   variant=var, code="phase", n_pos=4)
-        except AssertionError as e:
-            assert "r3" in str(e)
-        else:
-            raise AssertionError(f"{var} aurait dû refuser --code phase")
+        for code in ("phase", "segmean", "segphase", "segsif"):
+            try:
+                ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                       variant=var, code=code, n_pos=4, seg_n_pos=8)
+            except AssertionError as e:
+                assert "r3" in str(e)
+            else:
+                raise AssertionError(f"{var} aurait dû refuser --code {code}")
+
+    # ════════════════ PHASE 3 : POOL DU SEGMENT ENTIER ══════════════════════
+    # 11. round-trip segphase sur un fait SYNTHÉTIQUE : seg de 20 tokens dont
+    #     la valeur occupe les positions 5-7. Le code ne sait PAS où elle est
+    #     (il poole les 20), le readout doit quand même la rendre top-1 aux 3
+    #     positions.
+    #
+    #     ⚠️ Ce test valide LE FORMAT (le binding survit au pool du segment),
+    #     PAS la viabilité aux dims du run. Superposer T tokens dans d dims
+    #     donne SNR ≈ √(d/(T−1)) contre le max de |V| gaussiennes concurrentes
+    #     (√(2·ln|V|)). À d=256/T=20 : 3.7 σ contre 3.5 (vocab 512) et 4.65
+    #     (vocab réel 49152) ⇒ le format est SNR-LIMITÉ à l'échelle réelle,
+    #     et c'est `code_roundtrip` sur les vrais segs qui rend le verdict de
+    #     déploiement. Ici on prend d=512 (SNR 5.2) pour que l'assertion teste
+    #     l'algèbre et non le tirage d'embeddings ; le chiffre à d=256 est
+    #     imprimé à titre indicatif, sans assertion.
+    torch.manual_seed(20260731)          # le self-test ne seedait pas le global
+    g20 = torch.Generator().manual_seed(11)
+    seg_syn = torch.randint(0, 512, (20,), generator=g20)
+    seg_syn[5:8] = torch.tensor([301, 44, 199])            # la « valeur »
+    vpos = [5, 6, 7]
+    m_sp = _mk("segphase", d=512)
+    ok, n = code_roundtrip(m_sp, 3, 2, tok8, seg_tok=seg_syn, val_pos=vpos)
+    assert (ok, n) == (3, 3), (
+        f"round-trip segphase : {ok}/{n} — le binding positionnel ne survit "
+        f"pas au pool du segment entier, l'expérience n'a pas de sens")
+    # rien de spécial au span valeur : le seg ENTIER se déroule au même taux.
+    ok_all, n_all = code_roundtrip(m_sp, 3, 2, tok8, seg_tok=seg_syn,
+                                   val_pos=list(range(20)))
+    assert ok_all == n_all, f"round-trip segphase seg entier {ok_all}/{n_all}"
+    ok_256, n_256 = code_roundtrip(_mk("segphase"), 3, 2, tok8,
+                                   seg_tok=seg_syn, val_pos=list(range(20)))
+    # segmean : l'ordre N'EXISTE PAS — un seul candidat, et il ne peut pas
+    # rendre 3 tokens distincts (au plus 1 des 3 positions par accident).
+    m_sm = _mk("segmean", d=512)
+    ok_sm, n_sm = code_roundtrip(m_sm, 3, 2, tok8, seg_tok=seg_syn,
+                                 val_pos=vpos)
+    assert ok_sm <= 1, f"segmean ne devrait pas décoder l'ordre ({ok_sm}/{n_sm})"
+    # et la PERMUTATION du segment donne la MÊME ligne (sac de tokens) alors
+    # qu'elle change celle de segphase.
+    permu = seg_syn[torch.randperm(20, generator=torch.Generator().manual_seed(5))]
+    assert torch.allclose(m_sm.oracle_lines(3, 2, tok8, seg_tok=seg_syn),
+                          m_sm.oracle_lines(3, 2, tok8, seg_tok=permu),
+                          atol=1e-6), "segmean : la permutation devrait collapser"
+    assert not torch.allclose(m_sp.oracle_lines(3, 2, tok8, seg_tok=seg_syn),
+                              m_sp.oracle_lines(3, 2, tok8, seg_tok=permu),
+                              atol=1e-4), "segphase : la permutation devrait compter"
+    # 11bis. le code ne dépend PAS de val_tok (privilège retiré) mais DÉPEND du
+    #        seg — la garantie que l'oracle n'a plus le span valeur.
+    for m_ in (m_sm, m_sp):
+        assert torch.equal(m_.oracle_lines(3, 2, tok8, seg_tok=seg_syn),
+                           m_.oracle_lines(3, 2, tok8[:2], seg_tok=seg_syn)), \
+            "phase 3 : le code regarde encore val_tok"
+    # 11ter. seg_tok manquant ⇒ erreur explicite
+    try:
+        m_sp.oracle_lines(3, 2, tok8)
+    except AssertionError as e:
+        assert "seg_tok" in str(e)
+    else:
+        raise AssertionError("segphase aurait dû exiger seg_tok")
+    # 11quater. FIFO INCHANGÉ : 12 faits ⇒ 8 lignes, une ligne par fait
+    for code in SEG_CODES:
+        m_ = _mk(code, d=32, n_pos=4, vocab=512, seg_n_pos=8)
+        b = []
+        for k in range(12):
+            s = dict(seg_tpl)
+            s["fact_val"] = torch.full_like(seg_tpl["fact_val"], 1 + k)
+            b = env.write(m_, b, s)
+        assert len(b) == 8, f"FIFO {code} : {len(b)} lignes"
+        ref = m_.oracle_lines(int(seg_tpl["fact_slot"][0, 0]),
+                              int(seg_tpl["fact_attr"][0, 0]),
+                              env.val_tokens(12),
+                              seg_tok=OracleEnv.seg_tokens(seg_tpl))
+        assert torch.equal(b[-1], ref[0]), f"FIFO {code} : dernière ligne"
+
+    # 12. segsif : le pool est PONDÉRÉ SIF (w = a/(a+p)) — recette du write du
+    #     350M. Tokens 7/8/9 = « template très fréquent » (w ≈ 5e-4), le reste
+    #     rare (w ≈ 0.91).
+    m_ss = _mk("segsif", d=512)
+    seg_f = seg_syn.clone()
+    seg_f[[0, 1, 2, 10, 11, 12, 15, 16]] = torch.tensor([7, 8, 9, 7, 8, 9, 7, 8])
+    # (a) la pondération CHANGE le code : segsif ≠ segphase sur ce seg
+    l_ss = m_ss.oracle_lines(3, 2, tok8, seg_tok=seg_f)
+    l_sp = _mk("segphase", d=512).oracle_lines(3, 2, tok8, seg_tok=seg_f)
+    assert not torch.allclose(l_ss, l_sp, atol=1e-3), \
+        "segsif : la pondération SIF ne change pas le code"
+    # (b) round-trip synthétique : la valeur (positions 5-7, tokens rares)
+    #     reste top-1 malgré le bruit de template
+    ok_ss, n_ss = code_roundtrip(m_ss, 3, 2, tok8, seg_tok=seg_f, val_pos=vpos)
+    assert (ok_ss, n_ss) == (3, 3), f"round-trip segsif : {ok_ss}/{n_ss}"
+    # (c) ÉCRASEMENT : bouger un token FRÉQUENT bouge le code segsif beaucoup
+    #     moins que le code segphase (c'est TOUT le mécanisme du SIF)
+    seg_g = seg_f.clone(); seg_g[10] = 9
+    d_ss = float((m_ss.oracle_lines(3, 2, tok8, seg_tok=seg_g) - l_ss).norm())
+    d_sp = float((_mk("segphase", d=512).oracle_lines(3, 2, tok8, seg_tok=seg_g)
+                  - l_sp).norm())
+    assert d_ss < 0.2 * d_sp, (
+        f"segsif n'écrase pas les tokens fréquents (Δ {d_ss:.4f} vs segphase "
+        f"{d_sp:.4f})")
+    # (d) T_eff : le SIF fait chuter le nombre EFFECTIF de tokens superposés
+    w_ = _sifw()[seg_f].float()
+    t_eff = float(w_.sum() ** 2 / (w_ * w_).sum())
+    assert t_eff < 0.7 * seg_f.numel(), (t_eff, seg_f.numel())
+    # (e) sif_w OBLIGATOIRE (sinon le code serait silencieusement uniforme)
+    try:
+        ToyReadLM(ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                         variant="r3", code="segsif", seg_n_pos=8),
+                  env.n_slots, env.n_attrs)
+    except AssertionError as e:
+        assert "sif_w" in str(e)
+    else:
+        raise AssertionError("segsif aurait dû exiger sif_w")
+    # (f) sif_a <= 0 refusé
+    try:
+        ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+               variant="r3", code="segsif", seg_n_pos=8, sif_a=0.0)
+    except AssertionError as e:
+        assert "sif_a" in str(e)
+    else:
+        raise AssertionError("sif_a=0 aurait dû être refusé")
 
     print("toy_read_lab self-test: OK (write oracle déterministe & "
           "embedding-dépendant, FIFO 8, porte pointer fermée à l'init, "
@@ -1345,11 +1708,24 @@ def _selftest() -> None:
           "4 variantes forward live+ablaté)")
     print("  phase 2 — round-trip ORACLE (top-1 exacts / positions, vocab 512, "
           "d_model 256, n_pos 8) : " +
-          "  ".join(f"{c} {rt[c][0]}/{rt[c][1]}" for c in CODES) +
+          "  ".join(f"{c} {rt[c][0]}/{rt[c][1]}" for c in P2_CODES) +
           "   [mean DOIT échouer : anagrammes ⇒ ligne identique]")
-    print("  phase 2 — lane vide ≡ ablaté & porte fermée pour les 4 formats, "
+    print("  phase 2 — lane vide ≡ ablaté & porte fermée pour les 7 formats, "
           "FIFO rows (3 faits × 3 tokens ⇒ 8 lignes), r0/r1/r2 refusent "
-          "chunk/phase/rows")
+          "chunk/phase/rows/segmean/segphase/segsif")
+    print(f"  phase 3 — POOL DU SEG ENTIER (privilège span-valeur retiré, "
+          f"seg_n_pos 32, seg synthétique de 20 tokens, vocab 512) : "
+          f"round-trip segphase d=512 valeur {ok}/{n}, seg entier "
+          f"{ok_all}/{n_all} ; MÊME seg à d=256 (dims du run) "
+          f"{ok_256}/{n_256} — régime SNR-limité, cf. le round-trip à "
+          f"l'échelle réelle ; segmean {ok_sm}/{n_sm} [DOIT échouer : "
+          f"permutation ⇒ ligne identique] ; codes indépendants de val_tok, "
+          f"FIFO 8 inchangé")
+    print(f"  phase 3 — segsif (pool PONDÉRÉ SIF w=a/(a+p), a={A_SIF:g}) : "
+          f"round-trip valeur {ok_ss}/{n_ss}, code ≠ segphase, T_eff "
+          f"{t_eff:.1f}/{seg_f.numel()} tokens, écrasement d'un token fréquent "
+          f"Δ {d_ss:.4f} vs {d_sp:.4f} en poids uniformes ; sif_w et sif_a>0 "
+          f"exigés")
 
 
 if __name__ == "__main__":
