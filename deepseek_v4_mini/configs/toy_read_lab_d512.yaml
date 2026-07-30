@@ -27,14 +27,16 @@
 # Axe FORMAT DE CODE (r3 seulement) :
 #   --code mean|chunk|phase|rows        (phase 2, pool du SPAN VALEUR)
 #   --code segmean|segphase|segsif      (phase 3, pool du SEGMENT ENTIER)
+#   --code pack|segpack                 (phase 5, ligne PARTITIONNÉE en blocs)
 #
 # Axe RÉGIME DE WRITE :
 #   --write fact   (défaut) l'oracle n'écrit qu'après les segs PORTEURS
 #   --write every  il écrit après CHAQUE seg (régime du 350M : le flux évince
 #                  les faits du FIFO). Exige un code de SEGMENT.
 # Axe POSITION : code.pos_offset (ou --pos-offset K) décale l'index de phase.
-# Les deux ajoutent un suffixe au save_dir (_o<K>, _wev) : aucun run passé
-# n'est écrasé.
+# Axe PARTITION : code.pack_blocks (ou --pack-blocks B) découpe la ligne pack.
+# Tous ajoutent un suffixe au save_dir (_o<K>, _wev, _b<B> hors défaut) :
+# aucun run passé n'est écrasé.
 #
 # ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal) :
 # toy_read_lab.py fait son propre paths.load_yaml.
@@ -146,7 +148,44 @@ code:
                           # anomalie position-0 dans le code lui-même) — il ne
                           # se teste donc qu'au niveau du READ APPRIS.
 
-  sif_a: 0.01             # `segsif` seulement : le a de w = a/(a+p(token)).
+  # ── PHASE 5 : --code pack|segpack (r3 seulement) ──────────────────────────
+  # La ligne n'est plus une SUPERPOSITION mais une PARTITION : pack_blocks
+  # sous-espaces disjoints, bloc 0 = CLÉ dédiée de la paire (slot, attr), blocs
+  # 1.. = UN token chacun (R_j^T·ê(t_j), frames orthonormés figés). Zéro
+  # interférence entre positions, mais capacité DURE de pack_blocks−1 tokens.
+  # `pack` garde le privilège de span (blocs = tokens de la valeur) ;
+  # `segpack` le retire (blocs = les top-(pack_blocks−1) tokens SIF du segment,
+  # dans l'ordre du segment) — c'est le bras comparable à segsif.
+  pack_blocks: 8          # nombre TOTAL de blocs, CLÉ COMPRISE (d_model doit
+                          # être divisible par lui ; ⇒ d_sub = 512/8 = 64 dims
+                          # par bloc, 7 tokens de contenu).
+                          # SWEEP ORACLE k×d_sub (500 faits held-out, partition
+                          # (k_val+1)·d_sub = 512, RT = top-1 par bloc sur les
+                          # tokens de valeur | clé = retrieval rang-1 sur des
+                          # banques de 8 lignes à clés distinctes) :
+                          #   d_sub 64 (8 blocs)   RT 100.0 % +3.84σ | clé 100 %
+                          #   d_sub 32 (16 blocs)  RT  95.9 % +1.42σ | clé 100 %
+                          #   d_sub 16 (32 blocs)  RT  40.2 % −0.21σ | clé 100 %
+                          #   d_sub  8 (64 blocs)  RT   3.3 % −1.37σ | clé 100 %
+                          #   d_sub  4 (128 blocs) RT   0.0 % −2.41σ | clé 100 %
+                          #   d_sub  1 (512 blocs) RT   0.0 % −3.53σ | clé 25 %
+                          # « pourquoi pas 512 blocs de 1 dim » : un bloc de
+                          # d_sub dims oppose le token cible au MAX de |V|
+                          # concurrents, dont le cos est ≈ √(2·ln|V|/d_sub) ;
+                          # il atteint 1 vers d_sub ≈ 2·ln|V| ≈ 21.6 (V=49 154).
+                          # Le cliff mesuré est bien là : 64 → 32 → 16 = 100 →
+                          # 95.9 → 40.2 %. La CLÉ, elle, ne discrimine que 8
+                          # lignes (pas 49 k) et tient donc jusqu'à d_sub 4 :
+                          # c'est le CONTENU qui fixe le plancher, pas l'adresse.
+                          # 8 = le verdict (RT ≥ 99 % ET clé ≥ 99 %, marge
+                          # saine). ⚠️ ARBITRAGE OUVERT : à pack_blocks 16 la
+                          # sélection SIF du `segpack` couvre 99.9 % des tokens
+                          # de valeur au lieu de 63.5 %, et le RT EFFECTIF
+                          # (couverture × RT) monte à 98.0 % contre 63.5 % —
+                          # payé par une marge à +1.4σ seulement. Si le grade de
+                          # r3_segpack plafonne par MANQUE DE CAPACITÉ (valeurs
+                          # tronquées), 16 est le knob à tourner.
+  sif_a: 0.01             # `segsif`/`segpack` : le a de w = a/(a+p(token)).
                           # La table unigram vient de _sif_table() de
                           # PersonaChatStream (300 convs, rng 4242) — MÊME
                           # recette que le write du 350M. Le stream d'entraîne-

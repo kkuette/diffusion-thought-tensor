@@ -215,11 +215,12 @@ from .persona_chat_data import fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3")
-CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif")
+CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif",
+         "pack", "segpack")
 # formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
 # d'oracle sur le span valeur). Ils indexent la position DANS LE SEGMENT, donc
 # ils utilisent `seg_n_pos` et non `n_pos`.
-SEG_CODES = ("segmean", "segphase", "segsif")
+SEG_CODES = ("segmean", "segphase", "segsif", "segpack")
 # formats à binding DFT sur la position DANS LE SEGMENT (mêmes tables, mêmes
 # candidats pointer) — seule la PONDÉRATION du pool les distingue.
 SEG_PHASE_CODES = ("segphase", "segsif")
@@ -227,6 +228,15 @@ SEG_PHASE_CODES = ("segphase", "segsif")
 PHASE_CODES = ("phase",) + SEG_PHASE_CODES
 # régimes de write de l'oracle (cf. ToyCfg.write_mode).
 WRITE_MODES = ("fact", "every")
+# formats PARTITIONNÉS (phase 5) : la ligne est un PACK de blocs disjoints —
+# bloc 0 = clé dédiée, blocs 1..B−1 = un token chacun. Readout = PackReadout.
+PACK_CODES = ("pack", "segpack")
+# codes qui exigent la table SIF (pondération/sélection des tokens du segment).
+SIF_CODES = ("segsif", "segpack")
+# seed des tables ORACLE du pack (frames R_j ET clés par paire). FIGÉ : il est
+# celui de la campagne de mesure oracle (scratchpad/oracle_pack.py), garder la
+# continuité des chiffres.
+PACK_SEED = 20260801
 # slots dont la valeur est un CODE arbitraire (5-8 tokens, zéro prior LM) —
 # c'est la strate que le pool moyen ne peut structurellement pas rendre.
 CODE_SLOTS = ("code", "ref", "plate")
@@ -273,6 +283,15 @@ class ToyCfg:
                               # 1e-4 = la recette du 350M (PersonaChatStream
                               # surprisal_mode='sif'). Knob du TOY, indépendant
                               # du stream (qui tourne surp OFF ici).
+    # ── axe PACK (phase 5) ──────────────────────────────────────────────────
+    pack_blocks: int = 8      # `pack`/`segpack` : la ligne est partitionnée en
+                              # pack_blocks blocs de d_model/pack_blocks dims.
+                              # Bloc 0 = CLÉ dédiée (slot, attr), blocs 1..B−1 =
+                              # UN token de contenu chacun ⇒ capacité DURE de
+                              # pack_blocks−1 tokens, mais ZÉRO interférence
+                              # entre positions (sous-espaces disjoints).
+                              # 8 blocs × 64 dims = la géométrie mesurée à
+                              # l'oracle (RT 100 % / +3.9σ à d=512).
     pos_offset: int = 0       # DÉCALAGE de l'index de phase (formats `phase`,
                               # `segphase`, `segsif` uniquement). 0 = DÉFAUT,
                               # rétro-compat bit-à-bit. 1 = la position 0 n'a
@@ -313,8 +332,13 @@ class ToyCfg:
             assert self.n_pos >= 1
             if self.code in SEG_CODES:
                 assert self.seg_n_pos >= 1
-            if self.code == "segsif":
+            if self.code in SIF_CODES:
                 assert self.sif_a > 0, f"sif_a doit être > 0 ({self.sif_a})"
+            if self.code in PACK_CODES:
+                assert self.pack_blocks >= 2, self.pack_blocks
+                assert self.d_model % self.pack_blocks == 0, (
+                    f"pack : d_model {self.d_model} doit être divisible par "
+                    f"pack_blocks {self.pack_blocks}")
             if self.code == "chunk":
                 assert self.d_model % self.n_pos == 0, (
                     f"chunk : d_model {self.d_model} doit être divisible par "
@@ -347,7 +371,11 @@ class ToyCfg:
         """Candidats engendrés PAR LIGNE par le readout position-conscient."""
         if self.code in SEG_PHASE_CODES:
             return self.seg_n_pos
-        return 1 if self.code in ("mean", "rows", "segmean") else self.n_pos
+        # les PACK n'engendrent pas de candidats : PackReadout consomme la
+        # LIGNE BRUTE (bloc-clé pour la sélection, blocs de contenu pour les
+        # logits). Le readout à candidats plats ne les concerne pas.
+        return 1 if self.code in ("mean", "rows", "segmean") + PACK_CODES \
+            else self.n_pos
 
     @property
     def pools_segment(self) -> bool:
@@ -661,6 +689,77 @@ class PointerReadout(nn.Module):
         return g * bias
 
 
+# ── PACK : readout DEUX ÉTAGES (quelle ligne / quel token) ───────────────────
+
+class PackReadout(nn.Module):
+    """Readout du format `pack` : la sélection de LIGNE et le choix du TOKEN
+    sont deux décisions SÉPARÉES — c'est tout le point du format.
+
+    Étage 1 « quelle ligne » : attention 1 tête sur les M lignes dont les clés
+      sont les dims [0, blk) SEULEMENT — le BLOC-CLÉ. Mesuré à l'oracle : sur
+      des banques de 8 lignes à clés distinctes, le retrieval rang-1 par ce
+      bloc est à 100 % (contre 38.7 % pour le gist K+A noyé dans une ligne
+      segsif, et 31.4 % de hit APPRIS relevé à la sonde de récence). La
+      sélection reste SOFT (softmax) en v1 : on veut MESURER si le mélange
+      recrée un attracteur, pas le durcir préventivement.
+    Étage 2 « quel token » : le bloc de contenu j de la ligne sélectionnée se
+      relit par TABLE DIRECTE, logits_j = b_j @ (Ê R_j)^T, frames R_j FIGÉS,
+      zéro paramètre. Une porte-position softmax sur les B−1 blocs, condition-
+      née sur h_t, mélange les blocs. Comme la projection au vocabulaire est
+      linéaire, on mélange AVANT :  u = Σ_j p_j·(R_j b_j) puis un seul produit
+      u @ Ê^T — même coût qu'un LM head, pas B−1 fois.
+
+    Porte globale σ(w·h + b), b = cfg.ptr_bias_init (même convention que
+    PointerReadout), ET `scale` initialisée à ZÉRO : le biais de logits est
+    EXACTEMENT nul au step 0 (pas seulement petit). `scale` reçoit du gradient
+    dès le premier backward (même argument que le P zéro-init de r2), le
+    module n'est donc pas mort.
+    """
+
+    def __init__(self, cfg: ToyCfg):
+        super().__init__()
+        d, nb = cfg.d_model, cfg.pack_blocks
+        self.nb, self.blk = nb, d // nb
+        self.last_gate = None       # σ(porte) du dernier forward (télémétrie)
+        self.last_sel = None        # softmax de SÉLECTION DE LIGNE (télémétrie)
+        self.last_pos = None        # softmax de position (bloc) (télémétrie)
+        self.norm = RMSNorm(d)
+        self.wq = nn.Linear(d, self.blk, bias=False)     # query du bloc-clé
+        self.wp = nn.Linear(d, nb - 1, bias=False)       # porte-position
+        nn.init.zeros_(self.wp.weight)                   # blocs équiprobables
+        self.scale = nn.Parameter(torch.zeros(1))        # biais EXACTEMENT nul
+        self.gate = nn.Linear(d, 1, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, cfg.ptr_bias_init)
+
+    def forward(self, h, bank, bank_mask, embed_w, frames):
+        B, M, d = bank.shape
+        blk, nb = self.blk, self.nb
+        hn = self.norm(h)
+        # ── étage 1 : quelle LIGNE (clés = bloc 0 uniquement) ───────────────
+        q = self.wq(hn)                                     # [B,T,blk]
+        k = bank[:, :, :blk]                                # [B,M,blk]
+        att = torch.einsum("btc,bmc->btm", q, k) / math.sqrt(blk)
+        sm, empty = safe_bank_mask(bank_mask)
+        if sm is not None:
+            att = att.masked_fill(~sm[:, None, :], float("-inf"))
+        s = att.softmax(-1)
+        self.last_sel = s.detach()
+        sel = torch.einsum("btm,bmd->btd", s, bank)         # [B,T,d]
+        if empty is not None:
+            sel = sel * (~empty)[:, None, None].to(sel.dtype)
+        # ── étage 2 : quel TOKEN (tables directes par bloc, frames figés) ───
+        blocks = sel.reshape(*sel.shape[:-1], nb, blk)[..., 1:, :]  # [B,T,nb-1,blk]
+        p = self.wp(hn).softmax(-1)                          # [B,T,nb-1]
+        self.last_pos = p.detach()
+        R = frames[1:].to(blocks.dtype)                      # [nb-1, d, blk]
+        u = torch.einsum("btjc,jdc->btd", blocks * p[..., None], R)
+        bias = self.scale * (u @ rms_unit(embed_w).t())      # [B,T,V]
+        g = torch.sigmoid(self.gate(hn))
+        self.last_gate = g.detach()
+        return g * bias
+
+
 # ── le modèle jouet ──────────────────────────────────────────────────────────
 
 class ToyBlock(nn.Module):
@@ -719,8 +818,14 @@ class ToyReadLM(nn.Module):
         nn.init.normal_(self.embed.weight, std=0.02)
         self.blocks = nn.ModuleList(ToyBlock(cfg, i) for i in range(cfg.n_layers))
         self.norm_f = RMSNorm(cfg.d_model)
-        self.ptr = (PointerReadout(cfg, project=(cfg.variant != "r3"))
-                    if cfg.uses_ptr else None)
+        self.ptr = None
+        if cfg.uses_ptr:
+            # les PACK ont leur PROPRE readout (deux étages) ; tous les autres
+            # codes gardent PointerReadout à l'identique (rétro-compat bit-à-bit
+            # : la construction du module ne change pas, donc le tirage des
+            # poids non plus).
+            self.ptr = (PackReadout(cfg) if cfg.code in PACK_CODES
+                        else PointerReadout(cfg, project=(cfg.variant != "r3")))
         # ── tables ORACLE (buffers, jamais apprises) ────────────────────────
         g = torch.Generator().manual_seed(cfg.oracle_seed)
         sd = cfg.mem_dim ** -0.5
@@ -753,6 +858,34 @@ class ToyReadLM(nn.Module):
         elif cfg.code == "rows":
             pos = torch.randn(cfg.n_pos, cfg.d_model, generator=g) * (cfg.d_model ** -0.5)
             self.register_buffer("pos_emb", pos)               # [n_pos, d]
+        elif cfg.code in PACK_CODES:
+            # ── tables ORACLE du PACK (phase 5) ─────────────────────────────
+            # Générateurs DÉDIÉS (seed PACK_SEED) : l'état de `g` vu par
+            # K/A/val_proj est intact, les autres codes restent bit-à-bit.
+            blk = cfg.d_model // cfg.pack_blocks
+            gp = torch.Generator().manual_seed(PACK_SEED)
+            R = torch.stack([
+                torch.linalg.qr(torch.randn(cfg.d_model, blk, generator=gp))[0]
+                for _ in range(cfg.pack_blocks)])
+            self.register_buffer("pack_R", R)          # [B, d, blk], orthonormés
+            # CLÉ DÉDIÉE par paire (slot, attr) : un vecteur unitaire aléatoire
+            # tiré par un générateur PROPRE À LA PAIRE ⇒ stable d'une
+            # instanciation à l'autre, et indépendant de l'ordre de tirage.
+            # ⚠️ PRIVILÈGE D'ORACLE ASSUMÉ : ces clés sont données, le modèle ne
+            # les produit pas. Mesuré (oracle) : la SOMME K[slot]+A[attr] fait
+            # partager la composante A à toutes les paires de même attr (cos
+            # structurel ≈ 0.5, pire cas 0.698) alors que la clé dédiée reste à
+            # |cos| ≤ 0.281 — d'où le choix. Au 350M c'est le modèle qui devra
+            # ÉMETTRE cette clé au write (et la re-produire au read) : le toy
+            # mesure ce que la géométrie permet une fois la clé disponible.
+            keys = torch.zeros(n_slots, n_attrs, blk)
+            for s in range(n_slots):
+                for a in range(n_attrs):
+                    gk = torch.Generator().manual_seed(
+                        PACK_SEED + 1000 * int(s) + int(a))
+                    keys[s, a] = rms_unit(
+                        torch.randn(cfg.d_model, generator=gk)) @ R[0]
+            self.register_buffer("pack_key", keys)     # [n_slots, n_attrs, blk]
         elif cfg.code in SEG_PHASE_CODES:
             # même binding DFT que `phase`, mais indexé sur la position DANS LE
             # SEGMENT ⇒ sa propre table de seg_n_pos lignes.
@@ -760,10 +893,10 @@ class ToyReadLM(nn.Module):
                                 offset=cfg.pos_offset)
             self.register_buffer("sg_cos", c)                  # [seg_n_pos, d/2]
             self.register_buffer("sg_sin", s)
-        if cfg.code == "segsif":
+        if cfg.code in SIF_CODES:
             assert sif_w is not None, (
-                "--code segsif exige la table de poids SIF : "
-                "ToyReadLM(..., sif_w=sif_weight_table(...))")
+                f"--code {cfg.code} exige la table de poids SIF : "
+                f"ToyReadLM(..., sif_w=sif_weight_table(...))")
             assert sif_w.numel() == cfg.vocab_size, (sif_w.numel(),
                                                      cfg.vocab_size)
             self.register_buffer("sif_w", sif_w.float().clone())
@@ -808,6 +941,9 @@ class ToyReadLM(nn.Module):
             assert not bare, "bare (write=every) exige un code de SEGMENT"
             return self.oracle_code(slot_id, attr_id, val_tok).unsqueeze(0)
         dev = self.embed.weight.device
+        if c.code in PACK_CODES:
+            return self.pack_lines(slot_id, attr_id, val_tok, seg_tok=seg_tok,
+                                   bare=bare)
         if bare:
             # `--write every`, seg SANS fait : MÊME formule de pool, mais AUCUNE
             # composante de liaison — la ligne ne prétend pas indexer un slot.
@@ -867,6 +1003,73 @@ class ToyReadLM(nn.Module):
             out = rms_unit(ka[None] + pos + e)                 # [n, d]
         return out.detach()
 
+    # ── write ORACLE du format PACK ─────────────────────────────────────────
+    @torch.no_grad()
+    def pack_tokens(self, val_tok: torch.Tensor,
+                    seg_tok: torch.Tensor | None) -> torch.Tensor:
+        """Les k_val = pack_blocks−1 tokens qui vont OCCUPER les blocs.
+
+        `pack`    : les tokens de la VALEUR, dans l'ordre (privilège de span
+                    gardé — c'est le bras « borne haute » du format).
+        `segpack` : les k_val tokens du SEGMENT au poids SIF le plus fort,
+                    RÉORDONNÉS DANS L'ORDRE DU SEGMENT (le tri par poids
+                    détruirait l'ordre, qui est tout ce que le pack achète).
+                    Aucun privilège : le write ne sait pas où est la valeur, il
+                    ne connaît que la table unigram.
+        """
+        c = self.cfg
+        dev = self.embed.weight.device
+        k = c.pack_blocks - 1
+        if c.code == "segpack":
+            assert seg_tok is not None, (
+                f"--code {c.code} sélectionne dans le SEGMENT : oracle_lines a "
+                f"besoin de seg_tok (tokens non-padés du seg porteur)")
+            st = seg_tok.to(dev).reshape(-1)
+            if st.numel() == 0:
+                return st
+            w = self.sif_w[st].float()
+            sel = torch.topk(w, min(k, st.numel())).indices.sort().values
+            return st[sel]
+        return val_tok.to(dev).reshape(-1)[:k]
+
+    @torch.no_grad()
+    def pack_lines(self, slot_id: int, attr_id: int, val_tok: torch.Tensor,
+                   seg_tok: torch.Tensor | None = None,
+                   bare: bool = False) -> torch.Tensor:
+        """LA ligne d'un fait au format PACK : [1, d_model].
+
+        Partition en `pack_blocks` blocs de blk = d_model/pack_blocks dims :
+          bloc 0     = CLÉ DÉDIÉE de la paire (slot, attr) — privilège d'oracle
+                       assumé, cf. le commentaire des tables en __init__ ;
+          bloc j ≥ 1 = R_j^T · ê(t_j), UN token par bloc, frames orthonormés
+                       figés ⇒ sous-espaces DISJOINTS, zéro interférence entre
+                       positions (contrairement à phase/segsif qui superposent
+                       tout dans les mêmes d dims) mais capacité DURE de k_val
+                       tokens.
+        Puis RMS-norm GLOBALE de la ligne : c'est un scalaire positif commun aux
+        blocs, donc un no-op strict pour les argmax et les marges du readout
+        (vérifié à l'oracle à 8e-08 près) — elle n'est là que pour que la ligne
+        pack ait la même échelle que toutes les autres lignes de banque.
+
+        `bare` (--write every, seg sans fait) : bloc 0 = ZÉRO. La ligne ne
+        prétend indexer aucune paire, donc elle ne peut pas gagner l'étage 1 du
+        readout — même convention que le `ka = 0` des codes de segment.
+        """
+        c = self.cfg
+        dev = self.embed.weight.device
+        blk = c.d_model // c.pack_blocks
+        line = torch.zeros(c.d_model, dtype=torch.float32, device=dev)
+        if not bare:
+            line[:blk] = self.pack_key[slot_id, attr_id].float()
+        toks = self.pack_tokens(val_tok, seg_tok)
+        n = int(toks.numel())
+        if n:
+            e = rms_unit(self.embed.weight[toks].float())      # [n, d], RMS 1
+            coeff = torch.einsum("nd,ndb->nb", e,
+                                 self.pack_R[1:1 + n].float())  # [n, blk]
+            line[blk:blk + n * blk] = coeff.reshape(-1)
+        return rms_unit(line).unsqueeze(0).detach()
+
     # ── candidats du readout position-conscient ─────────────────────────────
     def candidates(self, bank, bank_mask):
         """Banque [B,M,d] → candidats [B, M·n_cand, d] (+ masque étendu).
@@ -876,8 +1079,10 @@ class ToyReadLM(nn.Module):
         qui apprend l'alignement position↔décodage.
         """
         c = self.cfg
-        if c.code in ("mean", "rows", "segmean"):
-            return bank, bank_mask                 # la ligne EST le candidat
+        if c.code in ("mean", "rows", "segmean") + PACK_CODES:
+            # la ligne EST le candidat (les PACK ne passent pas par ici : leur
+            # readout consomme la ligne BRUTE, bloc par bloc).
+            return bank, bank_mask
         B, M, d = bank.shape
         n = c.n_cand
         if c.code in SEG_PHASE_CODES:
@@ -907,9 +1112,15 @@ class ToyReadLM(nn.Module):
         x = self.norm_f(x)
         logits = x @ self.embed.weight.t()             # embeddings tiés
         if self.ptr is not None and bank is not None and bank.size(1) > 0:
-            # code == mean  → candidats = les lignes (chemin phase 1, inchangé)
-            cand, cmask = self.candidates(bank, bank_mask)
-            logits = logits + self.ptr(x, cand, cmask, self.embed.weight)
+            if self.cfg.code in PACK_CODES:
+                # PACK : pas de candidats plats — le readout lit la ligne par
+                # BLOCS (bloc 0 = clé pour choisir la ligne, blocs ≥ 1 = tokens)
+                logits = logits + self.ptr(x, bank, bank_mask,
+                                           self.embed.weight, self.pack_R)
+            else:
+                # code == mean  → candidats = les lignes (chemin phase 1, inchangé)
+                cand, cmask = self.candidates(bank, bank_mask)
+                logits = logits + self.ptr(x, cand, cmask, self.embed.weight)
         return logits
 
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
@@ -1262,6 +1473,10 @@ def main(argv=None):
     ap.add_argument("--pos-offset", type=int, default=None, dest="pos_offset",
                     help="surcharge code.pos_offset (décalage de l'index de "
                          "phase ; 1 libère l'identité occupée par K/A)")
+    ap.add_argument("--pack-blocks", type=int, default=None,
+                    dest="pack_blocks",
+                    help="surcharge code.pack_blocks (formats pack/segpack : "
+                         "nombre TOTAL de blocs, CLÉ comprise)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -1292,8 +1507,12 @@ def main(argv=None):
         mc["sif_a"] = float(cb["sif_a"])
     if "pos_offset" in cb:
         mc["pos_offset"] = int(cb["pos_offset"])
+    if "pack_blocks" in cb:
+        mc["pack_blocks"] = int(cb["pack_blocks"])
     if a.pos_offset is not None:           # la CLI gagne sur le YAML
         mc["pos_offset"] = int(a.pos_offset)
+    if a.pack_blocks is not None:
+        mc["pack_blocks"] = int(a.pack_blocks)
     device = a.device or t.get("device") or ("cuda" if torch.cuda.is_available()
                                              else "cpu")
     steps = int(a.steps or t.get("steps", 3000))
@@ -1316,7 +1535,7 @@ def main(argv=None):
     cfg = ToyCfg(**mc)
     P = chat_stream_class("persona")
     sif_w = None
-    if cfg.code == "segsif":
+    if cfg.code in SIF_CODES:
         # table SIF sur le split TRAIN (la vue du write). Le stream
         # d'entraînement reste surp OFF : le SIF n'entre QUE dans le code.
         sif_w = sif_weight_table(P, tok, persona_kwargs(raw, "train", a.smoke),
@@ -1330,6 +1549,8 @@ def main(argv=None):
     run_name = a.variant if a.code == "mean" else f"{a.variant}_{a.code}"
     if cfg.pos_offset:
         run_name += f"_o{cfg.pos_offset}"
+    if cfg.code in PACK_CODES and cfg.pack_blocks != ToyCfg.pack_blocks:
+        run_name += f"_b{cfg.pack_blocks}"     # sweep de partition = run à part
     if cfg.write_mode == "every":
         run_name += "_wev"
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
@@ -1345,9 +1566,19 @@ def main(argv=None):
           f"mem_dim {cfg.mem_dim} M {cfg.max_mem} x_dim {cfg.x_dim} "
           f"vocab {cfg.vocab_size}", flush=True)
     if a.code != "mean":
-        head = (f"seg_n_pos {cfg.seg_n_pos} (pool du SEG ENTIER, "
-                f"privilège span-valeur RETIRÉ) " if cfg.pools_segment
-                else f"n_pos {cfg.n_pos} ")
+        if cfg.code in PACK_CODES:
+            head = (f"pack_blocks {cfg.pack_blocks} × "
+                    f"{cfg.d_model // cfg.pack_blocks} dims (bloc 0 = CLÉ "
+                    f"dédiée par paire, {cfg.pack_blocks - 1} tokens de "
+                    f"contenu) "
+                    + ("[segpack : tokens SIF du SEGMENT, privilège "
+                       "span-valeur RETIRÉ] " if cfg.code == "segpack"
+                       else "[pack : tokens de la VALEUR, privilège gardé] "))
+        elif cfg.pools_segment:
+            head = (f"seg_n_pos {cfg.seg_n_pos} (pool du SEG ENTIER, "
+                    f"privilège span-valeur RETIRÉ) ")
+        else:
+            head = f"n_pos {cfg.n_pos} "
         print(f"  code {a.code} : " + head
               + (f"blk {cfg.d_model // cfg.n_pos} " if a.code == "chunk" else "")
               + (f"rope_base {cfg.rope_base} "
@@ -1357,12 +1588,16 @@ def main(argv=None):
               # fréquent, c'est LUI qui dit si le SIF mord.
               + (f"sif_a {cfg.sif_a:g} (w vocab moy {float(model.sif_w.mean()):.3f} "
                  f"min {float(model.sif_w.min()):.4f}) "
-                 if a.code == "segsif" else "")
+                 if a.code in SIF_CODES else "")
               + (f"pos_offset {cfg.pos_offset} (identité LIBRE, positions "
                  f"protégées 0..{(cfg.seg_n_pos if cfg.pools_segment else cfg.n_pos) - cfg.pos_offset - 1}) "
                  if cfg.pos_offset else "")
-              + f"| candidats pointer {cfg.max_mem * cfg.n_cand} "
-              f"({cfg.max_mem}×{cfg.n_cand})", flush=True)
+              + (f"| readout PackReadout 2 étages : ligne parmi "
+                 f"{cfg.max_mem} (clé), bloc parmi {cfg.pack_blocks - 1} "
+                 f"(porte-position)"
+                 if cfg.code in PACK_CODES else
+                 f"| candidats pointer {cfg.max_mem * cfg.n_cand} "
+                 f"({cfg.max_mem}×{cfg.n_cand})"), flush=True)
     if cfg.write_mode == "every":
         print(f"  write EVERY : l'oracle écrit après CHAQUE seg (segs sans "
               f"fait = même pool SANS K/A) — le FIFO {cfg.max_mem} évince les "
@@ -1510,6 +1745,35 @@ def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
     lines = model.oracle_lines(slot_id, attr_id, val_tok, seg_tok=seg_tok)
     cand, _ = model.candidates(lines.unsqueeze(0), None)      # [1, N, d]
     E = model.embed.weight.float()
+    if cfg.code in PACK_CODES:
+        # PACK : le lookup est PAR BLOC (table Ê R_j), pas par dé-projection
+        # d'un candidat plat. Les positions testées sont les blocs OCCUPÉS.
+        # `segpack` : les blocs portent les k_val tokens SIF du segment, donc on
+        # ne teste QUE les positions de valeur qui ont SURVÉCU à la sélection
+        # (la couverture est une mesure séparée — cf. le sweep oracle).
+        blk = cfg.d_model // cfg.pack_blocks
+        toks = model.pack_tokens(val_tok, seg_tok)
+        Erms = rms_unit(E)
+        line = lines[0].float()
+        idx = range(len(toks))
+        if cfg.code == "segpack":
+            assert seg_tok is not None and val_pos is not None, (
+                "round-trip segpack : seg_tok + val_pos requis")
+            st = seg_tok.reshape(-1)
+            # positions du SEGMENT retenues (ordre du segment) → index de bloc
+            wsel = torch.topk(model.sif_w[st].float(),
+                              min(cfg.pack_blocks - 1, st.numel())
+                              ).indices.sort().values
+            keep = {int(p): j for j, p in enumerate(wsel)}
+            idx = [keep[int(p)] for p in val_pos if int(p) in keep]
+        ok = 0
+        n = 0
+        for j in idx:
+            b = line[(j + 1) * blk:(j + 2) * blk]
+            sc = b @ (Erms @ model.pack_R[j + 1].float()).t()
+            ok += int(int(sc.argmax()) == int(toks[j]))
+            n += 1
+        return ok, n
     if cfg.pools_segment:
         assert seg_tok is not None and val_pos is not None, (
             "round-trip phase 3 : seg_tok + val_pos requis")
@@ -1704,13 +1968,14 @@ def _selftest() -> None:
         return w
 
     def _mk(code, d=256, n_pos=8, vocab=512, base=0.0, seg_n_pos=32,
-            offset=0):
+            offset=0, pack_blocks=8):
         c = ToyCfg(vocab_size=vocab, d_model=d, n_layers=1, n_heads=4,
                    mem_dim=d, variant="r3", max_seq_len=64, code=code,
                    n_pos=n_pos, rope_base=base, seg_n_pos=seg_n_pos,
-                   sif_a=A_SIF, pos_offset=offset)
+                   sif_a=A_SIF, pos_offset=offset, pack_blocks=pack_blocks)
         return ToyReadLM(c, env.n_slots, env.n_attrs,
-                         sif_w=_sifw(vocab) if code == "segsif" else None).eval()
+                         sif_w=_sifw(vocab) if code in SIF_CODES
+                         else None).eval()
 
     tok8 = torch.tensor([11, 77, 200, 41, 305, 9, 128, 460])   # 8 positions
     rt = {}
@@ -1754,9 +2019,12 @@ def _selftest() -> None:
             f"lane vide != ablaté (code {code})"
         # 8bis. porte du pointer FERMÉE à l'init : biais ≈ 0
         b1 = rows[:1][None].expand(1, -1, -1)
-        cand, cm = m.candidates(b1, torch.ones(1, b1.size(1), dtype=torch.bool))
+        bm1 = torch.ones(1, b1.size(1), dtype=torch.bool)
+        cand, cm = m.candidates(b1, bm1)
         with torch.no_grad():
-            bias = m.ptr(torch.randn(1, 5, 32), cand, cm, m.embed.weight)
+            bias = (m.ptr(torch.randn(1, 5, 32), b1, bm1, m.embed.weight,
+                          m.pack_R) if code in PACK_CODES
+                    else m.ptr(torch.randn(1, 5, 32), cand, cm, m.embed.weight))
         assert float(bias.abs().max()) < 1e-2, (code, float(bias.abs().max()))
         assert m.ptr.last_gate is not None and \
             float(m.ptr.last_gate.max()) < 1e-3, f"porte ouverte à l'init ({code})"
@@ -1780,7 +2048,8 @@ def _selftest() -> None:
 
     # 10. r0/r1/r2 REFUSENT les nouveaux formats (message clair)
     for var in ("r0", "r1", "r2"):
-        for code in ("phase", "segmean", "segphase", "segsif"):
+        for code in ("phase", "segmean", "segphase", "segsif", "pack",
+                     "segpack"):
             try:
                 ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
                        variant=var, code=code, n_pos=4, seg_n_pos=8)
@@ -2057,7 +2326,7 @@ def _selftest() -> None:
     assert torch.equal(env_e.write(m_e, [], nofact)[0],
                        env_e.write(m_e, [], nofact)[0])
     # 14g. --write every REFUSÉ pour les codes à privilège span-valeur
-    for code in ("mean", "chunk", "phase", "rows"):
+    for code in ("mean", "chunk", "phase", "rows", "pack"):
         try:
             ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
                    variant="r3", code=code, n_pos=4, write_mode="every")
@@ -2065,6 +2334,129 @@ def _selftest() -> None:
             assert "every" in str(e)
         else:
             raise AssertionError(f"--write every aurait dû être refusé ({code})")
+
+    # ═══════════ PHASE 5 : format PACK (ligne PARTITIONNÉE en blocs) ════════
+    torch.manual_seed(20260801)
+    # 15a. round-trip `pack` : 8 tokens, 7 blocs de contenu ⇒ 7 positions
+    #      testées, toutes top-1. Le pack ne SUPERPOSE rien : chaque token vit
+    #      dans son propre sous-espace, le seul bruit est celui de la
+    #      dé-projection JL (SNR ≈ √blk contre √(2 ln|V|)).
+    m_pk = _mk("pack", d=512)
+    ok_pk, n_pk = code_roundtrip(m_pk, 3, 2, tok8)
+    assert (ok_pk, n_pk) == (7, 7), (
+        f"round-trip pack : {ok_pk}/{n_pk} — les blocs ne sont pas inversibles, "
+        f"le format n'a pas de sens")
+    # 15b. round-trip `segpack` SANS privilège : seg de 20 tokens dont 7 rares
+    #      (positions 5-7 = la « valeur », 4 autres = du contenu), le reste =
+    #      template très fréquent. La sélection top-7 SIF doit retenir
+    #      EXACTEMENT les 7 rares, donc les 3 positions de valeur, et chacune
+    #      doit être top-1 dans son bloc.
+    seg_pk = torch.full((20,), 7, dtype=torch.long)
+    seg_pk[[1, 3, 5, 6, 7, 14, 18]] = torch.tensor([120, 301, 44, 199, 260,
+                                                    77, 410])
+    m_sk = _mk("segpack", d=512)
+    sel_pk = m_sk.pack_tokens(tok8, seg_pk)
+    assert torch.equal(sel_pk, seg_pk[[1, 3, 5, 6, 7, 14, 18]]), sel_pk
+    ok_sk, n_sk = code_roundtrip(m_sk, 3, 2, tok8, seg_tok=seg_pk,
+                                 val_pos=[5, 6, 7])
+    assert (ok_sk, n_sk) == (3, 3), f"round-trip segpack : {ok_sk}/{n_sk}"
+    # … et le code ne regarde PAS val_tok (privilège retiré), mais DÉPEND du seg
+    assert torch.equal(m_sk.oracle_lines(3, 2, tok8, seg_tok=seg_pk),
+                       m_sk.oracle_lines(3, 2, tok8[:2], seg_tok=seg_pk)), \
+        "segpack : le code regarde encore val_tok"
+    # 15c. la CLÉ par paire est STABLE d'une instanciation à l'autre (elle est
+    #      tirée par un générateur propre à la paire, pas par l'ordre du
+    #      tirage), et elle SÉPARE les paires.
+    k1 = _mk("pack", d=512).pack_key
+    k2 = _mk("pack", d=512).pack_key
+    assert torch.equal(k1, k2), "clé pack non stable entre instanciations"
+    assert torch.equal(m_pk.pack_R, _mk("pack", d=512).pack_R), \
+        "frames pack non stables entre instanciations"
+    assert not torch.allclose(k1[3, 2], k1[3, 1], atol=1e-4) and \
+        not torch.allclose(k1[3, 2], k1[5, 2], atol=1e-4), \
+        "la clé pack ne dépend pas de la paire (slot, attr)"
+    # 15d. les blocs sont DISJOINTS : changer le token du bloc 2 ne touche
+    #      AUCUNE dimension hors du bloc 2 (à la RMS-norm globale près, qui est
+    #      un scalaire — on compare donc les lignes NON normalisées via le
+    #      rapport). C'est la propriété que segsif n'a pas.
+    blk512 = 512 // 8
+    la = m_pk.oracle_lines(3, 2, tok8[:5])[0]
+    tb = tok8[:5].clone(); tb[1] = 333
+    lb = m_pk.oracle_lines(3, 2, tb)[0]
+    r = float(la[:blk512].norm() / lb[:blk512].norm())      # scalaire de RMS
+    d_blk = [float((la[j * blk512:(j + 1) * blk512]
+                    - r * lb[j * blk512:(j + 1) * blk512]).abs().max())
+             for j in range(8)]
+    assert d_blk[2] > 1e-3 and max(d_blk[:2] + d_blk[3:]) < 1e-5, d_blk
+    # 15e. PackReadout : porte fermée ⇒ biais EXACTEMENT nul (scale zéro-init,
+    #      pas seulement « petit »), et les deux étages sont bien définis.
+    for code in PACK_CODES:
+        m_ = _mk(code, d=512)
+        bk_ = torch.stack([m_.oracle_lines(3, 2, tok8, seg_tok=seg_pk)[0],
+                           m_.oracle_lines(5, 1, tok8[:4], seg_tok=seg_pk)[0]]
+                          )[None]
+        bm_ = torch.ones(1, 2, dtype=torch.bool)
+        with torch.no_grad():
+            bias = m_.ptr(torch.randn(1, 5, 512), bk_, bm_, m_.embed.weight,
+                          m_.pack_R)
+        assert float(bias.abs().max()) == 0.0, (code, float(bias.abs().max()))
+        assert float(m_.ptr.last_gate.max()) < 1e-3, code
+        # les softmax des deux étages somment à 1 sur leurs axes respectifs
+        assert torch.allclose(m_.ptr.last_sel.sum(-1), torch.ones(1, 5)) and \
+            torch.allclose(m_.ptr.last_pos.sum(-1), torch.ones(1, 5))
+        assert m_.ptr.last_sel.shape[-1] == 2 and \
+            m_.ptr.last_pos.shape[-1] == m_.cfg.pack_blocks - 1
+        # porte OUVERTE (scale forcé) : le biais pointe bien vers un token de la
+        # ligne — l'étage 2 relit vraiment le contenu.
+        with torch.no_grad():
+            m_.ptr.scale.fill_(50.0)
+            m_.ptr.gate.bias.fill_(8.0)
+            m_.ptr.wp.weight.zero_()
+            b2 = m_.ptr(torch.randn(1, 1, 512), bk_[:, :1], bm_[:, :1],
+                        m_.embed.weight, m_.pack_R)
+        cand_tok = set(int(t) for t in m_.pack_tokens(tok8, seg_pk))
+        assert int(b2[0, 0].argmax()) in cand_tok, (code, int(b2[0, 0].argmax()))
+    # 15f. `segpack` + --write every : la ligne NUE n'a PAS de bloc-clé (elle ne
+    #      peut donc pas gagner l'étage 1), mais elle porte bien du contenu.
+    m_we = _mk("segpack", d=512)
+    bare = m_we.oracle_lines(0, 0, torch.zeros(0, dtype=torch.long),
+                             seg_tok=seg_pk, bare=True)[0]
+    assert float(bare[:blk512].abs().max()) == 0.0, "ligne bare : clé non nulle"
+    assert float(bare[blk512:].abs().max()) > 0
+    assert abs(float(bare.pow(2).mean().sqrt()) - 1.0) < 1e-3
+    assert torch.equal(bare, m_we.oracle_lines(5, 3,
+                                               torch.zeros(0, dtype=torch.long),
+                                               seg_tok=seg_pk, bare=True)[0]), \
+        "ligne bare : dépend encore du slot/attr"
+    # 15g. pack_blocks : diviseur de d_model obligatoire, ≥ 2
+    for pb, needle in ((7, "divisible"), (1, "1")):
+        try:
+            ToyCfg(vocab_size=512, d_model=512, n_heads=4, mem_dim=512,
+                   variant="r3", code="pack", pack_blocks=pb)
+        except AssertionError as e:
+            assert needle in str(e), (pb, str(e))
+        else:
+            raise AssertionError(f"pack_blocks={pb} aurait dû être refusé")
+
+    # 16. RÉTRO-COMPAT BIT-À-BIT des codes NON-pack. La constante ci-dessous a
+    #     été relevée sur le commit 4daf6a6 (phase 4, AVANT le pack) avec la
+    #     même graine et les mêmes entrées : si l'ajout du pack avait déplacé
+    #     d'un cran la consommation du générateur global (ordre de création des
+    #     modules) ou touché un chemin partagé, elle bougerait. C'est
+    #     l'assertion qui remplace le `git stash` manuel des phases passées.
+    torch.manual_seed(4242)
+    m_rc = _mk("segsif", d=64, n_pos=4, vocab=512, seg_n_pos=8)
+    ids_rc = (torch.arange(12).reshape(2, 6) * 37) % 512
+    rows_rc = m_rc.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
+    bk_rc = rows_rc[:1][None].expand(2, -1, -1).contiguous()
+    bm_rc = torch.ones(2, 1, dtype=torch.bool)
+    with torch.no_grad():
+        out_rc = float(m_rc(ids_rc, bk_rc, bm_rc).double().sum())
+    RC_REF_4DAF6A6 = -18.756196630471095
+    assert abs(out_rc - RC_REF_4DAF6A6) < 1e-9, (
+        f"RÉTRO-COMPAT ROMPUE : forward segsif {out_rc} ≠ {RC_REF_4DAF6A6} "
+        f"(valeur du commit 4daf6a6) — l'ajout du pack a déplacé un chemin "
+        f"partagé ou le tirage des poids")
 
     print("toy_read_lab self-test: OK (write oracle déterministe & "
           "embedding-dépendant, FIFO 8, porte pointer fermée à l'init, "
@@ -2074,9 +2466,9 @@ def _selftest() -> None:
           "d_model 256, n_pos 8) : " +
           "  ".join(f"{c} {rt[c][0]}/{rt[c][1]}" for c in P2_CODES) +
           "   [mean DOIT échouer : anagrammes ⇒ ligne identique]")
-    print("  phase 2 — lane vide ≡ ablaté & porte fermée pour les 7 formats, "
-          "FIFO rows (3 faits × 3 tokens ⇒ 8 lignes), r0/r1/r2 refusent "
-          "chunk/phase/rows/segmean/segphase/segsif")
+    print(f"  phase 2 — lane vide ≡ ablaté & porte fermée pour les "
+          f"{len(CODES)} formats, FIFO rows (3 faits × 3 tokens ⇒ 8 lignes), "
+          f"r0/r1/r2 refusent tout code ≠ mean (pack/segpack compris)")
     print(f"  phase 3 — POOL DU SEG ENTIER (privilège span-valeur retiré, "
           f"seg_n_pos 32, seg synthétique de 20 tokens, vocab 512) : "
           f"round-trip segphase d=512 valeur {ok}/{n}, seg entier "
@@ -2101,6 +2493,18 @@ def _selftest() -> None:
           "évincé), lane vide "
           "≡ ablaté avec lignes nues en banque, déterministe, refusé pour "
           "mean/chunk/phase/rows")
+    print(f"  phase 5 — PACK (ligne PARTITIONNÉE, {8} blocs : 1 clé + 7 tokens, "
+          f"d=512 ⇒ 64 dims/bloc) : round-trip pack {ok_pk}/{n_pk} (span "
+          f"tronqué à 7), segpack {ok_sk}/{n_sk} (sélection top-7 SIF = les 7 "
+          f"tokens rares du seg, ordre du segment, val_tok jamais lu) ; clé et "
+          f"frames STABLES entre instanciations et séparant les paires ; blocs "
+          f"DISJOINTS (toucher un token ne bouge que son bloc) ; PackReadout "
+          f"biais EXACTEMENT 0 porte fermée et pointe un token de la ligne "
+          f"porte ouverte ; ligne bare (write every) SANS bloc-clé ; "
+          f"pack_blocks non-diviseur / < 2 refusés")
+    print("  rétro-compat — forward segsif identique BIT-À-BIT au commit "
+          "4daf6a6 (constante figée dans le self-test) : l'ajout du pack n'a "
+          "déplacé ni un chemin partagé ni le tirage des poids")
 
 
 if __name__ == "__main__":
