@@ -1,0 +1,84 @@
+# toy_read_lab — labo jouet « classe de fonctions du READ », WRITE ORACLE.
+#
+# UNE config, quatre variantes (--variant r0|r1|r2|r3), un sous-dossier par
+# variante sous training.save_dir. Le backbone est VANILLA (aucun élément
+# dsv4) et la banque est posée par l'environnement : la seule chose qui change
+# entre les runs est la CLASSE DE FONCTIONS DU READ.
+#
+#   r0  fast-weight (contrôle, port de model.py:282-394)
+#   r1  cross-attention contenu
+#   r2  r0 + tête de copie (pointer readout)
+#   r3  banque en espace d'embeddings (mem_dim forcé à d_model) + pointer nu
+#
+# ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal) :
+# toy_read_lab.py fait son propre paths.load_yaml.
+#
+# LANCEMENT (une 3070Ti 8 Go suffit) :
+#   TB_ROOT=/mnt/tb python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab.yaml --variant r0
+#
+# SMOKE CPU (dims minuscules, filler template, 2 pas) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab.yaml --variant r0 --smoke --device cpu
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  d_ff_mult: 4
+  mem_dim: 512            # r3 l'écrase à d_model (banque = embeddings)
+  max_mem: 8              # FIFO, comme le 350M
+  max_seq_len: 320
+  dropout: 0.0
+  fw_rank: 8              # = mem_read_rank du 350M
+  read_layers: []         # vide = toutes les couches lisent (comme le 350M)
+  x_dim: 2048             # dim interne des cross-attn r1/r3 (0 = d_model).
+                          # 2048 = APPARIEMENT DE BUDGET avec le hypernetwork
+                          # fast-weight de r0 : r0 36.56M / r1 36.17M / r2
+                          # 36.89M (±1 %). r3 reste à 24.11M — structurel : sa
+                          # V n'est PAS projetée (c'est sa définition), on ne
+                          # peut pas lui dépenser les params sans casser la
+                          # variante. Mettre 0 pour la version « naturelle »
+                          # (cross-attn en d_model, r1 à 19.65M).
+  ptr_bias_init: -8.0     # porte du pointer readout FERMÉE à l'init
+  oracle_ka_scale: 0.2    # K[slot]/A[attr] = petits offsets de liaison
+  oracle_seed: 20260730
+
+training:
+  seed: 0
+  steps: 3000
+  batch_convs: 8          # 1 pas = un groupe de 8 conversations complètes
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  amp: true               # bf16 autocast (ignoré sur cpu)
+  log_every: 20
+  eval_every: 200
+  eval_convs: 24          # convs gradées par bras (held-out ET train)
+  max_new: 48
+  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab
+
+# kwargs de la branche persona de chat.eval_gen de sft_recall_350m_table2.yaml.
+# pool_split est SURCHARGÉ par le code : 'train' pour l'entraînement et le
+# contrôle mécanisme, 'eval' pour le held-out.
+persona:
+  gen:
+    p_smalltalk: 0.15
+    n_facts:
+    - 1
+    - 3
+    n_queries:
+    - 1
+    - 2
+    p_ack: 0.5
+    p_update: 0.15
+    p_beyond: 0.15
+    value_weight: 4.0
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cap: 20000
+    real_max_tok: 96
+    p_real: 0.8
+    real_cache_dir: ${TB_ROOT}/data_cache
