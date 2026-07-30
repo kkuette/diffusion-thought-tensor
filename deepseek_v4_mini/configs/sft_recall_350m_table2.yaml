@@ -1,0 +1,368 @@
+# sft_recall_350m_table2 — SFT recall v3 : value_table + INIT SIF DU CODEBOOK.
+# Verdict du run table v1 (stoppé @1402, 2026-07-30) : la mécanique a marché
+# (dist 1.0→0.40, table_gnorm vivant, rampe β sans casse) mais Δnll held-out
+# ≈ 0 aux paliers β=0 (1200/1400) — PIRE que le stair (+0.190 @1400).
+# Diagnostic (user) : conflit de géométries — V aléatoire vs write ancré dans
+# le pooling SIF de la phase 1 ; le read apprend des codes que le write ne
+# sait pas produire. Remède : V[val] initialisé à RMSnorm(pool(embed)@tf_proj)
+# = la géométrie NATIVE du write (dist ~0.25 au stair), K/A = petits offsets
+# de liaison (×0.2). « Le code = du SIF organisé. » Init dans le trainer
+# (bloc value_table) — aucune clé de config, seul le save_dir change (A/B
+# propre vs table v1). Header d'origine ci-dessous.
+#
+# sft_recall_350m_table — SFT recall v2 : teacher APPRIS à codes COMPOSÉS
+# (target value_table). Décision user 2026-07-29, après le verdict du run
+# stair : canal Δnll OUVERT (+0.230) mais copie argmax FERMÉE, même sur le
+# split train — attracteurs de pool, ~50 % d'erreurs de slot. Diagnostic :
+# le read ne sait ni sélectionner ni décompresser, et le teacher value_sif
+# n'amorçait que le côté WRITE (cible figée = projection aléatoire des
+# embeddings). La recette 47M complète (keyed retrieval 0.03->0.99,
+# train.py:2126-2178) avait TROIS pièces ; on n'en portait qu'une.
+#
+# CE QUI CHANGE (la seule différence vs sft_recall_350m_stair — A/B propre,
+# même init, même data, même escalier LR) :
+#   teacher.target: value_table
+#   - trois nn.Embedding APPRISES (slot 10 / attribut chien-chat-sœur-frère 7
+#     / valeur ~7 878), sommées puis RMS-normées = le code d'un fait porte sa
+#     LIAISON (contrainte user : « le chien peut être un chat, le nom peut
+#     être la race ») — pas la valeur seule ;
+#   - BLEND β du code dans la ligne écrite au tour d'énonciation, NON détaché :
+#     la CE des tours suivants traverse le read jusqu'aux tables — le codebook
+#     s'organise pour être ce que le read sait sélectionner ET décompresser
+#     (la pièce « teacher appris À TRAVERS le read » du 47M) ;
+#   - distill = pull du write vers le code DÉTACHÉ (β·distill_weight, annealé).
+#   anneal [500,1000] (décision user) : plateau β=1 long — le read apprend
+#   sélection + décompression sur codes propres, la rampe transfère aux writes
+#   du modèle et finit AVANT l'escalier LR (1200).
+#   table_lr 1e-3 (AdamW dédié, comme le teacher_opt du 47M).
+#
+# Le teacher n'existe qu'au TRAIN : l'éval held-out (chat.eval_gen, valeurs
+# jamais vues) décode les writes nus — un grade > 0 aux paliers 1400-2000 est
+# du rappel par la banque, la géométrie factorisée du read généralisant à des
+# valeurs hors codebook.
+#
+# ⚠️ MODE D'ÉCHEC CONNU du teacher discriminant : pendant β>0 l'écriture
+# contient le code de la réponse — seul le verdict à β=0 (après step 1000)
+# compte, et le grade qui compte est le held-out des paliers 1400/1600/1800/2000.
+#
+# LANCEMENT (--check d'abord) :
+#   TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_recall_350m_table2.yaml --check
+#   TB_ROOT=/mnt/tb nohup python -u -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_recall_350m_table2.yaml \
+#     >> /mnt/tb/runs/v350_sft_recall_table2/train.log 2>&1 &
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 8                        # = max_mem (décision user 2026-07-28) :
+                                           # banque à TAILLE FIXE dès le tour 1 —
+                                           # pas de phase de croissance 4→8, chaque
+                                           # write évince dès le départ (les seeds
+                                           # d'abord). Seeds = random [0,1], pas de
+                                           # paramètres : l'init base est intacte.
+                                           # Bonus : UNE seule signature de forme
+                                           # pour les graphs d'éval (armement 1x).
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+  sinkhorn_closed_form: true
+  decode_fuse: true                        # les 3 flags decode_* ne touchent
+  decode_dense_moe: true                   # QUE le chemin de décodage (memo
+  decode_static_cache: true                # sous no_grad, MoE dense à BT=1,
+                                           # cache statique) — le forward
+                                           # d'entraînement est bit-identique ;
+                                           # précédent : rl_disagg_350m les a.
+                                           # Requis par training.decode_graphs.
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.2
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.1
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 2000
+  grad_accum: 1
+  amp: true
+  # Base = phase 1 SIF repass, la MÊME que valsif_stair (comparaison à init
+  # égale, décision user 2026-07-28). Poids seuls, optim frais, step→0.
+  init_from: ${TB_ROOT}/checkpoints/v350_sif_repass/final_step2500.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  no_reset_files: 0
+  cascade_depth: 0                         # SANS cascade (décision user) : la
+                                           # banque vive 8 slots est TOUTE la
+                                           # mémoire, comme en phase 1. Un
+                                           # confound de moins pour la démo.
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_decay_start: 1200                    # identique valsif_stair : LR plein
+  wsd_decay_shape: stair                   # jusqu'à 1200, puis 4 paliers de
+  wsd_stair_n: 4                           # 200 steps x0.473/0.224/0.106/0.050
+  wsd_stair_end: 0.05                      # — on lit à quel LR le canal recall
+                                           # s'ouvre (decode_every 2 pose un
+                                           # grade à la fin de chaque palier).
+  decode_cache: true
+  decode_graphs: true                      # décision user 2026-07-28 : le bras
+                                           # LIVE des paliers décode par CUDA
+                                           # graphs (~14x/pas, bench 07-28).
+                                           # Classe ULP — cohérent PAR RUN, ne
+                                           # pas comparer à un grade cache d'un
+                                           # autre run. Bras ablaté : eager
+                                           # (décodé une fois, banque None).
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 100
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths:
+  - 2
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 100
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_recall_table2
+  metrics_file: ${TB_ROOT}/runs/v350_sft_recall_table2/metrics.jsonl
+chat:
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 240
+  decode_every: 2
+  stream: chat_batch
+  gen:
+    batch: 4
+    slots: 24
+    tile: true
+    pool: 16
+    max_seg_tok: 512
+    stream: chat_mix
+    gen:
+      streams:
+      - stream: persona
+        weight: 0.5
+        gen:
+          p_smalltalk: 0.15
+          n_facts:
+          - 1
+          - 3
+          n_queries:
+          - 1
+          - 2
+          p_ack: 0.5
+          p_update: 0.15
+          p_beyond: 0.15
+          value_weight: 4.0
+          real_filler: HuggingFaceTB/smol-smoltalk
+          real_cap: 20000
+          real_max_tok: 96
+          p_real: 0.8
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+          pool_split: train
+      - stream: sota_session
+        weight: 0.5
+        gen:
+          real_cache_dir: ${TB_ROOT}/data_cache
+          conv_cap: 8000
+          max_turn_tok: 192
+          max_conv_msgs: 10
+          convs_per_session:
+          - 2
+          - 6
+          p_requote: 0.5
+          n_requote:
+          - 1
+          - 2
+          requote_weight: 4.0
+          surprisal_mode: sif
+          sif_a: 0.0001
+  # ── éval des paliers = valeurs HELD-OUT (remplacement COMPLET du gen) ──────
+  # Même structure que gen, seule différence : pool_split 'eval' côté persona.
+  # Le grade recall des paliers porte donc sur des valeurs jamais vues au
+  # train — c'est LE chiffre de la démo.
+  eval_gen:
+    batch: 4
+    slots: 24
+    tile: true
+    pool: 16
+    max_seg_tok: 512
+    stream: chat_mix
+    gen:
+      streams:
+      - stream: persona
+        weight: 0.5
+        gen:
+          p_smalltalk: 0.15
+          n_facts:
+          - 1
+          - 3
+          n_queries:
+          - 1
+          - 2
+          p_ack: 0.5
+          p_update: 0.15
+          p_beyond: 0.15
+          value_weight: 4.0
+          real_filler: HuggingFaceTB/smol-smoltalk
+          real_cap: 20000
+          real_max_tok: 96
+          p_real: 0.8
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+          pool_split: eval
+      - stream: sota_session
+        weight: 0.5
+        gen:
+          real_cache_dir: ${TB_ROOT}/data_cache
+          conv_cap: 8000
+          max_turn_tok: 192
+          max_conv_msgs: 10
+          convs_per_session:
+          - 2
+          - 6
+          p_requote: 0.5
+          n_requote:
+          - 1
+          - 2
+          requote_weight: 4.0
+          surprisal_mode: sif
+          sif_a: 0.0001
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  target: value_table                      # codes APPRIS composés
+                                           # K[slot]+A[attr]+V[valeur],
+                                           # organisés via le read (blend non
+                                           # détaché) — voir header
+  table_lr: 1.0e-3
+  anneal:
+  - 500
+  - 1000

@@ -699,6 +699,28 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 "val": nn.Embedding(len(_vm_ids) + 1, cfg.mem_dim,
                                     padding_idx=0),
             }).to(device).float()
+            # Init SIF du codebook (2026-07-30) : le run table v1 a montré le
+            # conflit de géométries — V aléatoire vs write ancré dans le pooling
+            # SIF de la phase 1, équilibre distill à ~0.40 et read aveugle aux
+            # writes nus (Δnll held-out ≈ 0 à β=0). Réconciliation : V[val]
+            # démarre à RMSnorm(pool(embed(tokens du val)) @ tf_proj) — la
+            # géométrie que le write produit NATIVEMENT (dist ~0.25 au stair) —
+            # et K/A deviennent de petits offsets de liaison (×0.2). Le code
+            # composé ≈ « du SIF organisé » : la distill ne serre plus que la
+            # liaison, le read organise à partir d'un point atteignable.
+            with torch.no_grad():
+                tf_tables["slot"].weight.mul_(0.2)
+                tf_tables["attr"].weight.mul_(0.2)
+                _emb = model.embed.weight.detach().float()
+                for _v, _i in _vm_ids.items():
+                    _ids = tok(" " + _v, add_special_tokens=False)["input_ids"]
+                    if not _ids:
+                        continue
+                    _c = _emb[torch.tensor(_ids, device=device)].mean(0) @ tf_proj.float()
+                    _c = _c / _c.pow(2).mean().clamp_min(1e-12).sqrt()
+                    tf_tables["val"].weight[_i] = _c
+            print(f"value_table init SIF: V <- pool(embed)@proj "
+                  f"({len(_vm_ids)} vals, ' '+val), K/A x0.2", flush=True)
             tf_topt = torch.optim.AdamW(tf_tables.parameters(),
                                         lr=float(tf_cfg.get("table_lr", 1e-3)))
         _tdesc = {"value": "proj embed valeur (discriminant)",
