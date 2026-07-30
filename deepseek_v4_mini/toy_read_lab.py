@@ -140,11 +140,59 @@ l'équilibre (w̄ chiffrés 0.81) et double `code` vs uniforme, sans atteindre 7
 à d=256. La conclusion tient : la condition de viabilité est d_model ≥ 512
 (avec SIF a=1e-2 : 94.9 % sur `code`).
 
+Phase 3bis : DEUX EXTENSIONS (`code.pos_offset`, `--write every`)
+-----------------------------------------------------------------
+1. `code.pos_offset` (défaut 0 = rétro-compat bit-à-bit) décale l'index de
+   phase : le token en position j est tourné de θ·(j+k) AU WRITE ET aux
+   candidats du readout. Motivation : à offset 0 la position 0 a rot(0) =
+   IDENTITÉ, donc son token se superpose sans étiquette rotationnelle à
+   K[slot]+A[attr] (eux aussi non tournés) — l'artefact des dumps
+   (SV-19621 → EX-19621 : chiffres exacts, PREMIER token de la valeur faux).
+   Wrap : période n_pos ⇒ l'offset consomme k positions (n_pos ≥ len_max + k).
+
+   ⚠️ VERDICT MESURÉ (round-trip ORACLE, vocab 49 154, d=512, 393 segs
+   porteurs réels, 1 555 positions de valeur) : l'offset ne change RIEN.
+
+     format                            ALL    short   word   code  | pos0 pos1
+     segsif a=1e-2 offset 0           97.4%  100.0% 100.0%  94.9%  |100.0% 99.2%
+     segsif a=1e-2 offset 1           97.5%  100.0% 100.0%  95.1%  |100.0% 99.5%
+     segphase      offset 0           77.7%   89.6%  83.0%  71.0%  | 83.2% 83.5%
+     segphase      offset 1           77.2%   88.3%  83.0%  70.2%  | 83.0% 83.7%
+     phase n_pos 8 offset 0/1        100.0%  100.0% 100.0% 100.0%  |100.0%(+8.4σ)
+
+   (pos_k = rang du token DANS LA VALEUR.) Par position ABSOLUE dans le
+   segment, même conclusion : segphase 85.2 % → 85.8 % à la position 0, marge
+   +0.91σ → +0.93σ ; le candidat d'index identité ne collapse sur aucun
+   attracteur (top-1 distinct sur 178/200 faits, aux DEUX offsets). Raison :
+   K/A sont à l'échelle 0.2 dans une ligne RMS-normalisée à d=512 — leur fuite
+   dans le candidat non tourné est très en dessous du bruit du vocabulaire.
+   Le 0 % de segsif aux positions 0-2 du SEGMENT n'est pas la collision
+   d'identité mais le SIF : `<|im_start|>user\\n` sont les tokens les plus
+   fréquents, donc écrasés hors de la ligne — c'est le comportement voulu.
+   ⇒ Si l'artefact « premier token faux » persiste, il vient du READ APPRIS
+   (quel candidat le pointer sélectionne), pas de l'inversibilité du code.
+
+2. `--write every` retire le SECOND privilège d'oracle : l'environnement écrit
+   après CHAQUE seg (user, assistant, smalltalk) comme le write du 350M. Les
+   segs porteurs gardent la ligne K+A+pool ; les segs SANS fait posent la MÊME
+   formule de pool SANS composante K/A. Le FIFO max_mem est inchangé ⇒ le flux
+   ÉVINCE les faits anciens : c'est le régime réel.
+
+   ⚠️ PLAFOND MESURÉ (stream persona, 24 convs gradées, FIFO 8) : l'âge en
+   writes entre le fait et sa query passe de 0.61 (mode `fact`, max 2) à 10.0
+   (mode `every`, max 25) ⇒ 52.8 % des faits gradés held-out (58.8 % sur le
+   train) ont leur ligne DÉJÀ ÉVINCÉE au moment de la question. Le grade
+   maximum atteignable en mode `every` est donc ~0.45, PAS 1.0 : tout écart
+   avec un bras `fact` doit être lu contre ce plafond (métriques `age_writes`
+   et `age_evicted` du CSV, distribution imprimée à la première éval).
+
 Usage
 -----
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r0
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r1 --smoke --device cpu
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r3 --code phase
+  python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r3 \
+      --code segsif --pos-offset 1 --write every       # → r3_segsif_o1_wev/
   python -m deepseek_v4_mini.toy_read_lab --selftest
 """
 from __future__ import annotations
@@ -175,6 +223,10 @@ SEG_CODES = ("segmean", "segphase", "segsif")
 # formats à binding DFT sur la position DANS LE SEGMENT (mêmes tables, mêmes
 # candidats pointer) — seule la PONDÉRATION du pool les distingue.
 SEG_PHASE_CODES = ("segphase", "segsif")
+# formats à binding de phase (les SEULS que `code.pos_offset` concerne).
+PHASE_CODES = ("phase",) + SEG_PHASE_CODES
+# régimes de write de l'oracle (cf. ToyCfg.write_mode).
+WRITE_MODES = ("fact", "every")
 # slots dont la valeur est un CODE arbitraire (5-8 tokens, zéro prior LM) —
 # c'est la strate que le pool moyen ne peut structurellement pas rendre.
 CODE_SLOTS = ("code", "ref", "plate")
@@ -221,6 +273,22 @@ class ToyCfg:
                               # 1e-4 = la recette du 350M (PersonaChatStream
                               # surprisal_mode='sif'). Knob du TOY, indépendant
                               # du stream (qui tourne surp OFF ici).
+    pos_offset: int = 0       # DÉCALAGE de l'index de phase (formats `phase`,
+                              # `segphase`, `segsif` uniquement). 0 = DÉFAUT,
+                              # rétro-compat bit-à-bit. 1 = la position 0 n'a
+                              # plus rot(0)=identité, donc son token ne se
+                              # superpose plus à K/A (qui, eux, ne sont jamais
+                              # tournés). Cf. phase_tables pour le wrap.
+    # ── axe RÉGIME DE WRITE (`--write`) ─────────────────────────────────────
+    write_mode: str = "fact"  # `fact` (DÉFAUT) : l'oracle n'écrit qu'après les
+                              # segs PORTEURS — il sait lesquels portent un
+                              # fait, c'est le 2ᵉ privilège d'oracle.
+                              # `every` : il écrit après CHAQUE seg (user,
+                              # assistant, smalltalk) comme le write du 350M ;
+                              # les segs sans fait posent la MÊME formule de
+                              # pool SANS composante K/A. Le FIFO max_mem étant
+                              # inchangé, le flux ÉVINCE les faits anciens —
+                              # c'est le régime réel.
 
     def __post_init__(self):
         if self.variant == "r3":
@@ -252,6 +320,27 @@ class ToyCfg:
                     f"chunk : d_model {self.d_model} doit être divisible par "
                     f"n_pos {self.n_pos}")
         assert self.d_model % 2 == 0
+        # ── pos_offset : seuls les formats à binding de phase le portent ────
+        assert isinstance(self.pos_offset, int) and self.pos_offset >= 0, (
+            f"pos_offset doit être un entier >= 0 ({self.pos_offset!r})")
+        if self.pos_offset:
+            assert self.code in PHASE_CODES, (
+                f"code.pos_offset n'a de sens QUE pour les formats à binding "
+                f"de phase {PHASE_CODES} ; reçu --code {self.code} "
+                f"(il serait silencieusement ignoré)")
+            npos = self.seg_n_pos if self.code in SEG_PHASE_CODES else self.n_pos
+            assert self.pos_offset < npos, (
+                f"pos_offset {self.pos_offset} >= n_pos {npos} : TOUTES les "
+                f"positions wrappent sur l'identité")
+        # ── write_mode ─────────────────────────────────────────────────────
+        assert self.write_mode in WRITE_MODES, (
+            f"write inconnu {self.write_mode!r} (∈ {WRITE_MODES})")
+        if self.write_mode == "every":
+            assert self.pools_segment, (
+                f"--write every exige un code qui poole le SEGMENT "
+                f"({SEG_CODES}) : un seg SANS fait n'a pas de span valeur, "
+                f"donc les formats à privilège span-valeur ne savent pas quoi "
+                f"écrire ; reçu --code {self.code}")
 
     @property
     def n_cand(self) -> int:
@@ -339,7 +428,8 @@ def apply_rope(x: torch.Tensor, cos, sin) -> torch.Tensor:
     return rot_pairs(x, cos[None, None], sin[None, None])
 
 
-def phase_tables(n_pos: int, d: int, base: float, device=None, dtype=None):
+def phase_tables(n_pos: int, d: int, base: float, device=None, dtype=None,
+                 offset: int = 0):
     """(cos, sin) [n_pos, d/2] du binding positionnel `phase`.
 
     La position k applique rot(θ_i·k) à la paire de dims i ; le readout
@@ -354,6 +444,22 @@ def phase_tables(n_pos: int, d: int, base: float, device=None, dtype=None):
       ⚠️ MESURÉ : elle ne décorrèle PAS n_pos=8 positions (θ_max = 1 rad ⇒
       ⟨cos(θ_i·1)⟩ = 0.95 à base 100, 0.54 à base 1) ; round-trip oracle
       plafonné à 3-7/8 selon la base contre 8/8 en DFT.
+
+    `offset` (knob `code.pos_offset`, défaut 0 = rétro-compat bit-à-bit) DÉCALE
+    l'index de phase : la ligne j de la table vaut rot(θ·(j+offset)). Elle sert
+    AU WRITE (le token en position j est tourné de θ·(j+offset)) ET AU READOUT
+    (le candidat j dé-tourne de −θ·(j+offset)) : c'est la MÊME table, donc le
+    round-trip reste exact par construction.
+    RAISON : à offset 0, la position 0 a rot(0) = IDENTITÉ — son token se
+    superpose SANS étiquette rotationnelle à K[slot]+A[attr], qui vivent aussi
+    non-tournés dans la ligne. Mesuré dans les dumps : le premier token de la
+    valeur échoue systématiquement (SV-19621 → EX-19621 / AD-19621, chiffres
+    exacts). offset ≥ 1 rend l'identité INOCCUPÉE.
+    ⚠️ WRAP : le binding DFT est périodique de période n_pos, donc l'index
+    j+offset ≡ 0 [n_pos] retombe sur l'identité. Avec offset=k, les positions
+    j ∈ [0, n_pos−k) sont protégées et les positions j ≥ n_pos−k rejouent le
+    conflit. L'offset CONSOMME donc k positions utiles : il faut
+    n_pos ≥ longueur_max + offset.
     """
     if base is None or base <= 0:
         r = (torch.arange(0, d // 2, device=device) % n_pos).float()
@@ -361,6 +467,8 @@ def phase_tables(n_pos: int, d: int, base: float, device=None, dtype=None):
     else:
         inv = 1.0 / (base ** (torch.arange(0, d, 2, device=device).float() / d))
     k = torch.arange(n_pos, device=device).float()
+    if offset:
+        k = k + float(offset)
     f = torch.outer(k, inv)                                   # [n_pos, d/2]
     c, s = f.cos(), f.sin()
     if dtype is not None:
@@ -638,7 +746,8 @@ class ToyReadLM(nn.Module):
             P = torch.stack([torch.linalg.qr(raw[k])[0] for k in range(cfg.n_pos)])
             self.register_buffer("chunk_P", P)                 # [n_pos, d, blk]
         elif cfg.code == "phase":
-            c, s = phase_tables(cfg.n_pos, cfg.d_model, cfg.rope_base)
+            c, s = phase_tables(cfg.n_pos, cfg.d_model, cfg.rope_base,
+                                offset=cfg.pos_offset)
             self.register_buffer("ph_cos", c)                  # [n_pos, d/2]
             self.register_buffer("ph_sin", s)
         elif cfg.code == "rows":
@@ -647,7 +756,8 @@ class ToyReadLM(nn.Module):
         elif cfg.code in SEG_PHASE_CODES:
             # même binding DFT que `phase`, mais indexé sur la position DANS LE
             # SEGMENT ⇒ sa propre table de seg_n_pos lignes.
-            c, s = phase_tables(cfg.seg_n_pos, cfg.d_model, cfg.rope_base)
+            c, s = phase_tables(cfg.seg_n_pos, cfg.d_model, cfg.rope_base,
+                                offset=cfg.pos_offset)
             self.register_buffer("sg_cos", c)                  # [seg_n_pos, d/2]
             self.register_buffer("sg_sin", s)
         if cfg.code == "segsif":
@@ -677,7 +787,8 @@ class ToyReadLM(nn.Module):
 
     @torch.no_grad()
     def oracle_lines(self, slot_id: int, attr_id: int, val_tok: torch.Tensor,
-                     seg_tok: torch.Tensor | None = None) -> torch.Tensor:
+                     seg_tok: torch.Tensor | None = None,
+                     bare: bool = False) -> torch.Tensor:
         """LES LIGNES d'un fait : [n_lignes, mem_dim]. Dispatch sur cfg.code.
 
         `mean` en rend UNE et est bit-à-bit identique à la phase 1 ; `chunk` et
@@ -694,9 +805,18 @@ class ToyReadLM(nn.Module):
         """
         c = self.cfg
         if c.code == "mean":
+            assert not bare, "bare (write=every) exige un code de SEGMENT"
             return self.oracle_code(slot_id, attr_id, val_tok).unsqueeze(0)
         dev = self.embed.weight.device
-        ka = self.K_slot[slot_id].float() + self.A_attr[attr_id].float()
+        if bare:
+            # `--write every`, seg SANS fait : MÊME formule de pool, mais AUCUNE
+            # composante de liaison — la ligne ne prétend pas indexer un slot.
+            # (K_slot[0]/A_attr[0] existent mais sont des vecteurs ALÉATOIRES
+            # comme les autres : on ne s'appuie pas dessus, on force le zéro.)
+            assert c.pools_segment, "bare (write=every) exige un code de SEGMENT"
+            ka = torch.zeros(c.mem_dim, dtype=torch.float32, device=dev)
+        else:
+            ka = self.K_slot[slot_id].float() + self.A_attr[attr_id].float()
         if c.pools_segment:
             assert seg_tok is not None, (
                 f"--code {c.code} poole le SEGMENT : oracle_lines a besoin de "
@@ -835,10 +955,16 @@ def param_report(model: ToyReadLM) -> dict:
 class OracleEnv:
     """Rejoue une conv seg par seg et pose la banque à la place du modèle."""
 
-    def __init__(self, tok, max_mem: int):
+    def __init__(self, tok, max_mem: int, write_mode: str = "fact"):
         self.tok = tok
         self.max_mem = max_mem
+        assert write_mode in WRITE_MODES, write_mode
+        self.write_mode = write_mode
+        # nombre de lignes appendées par le DERNIER appel à write() (télémétrie
+        # d'âge : « combien de writes séparent le fait de sa query »).
+        self.last_added = 0
         slot_ids, val_ids, attr_ids = fact_id_maps()
+        self.slot_ids = slot_ids
         self.id2val = {i: v for v, i in val_ids.items()}
         self.n_slots = len(slot_ids) + 1
         self.n_attrs = len(attr_ids) + 1
@@ -879,7 +1005,13 @@ class OracleEnv:
         return sl, int(seg["fact_attr"][0, 0]), int(seg["fact_val"][0, 0])
 
     def write(self, model: ToyReadLM, bank: list, seg: dict) -> list:
-        """FIFO de max_mem lignes ; les segs sans fait n'écrivent rien.
+        """FIFO de max_mem lignes.
+
+        `write_mode='fact'` (DÉFAUT) : les segs sans fait n'écrivent rien —
+        l'oracle SAIT lesquels portent un fait (2ᵉ privilège).
+        `write_mode='every'` : CHAQUE seg écrit une ligne, comme le write du
+        350M. Les segs sans fait posent la même formule de pool SANS K/A, donc
+        le flux ÉVINCE les faits anciens du FIFO : c'est le régime réel.
 
         `--code rows` appende PLUSIEURS lignes d'un coup (une par token de la
         valeur) : le FIFO reste à max_mem, donc un fait long évince les
@@ -887,9 +1019,15 @@ class OracleEnv:
         """
         f = self.fact_of(seg)
         if f is None:
-            return bank
-        rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]),
-                                  seg_tok=self.seg_tokens(seg))
+            if self.write_mode != "every":
+                self.last_added = 0
+                return bank
+            rows = model.oracle_lines(0, 0, torch.zeros(0, dtype=torch.long),
+                                      seg_tok=self.seg_tokens(seg), bare=True)
+        else:
+            rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]),
+                                      seg_tok=self.seg_tokens(seg))
+        self.last_added = int(rows.shape[0])
         bank = bank + list(rows)
         return bank[-self.max_mem:]
 
@@ -985,6 +1123,7 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     model.eval()
     stream.rng = random.Random(seed)
     live_ans, abl_ans, truths_all, groups = [], [], [], []
+    ages = []                            # writes entre le fait et sa query
     dnll_num, dnll_den = 0.0, 0.0
     gate_num, gate_den = 0.0, 0.0
     shown = []
@@ -1004,6 +1143,13 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         bank: list = []
         qi = 0
         prev = ""
+        # âge en WRITES : compteur de lignes appendées depuis le début de la
+        # conv, et pour chaque slot l'instant de son dernier write. En mode
+        # `fact` l'âge ne compte que les autres faits ; en mode `every` il
+        # compte TOUT le flux — c'est lui qui dit combien de faits le FIFO a
+        # déjà évincés au moment de la question.
+        wcount = 0
+        slot_w: dict = {}
         for i, seg in enumerate(conv["segs"]):
             X = seg["input_ids"][:, :max_len].to(device)
             W = seg["loss_mask"][:, :max_len].to(device)
@@ -1032,13 +1178,20 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 live_ans.append(live)
                 abl_ans.append(abl_txt)
                 truths_all.append(tr)
-                groups.append(env.value_group(
-                    q_slots[qi] if qi < len(q_slots) else None, tr))
+                q_slot = q_slots[qi] if qi < len(q_slots) else None
+                groups.append(env.value_group(q_slot, tr))
+                sid = env.slot_ids.get(q_slot) if q_slot else None
+                if sid in slot_w:
+                    ages.append(wcount - slot_w[sid])
                 if len(shown) < n_show:
                     shown.append((prev.strip(), tr, live.strip(),
                                   abl_txt.strip()))
                 qi += 1
             bank = env.write(model, bank, seg)
+            wcount += env.last_added
+            f = OracleEnv.fact_of(seg)
+            if f is not None and env.last_added:
+                slot_w[f[0]] = wcount        # instant du write DE CE FAIT
             prev = tok.decode(seg["input_ids"][0].tolist())
     model.train()
     out = {
@@ -1048,6 +1201,13 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         "n": len(truths_all),
         "show": shown,
         "ptr_gate": (gate_num / gate_den) if gate_den > 0 else float("nan"),
+        # âge = nombre de writes appendés ENTRE le write du fait et la query.
+        # ≥ max_mem ⇒ la ligne du fait a été ÉVINCÉE du FIFO (le read ne peut
+        # structurellement plus répondre) : c'est la mesure du régime réel.
+        "age_writes": (sum(ages) / len(ages)) if ages else float("nan"),
+        "age_hist": ages,
+        "age_evicted": (sum(1 for x in ages if x >= env.max_mem) / len(ages))
+                       if ages else float("nan"),
     }
     # grade PAR STRATE de valeur (short / word / code)
     for gname in GROUPS:
@@ -1093,6 +1253,15 @@ def main(argv=None):
     ap.add_argument("--code", choices=CODES, default="mean",
                     help="format du code de banque (phase 2, r3 seulement) ; "
                          "mean = phase 1 inchangée")
+    ap.add_argument("--write", choices=WRITE_MODES, default="fact",
+                    dest="write_mode",
+                    help="régime du write oracle : fact = segs PORTEURS "
+                         "seulement (défaut, privilège gardé) ; every = APRÈS "
+                         "CHAQUE seg (le régime du 350M : le flux évince les "
+                         "faits du FIFO)")
+    ap.add_argument("--pos-offset", type=int, default=None, dest="pos_offset",
+                    help="surcharge code.pos_offset (décalage de l'index de "
+                         "phase ; 1 libère l'identité occupée par K/A)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -1121,6 +1290,10 @@ def main(argv=None):
         mc["seg_n_pos"] = int(cb["seg_n_pos"])
     if "sif_a" in cb:
         mc["sif_a"] = float(cb["sif_a"])
+    if "pos_offset" in cb:
+        mc["pos_offset"] = int(cb["pos_offset"])
+    if a.pos_offset is not None:           # la CLI gagne sur le YAML
+        mc["pos_offset"] = int(a.pos_offset)
     device = a.device or t.get("device") or ("cuda" if torch.cuda.is_available()
                                              else "cpu")
     steps = int(a.steps or t.get("steps", 3000))
@@ -1134,10 +1307,11 @@ def main(argv=None):
 
     torch.manual_seed(int(t.get("seed", 0)))
     tok = build_tokenizer(raw["tokenizer"])
-    env = OracleEnv(tok, int(mc.get("max_mem", 8)))
+    env = OracleEnv(tok, int(mc.get("max_mem", 8)), write_mode=a.write_mode)
 
     mc["variant"] = a.variant
     mc["code"] = a.code
+    mc["write_mode"] = a.write_mode
     mc["vocab_size"] = len(tok)
     cfg = ToyCfg(**mc)
     P = chat_stream_class("persona")
@@ -1150,8 +1324,14 @@ def main(argv=None):
                                  seed=int(t.get("seed", 0)))
     model = ToyReadLM(cfg, env.n_slots, env.n_attrs, sif_w=sif_w).to(device)
 
-    # phase 1 → <variant>/ (inchangé) ; phase 2 → <variant>_<code>/
+    # phase 1 → <variant>/ (inchangé) ; phase 2 → <variant>_<code>/ ;
+    # extensions → suffixes _o<k> (pos_offset) et _wev (write=every) pour ne
+    # JAMAIS écraser un run déjà fini sous le même nom.
     run_name = a.variant if a.code == "mean" else f"{a.variant}_{a.code}"
+    if cfg.pos_offset:
+        run_name += f"_o{cfg.pos_offset}"
+    if cfg.write_mode == "every":
+        run_name += "_wev"
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
                             run_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -1178,8 +1358,15 @@ def main(argv=None):
               + (f"sif_a {cfg.sif_a:g} (w vocab moy {float(model.sif_w.mean()):.3f} "
                  f"min {float(model.sif_w.min()):.4f}) "
                  if a.code == "segsif" else "")
+              + (f"pos_offset {cfg.pos_offset} (identité LIBRE, positions "
+                 f"protégées 0..{(cfg.seg_n_pos if cfg.pools_segment else cfg.n_pos) - cfg.pos_offset - 1}) "
+                 if cfg.pos_offset else "")
               + f"| candidats pointer {cfg.max_mem * cfg.n_cand} "
               f"({cfg.max_mem}×{cfg.n_cand})", flush=True)
+    if cfg.write_mode == "every":
+        print(f"  write EVERY : l'oracle écrit après CHAQUE seg (segs sans "
+              f"fait = même pool SANS K/A) — le FIFO {cfg.max_mem} évince les "
+              f"faits anciens, 2ᵉ privilège d'oracle RETIRÉ", flush=True)
     print("  params : " + "  ".join(f"{k} {v/1e6:.2f}M" for k, v in pr.items()),
           flush=True)
     print(f"  read+pointer = {(pr['read']+pr['pointer'])/1e6:.2f}M "
@@ -1215,6 +1402,7 @@ def main(argv=None):
     stop_id = tok.convert_tokens_to_ids("<|im_end|>")
 
     best = -1.0
+    first_age = True                 # distribution des âges imprimée UNE fois
     t0 = time.time()
     for step in range(steps):
         for g in opt.param_groups:
@@ -1243,6 +1431,17 @@ def main(argv=None):
                 f"{g} {ev['grade_' + g]:.3f} (n={ev['n_' + g]})"
                 for g in GROUPS) + f"  | porte pointer σ {ev['ptr_gate']:.4f}",
                 flush=True)
+            if cfg.write_mode == "every":
+                # RÉGIME RÉEL : combien de writes séparent le fait de sa query,
+                # et quelle fraction des faits gradés est DÉJÀ ÉVINCÉE du FIFO.
+                print(f"    âges (writes fait→query) : moyenne "
+                      f"{ev['age_writes']:.2f} | évincés (âge ≥ "
+                      f"{cfg.max_mem}) {ev['age_evicted']:.3f}"
+                      + (("  | distribution " + " ".join(
+                          f"{k}:{ev['age_hist'].count(k)}"
+                          for k in sorted(set(ev["age_hist"]))))
+                         if first_age else ""), flush=True)
+                first_age = False
             for q, tr, lv, ab in ev["show"]:
                 print(f"    Q {q[:90]!r}\n      vérité {tr!r}\n"
                       f"      LIVE   {lv[:120]!r}\n      ABLATÉ {ab[:120]!r}",
@@ -1257,6 +1456,11 @@ def main(argv=None):
                                + [c for g in GROUPS for c in
                                   (f"grade_eval_{g}", f"grade_eval_{g}_abl",
                                    f"n_eval_{g}")]
+                               # colonnes d'âge SEULEMENT en write=every : le
+                               # CSV du mode `fact` reste octet-à-octet celui
+                               # de HEAD.
+                               + (["age_writes", "age_evicted"]
+                                  if cfg.write_mode == "every" else [])
                                + ["ptr_gate", "sec"])
                     new_csv = False
 
@@ -1269,6 +1473,8 @@ def main(argv=None):
                            + [v for g in GROUPS for v in
                               (_f(ev[f"grade_{g}"]), _f(ev[f"grade_{g}_abl"]),
                                ev[f"n_{g}"])]
+                           + ([_f(ev["age_writes"]), _f(ev["age_evicted"])]
+                              if cfg.write_mode == "every" else [])
                            + [_f(ev["ptr_gate"]), f"{time.time()-t0:.0f}"])
             if ev["grade_live"] > best:
                 best = ev["grade_live"]
@@ -1497,11 +1703,12 @@ def _selftest() -> None:
         w[torch.tensor([7, 8, 9])] = A_SIF / (A_SIF + 0.2)
         return w
 
-    def _mk(code, d=256, n_pos=8, vocab=512, base=0.0, seg_n_pos=32):
+    def _mk(code, d=256, n_pos=8, vocab=512, base=0.0, seg_n_pos=32,
+            offset=0):
         c = ToyCfg(vocab_size=vocab, d_model=d, n_layers=1, n_heads=4,
                    mem_dim=d, variant="r3", max_seq_len=64, code=code,
                    n_pos=n_pos, rope_base=base, seg_n_pos=seg_n_pos,
-                   sif_a=A_SIF)
+                   sif_a=A_SIF, pos_offset=offset)
         return ToyReadLM(c, env.n_slots, env.n_attrs,
                          sif_w=_sifw(vocab) if code == "segsif" else None).eval()
 
@@ -1702,6 +1909,163 @@ def _selftest() -> None:
     else:
         raise AssertionError("sif_a=0 aurait dû être refusé")
 
+    # ═══════════ EXTENSION 1 : code.pos_offset (fix position 0) ═════════════
+    # 13a. la table EST décalée : offset k ⇒ ligne j = rot(θ·(j+k)), donc
+    #      (binding DFT, période n_pos) elle vaut la ligne (j+k) mod n_pos de
+    #      la table non décalée. offset 0 = tables IDENTIQUES (rétro-compat).
+    c0, s0 = phase_tables(8, 32, 0.0)
+    c1, s1 = phase_tables(8, 32, 0.0, offset=1)
+    assert torch.equal(c0, phase_tables(8, 32, 0.0, offset=0)[0])
+    for j in range(8):
+        assert torch.allclose(c1[j], c0[(j + 1) % 8], atol=1e-5) and \
+            torch.allclose(s1[j], s0[(j + 1) % 8], atol=1e-5), j
+    # 13b. le décalage passe AU WRITE ET AUX CANDIDATS : le round-trip reste
+    #      exact, y compris À LA POSITION 0 (qui, à offset 0, partage
+    #      l'identité rotationnelle avec K[slot]+A[attr]).
+    seg8 = torch.tensor([301, 44, 199, 12, 260, 88, 150, 7])
+    for off in (0, 1):
+        m_o = _mk("segphase", d=512, seg_n_pos=8, offset=off)
+        # positions PROTÉGÉES : j + offset ≢ 0 [seg_n_pos]
+        prot = list(range(8 - off))
+        ok_o, n_o = code_roundtrip(m_o, 3, 2, tok8, seg_tok=seg8, val_pos=prot)
+        assert (ok_o, n_o) == (len(prot), len(prot)), (off, ok_o, n_o)
+        assert 0 in prot                      # la position 0 EST récupérée
+    # et le code CHANGE avec l'offset (sinon le knob serait un no-op)
+    assert not torch.allclose(
+        _mk("segphase", d=512, seg_n_pos=8, offset=0).oracle_lines(
+            3, 2, tok8, seg_tok=seg8),
+        _mk("segphase", d=512, seg_n_pos=8, offset=1).oracle_lines(
+            3, 2, tok8, seg_tok=seg8), atol=1e-4), "pos_offset = no-op"
+    # 13c. WRAP documenté : à offset 1, la position seg_n_pos−1 retombe sur
+    #      l'identité (index ≡ 0) — elle redevient exactement la position 0 du
+    #      format non décalé. C'est le coût du knob, pas un bug.
+    #      Invariant vérifiable : le candidat d'index de phase ≡ 0 est la LIGNE
+    #      BRUTE (dé-rotation identité) — c'est le candidat 0 à offset 0, et le
+    #      candidat n_pos−1 à offset 1. C'est CE candidat qui voit K/A non
+    #      tourné ; l'offset le déplace sur une position JAMAIS occupée.
+    for off, j_id in ((0, 0), (1, 7)):
+        m_w = _mk("segphase", d=512, seg_n_pos=8, offset=off)
+        li = m_w.oracle_lines(3, 2, tok8, seg_tok=seg8)
+        cw, _ = m_w.candidates(li.unsqueeze(0), None)
+        assert torch.allclose(cw[0, j_id], li[0], atol=1e-5), \
+            f"wrap : à offset {off}, le candidat {j_id} doit être la ligne nue"
+    # 13d. pos_offset REFUSÉ hors formats à binding de phase (pas de no-op
+    #      silencieux), et refusé s'il dépasse n_pos.
+    for code in ("mean", "chunk", "rows", "segmean"):
+        try:
+            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                   variant="r3", code=code, n_pos=4, seg_n_pos=8, pos_offset=1)
+        except AssertionError as e:
+            assert "pos_offset" in str(e)
+        else:
+            raise AssertionError(f"pos_offset aurait dû être refusé ({code})")
+    try:
+        ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32, variant="r3",
+               code="segphase", seg_n_pos=8, pos_offset=8)
+    except AssertionError as e:
+        assert "wrappent" in str(e)
+    else:
+        raise AssertionError("pos_offset >= n_pos aurait dû être refusé")
+    # 13e. déterminisme : deux écritures successives, offset actif, identiques
+    m_d = _mk("segsif", d=512, seg_n_pos=8, offset=1)
+    assert torch.equal(m_d.oracle_lines(3, 2, tok8, seg_tok=seg8),
+                       m_d.oracle_lines(3, 2, tok8, seg_tok=seg8))
+
+    # ═══════════ EXTENSION 2 : --write every (2ᵉ privilège retiré) ══════════
+    m_e = _mk("segsif", d=32, n_pos=4, vocab=512, seg_n_pos=8)
+    env_f = OracleEnv(tok, 8)                       # mode `fact` (défaut)
+    env_e = OracleEnv(tok, 8, write_mode="every")
+    nofact = [s for s in conv["segs"] if OracleEnv.fact_of(s) is None][0]
+    factseg = [s for s in conv["segs"] if OracleEnv.fact_of(s)][0]
+    # 14a. mode fact : un seg SANS fait n'écrit RIEN (inchangé)
+    assert env_f.write(m_e, [], nofact) == [] and env_f.last_added == 0
+    # 14b. mode every : il écrit UNE ligne, non nulle, de RMS 1
+    b_e = env_e.write(m_e, [], nofact)
+    assert len(b_e) == 1 and env_e.last_added == 1
+    assert float(b_e[0].abs().max()) > 0 and \
+        abs(float(b_e[0].pow(2).mean().sqrt()) - 1.0) < 1e-3
+    # 14c. … et SANS composante K/A : la ligne d'un seg sans fait ne dépend NI
+    #      du slot NI de l'attribut, alors que celle d'un seg porteur en dépend.
+    st_nf = OracleEnv.seg_tokens(nofact)
+    bare_a = m_e.oracle_lines(0, 0, torch.zeros(0, dtype=torch.long),
+                              seg_tok=st_nf, bare=True)
+    bare_b = m_e.oracle_lines(5, 3, torch.zeros(0, dtype=torch.long),
+                              seg_tok=st_nf, bare=True)
+    assert torch.equal(bare_a, bare_b), "ligne bare : K/A n'est pas annulé"
+    assert torch.equal(bare_a[0], b_e[0])
+    ka_a = m_e.oracle_lines(1, 1, torch.zeros(0, dtype=torch.long),
+                            seg_tok=st_nf)
+    ka_b = m_e.oracle_lines(5, 3, torch.zeros(0, dtype=torch.long),
+                            seg_tok=st_nf)
+    assert not torch.allclose(ka_a, ka_b, atol=1e-4) and \
+        not torch.allclose(bare_a, ka_a, atol=1e-4), \
+        "la ligne AVEC K/A devrait dépendre du slot/attr et différer de bare"
+    # 14d. FIFO en mode every : 3 faits PUIS des segs vides ⇒ les lignes de
+    #      faits SORTENT (c'est LE point de l'extension). Arithmétique : 3+6=9
+    #      lignes pour 8 slots ⇒ le fait le PLUS ANCIEN est déjà évincé ; à
+    #      3+8=11 il ne reste plus AUCUN fait.
+    b = []
+    fact_rows = []
+    for k in range(3):
+        s = dict(factseg)
+        s["fact_val"] = torch.full_like(factseg["fact_val"], 1 + k)
+        # segs DISTINCTS : les codes de segment poolent le seg, pas fact_val —
+        # sans ça les 3 lignes seraient identiques et « évincée » indécidable.
+        s["input_ids"] = factseg["input_ids"].clone()
+        s["input_ids"][0, 1] = 100 + k
+        b = env_e.write(m_e, b, s)
+        fact_rows.append(b[-1].clone())
+    assert len(b) == 3
+    for k in range(6):
+        b = env_e.write(m_e, b, nofact)
+    assert len(b) == 8, len(b)
+    assert not any(torch.equal(fact_rows[0], x) for x in b), \
+        "FIFO every : le fait le plus ancien aurait dû être évincé par le flux"
+    assert sum(any(torch.equal(fr, x) for x in b) for fr in fact_rows) == 2
+    for k in range(2):
+        b = env_e.write(m_e, b, nofact)
+    for fr in fact_rows:
+        assert not any(torch.equal(fr, x) for x in b), \
+            "FIFO every : 8 segs vides doivent purger TOUS les faits"
+    # en mode `fact` les mêmes 6 segs vides n'évincent RIEN
+    b2 = []
+    for k in range(3):
+        s = dict(factseg)
+        s["fact_val"] = torch.full_like(factseg["fact_val"], 1 + k)
+        # segs DISTINCTS : les codes de segment poolent le seg, pas fact_val —
+        # sans ça les 3 lignes seraient identiques et « évincée » indécidable.
+        s["input_ids"] = factseg["input_ids"].clone()
+        s["input_ids"][0, 1] = 100 + k
+        b2 = env_f.write(m_e, b2, s)
+    for k in range(6):
+        b2 = env_f.write(m_e, b2, nofact)
+    assert len(b2) == 3, len(b2)
+    # 14e. lane vide ≡ ablaté et forward fini AVEC des lignes bare dans la
+    #      banque (le régime every mélange lignes de faits et lignes nues)
+    bmix = torch.stack([torch.stack(b[:2] + [torch.zeros(32)]),
+                        torch.zeros(3, 32)])
+    mmix = torch.tensor([[True, True, False], [False, False, False]])
+    with torch.no_grad():
+        lg = m_e(torch.randint(0, 512, (2, 6)), bmix, mmix)
+    assert torch.isfinite(lg).all()
+    with torch.no_grad():
+        i1 = torch.randint(0, 512, (1, 6))
+        assert torch.allclose(
+            m_e(i1, torch.zeros(1, 3, 32), torch.tensor([[False] * 3])),
+            m_e(i1, None, None), atol=1e-5), "lane vide != ablaté (every)"
+    # 14f. déterminisme des lignes bare
+    assert torch.equal(env_e.write(m_e, [], nofact)[0],
+                       env_e.write(m_e, [], nofact)[0])
+    # 14g. --write every REFUSÉ pour les codes à privilège span-valeur
+    for code in ("mean", "chunk", "phase", "rows"):
+        try:
+            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                   variant="r3", code=code, n_pos=4, write_mode="every")
+        except AssertionError as e:
+            assert "every" in str(e)
+        else:
+            raise AssertionError(f"--write every aurait dû être refusé ({code})")
+
     print("toy_read_lab self-test: OK (write oracle déterministe & "
           "embedding-dépendant, FIFO 8, porte pointer fermée à l'init, "
           "masque CE assistant-seul, padding de banque inerte, "
@@ -1726,6 +2090,17 @@ def _selftest() -> None:
           f"{t_eff:.1f}/{seg_f.numel()} tokens, écrasement d'un token fréquent "
           f"Δ {d_ss:.4f} vs {d_sp:.4f} en poids uniformes ; sif_w et sif_a>0 "
           f"exigés")
+    print("  extension 1 — code.pos_offset : table décalée (ligne j = rot(θ·"
+          "(j+k))), appliqué au WRITE ET aux candidats (round-trip segphase "
+          "offset 1 exact, position 0 comprise), wrap n_pos−1 ≡ position 0 du "
+          "format non décalé, refusé hors phase/segphase/segsif et si "
+          "offset ≥ n_pos, déterministe")
+    print("  extension 2 — --write every : seg SANS fait ⇒ UNE ligne RMS 1 "
+          "SANS composante K/A (indépendante du slot/attr), FIFO évince les 3 "
+          "faits après 8 segs vides (le plus ancien dès 6 ; mode fact : rien n'est "
+          "évincé), lane vide "
+          "≡ ablaté avec lignes nues en banque, déterministe, refusé pour "
+          "mean/chunk/phase/rows")
 
 
 if __name__ == "__main__":

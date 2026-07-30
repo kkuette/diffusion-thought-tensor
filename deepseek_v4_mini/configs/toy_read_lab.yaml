@@ -14,6 +14,14 @@
 #   --code mean|chunk|phase|rows        (phase 2, pool du SPAN VALEUR)
 #   --code segmean|segphase|segsif      (phase 3, pool du SEGMENT ENTIER)
 #
+# Axe RÉGIME DE WRITE :
+#   --write fact   (défaut) l'oracle n'écrit qu'après les segs PORTEURS
+#   --write every  il écrit après CHAQUE seg (régime du 350M : le flux évince
+#                  les faits du FIFO). Exige un code de SEGMENT.
+# Axe POSITION : code.pos_offset (ou --pos-offset K) décale l'index de phase.
+# Les deux ajoutent un suffixe au save_dir (_o<K>, _wev) : aucun run passé
+# n'est écrasé.
+#
 # ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal) :
 # toy_read_lab.py fait son propre paths.load_yaml.
 #
@@ -97,6 +105,33 @@ code:
                           # soit un produit [B,T,256] au lieu de [B,T,8] sur
                           # l'attention plate — négligeable devant le [B,T,V]
                           # du biais de logits (V = 49 154).
+  pos_offset: 0           # DÉCALAGE de l'index de phase (`phase`, `segphase`,
+                          # `segsif` seulement). 0 = DÉFAUT et rétro-compat
+                          # bit-à-bit des runs passés.
+                          # POURQUOI le knob : à offset 0 la position 0 a
+                          # rot(0) = IDENTITÉ, donc son token se superpose SANS
+                          # étiquette rotationnelle à K[slot]+A[attr], qui
+                          # vivent eux aussi NON tournés dans la ligne (dumps :
+                          # SV-19621 → EX-19621, les chiffres exacts mais le
+                          # premier token de la valeur faux). offset=k tourne le
+                          # token de position j de θ·(j+k), AU WRITE ET aux
+                          # candidats du readout : plus aucune position ne
+                          # partage la phase identité.
+                          # WRAP : le binding DFT est de période n_pos, donc
+                          # l'offset CONSOMME k positions — il faut
+                          # n_pos ≥ longueur_max + k. MESURÉ sur le stream :
+                          # segs porteurs ≤ 26 tokens ⇒ seg_n_pos 32 avec
+                          # offset 1 ne wrappe JAMAIS ; valeurs ≤ 8 tokens ⇒
+                          # `phase` à n_pos 8 avec offset 1 fait wrapper la
+                          # position 7 des 18 valeurs de 8 tokens (mesuré : le
+                          # round-trip reste 100 % / +3.2σ, K/A à 0.2 est trop
+                          # faible pour mordre à d=512 ; mettre n_pos 16 pour
+                          # supprimer le wrap si un jour il compte).
+                          # ⚠️ MESURÉ à d=512 : l'offset ne change RIEN au
+                          # round-trip oracle (segsif 97.4 → 97.5 %, aucune
+                          # anomalie position-0 dans le code lui-même) — il ne
+                          # se teste donc qu'au niveau du READ APPRIS.
+
   sif_a: 0.01             # `segsif` seulement : le a de w = a/(a+p(token)).
                           # La table unigram vient de _sif_table() de
                           # PersonaChatStream (300 convs, rng 4242) — MÊME
