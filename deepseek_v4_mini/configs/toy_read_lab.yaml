@@ -46,6 +46,32 @@ model:
   oracle_ka_scale: 0.2    # K[slot]/A[attr] = petits offsets de liaison
   oracle_seed: 20260730
 
+# ── PHASE 2 : axe FORMAT DE CODE (--code mean|chunk|phase|rows, r3 seulement)
+# Le pool MOYEN de la phase 1 détruit l'ordre des tokens (la ligne est un sac
+# de tokens) ⇒ grade 0.000 partout malgré Δnll +3.80 sur r3. Ces knobs pilotent
+# les formats qui PRÉSERVENT l'ordre. --code mean les ignore intégralement
+# (chemin bit-à-bit de la phase 1, sous save_dir/<variant>/).
+code:
+  n_pos: 8                # tokens de valeur retenus par fait.
+                          # Distribution ÉCHANTILLONNÉE des longueurs de " "+val
+                          # (10 slots équiprobables) : 1 tok 4.6 %, 2 tok 27.0 %,
+                          # 3 tok 27.4 %, 4 tok 9.3 %, 5 tok 1.7 %, 6 tok 8.3 %,
+                          # 7 tok 17.0 %, 8 tok 4.8 % ⇒ n_pos=7 couvre 95.2 %,
+                          # n_pos=8 couvre 100 %. 8 est aussi une puissance de 2
+                          # qui divise d_model=256 (blocs chunk de 32 dims) ET
+                          # le d_model=64 du smoke (blocs de 8).
+  rope_base: 0.0          # binding `phase`. 0 (ou négatif) = DFT :
+                          # θ_i = 2π·(i mod n_pos)/n_pos, la SEULE famille de
+                          # fréquences qui annule EXACTEMENT l'interférence
+                          # entre positions (⟨cos(θ_i·Δ)⟩_i = 0 ∀Δ≠0).
+                          # ÉCART ASSUMÉ vs la spec « RoPE base 100 » : mesuré,
+                          # la forme RoPE littérale θ_i = base^(−2i/d) a θ_max =
+                          # 1 rad, donc ⟨cos(θ_i·1)⟩ = 0.95 à base 100 et 0.54 à
+                          # base 1 — elle ne sépare PAS 8 positions (round-trip
+                          # oracle 3/8 à base 100, 6/8 au mieux, contre 8/8 en
+                          # DFT). Mettre une base > 0 rejoue la forme RoPE
+                          # (gardée comme ablation).
+
 training:
   seed: 0
   steps: 3000

@@ -52,10 +52,38 @@ Sur des valeurs HELD-OUT (pool_split=eval, sha1 20 %) ET sur le split train
 sait pas citer, pas qu'il ne généralise pas) :
   grade_recall LIVE, grade ABLATÉ (banque vide), Δnll = nll_ablaté − nll_live.
 
+Phase 2 : l'axe FORMAT DE CODE (`--code`)
+-----------------------------------------
+Verdict de la phase 1 : grade held-out 0.000 pour les 4 variantes, mais Δnll
+r0 +0.87 / r1 +1.22 / r2 +0.77 / **r3 +3.80**. Diagnostic : le POOL MOYEN
+détruit l'ordre des tokens — la ligne est un SAC DE TOKENS, l'information de
+séquence n'existe plus DANS LA BANQUE, donc aucun read ne peut la ressusciter.
+La phase 2 attaque l'axe orthogonal (le format du code), sur le read gagnant
+r3 uniquement :
+
+  mean   (DÉFAUT, contrôle bit-à-bit de la phase 1) V = moyenne uniforme.
+  chunk  la ligne est découpée en n_pos blocs de d_model/n_pos dims ; le token
+         k occupe le bloc k, projeté par P_k (frame orthonormé FIGÉ). Ordre =
+         position physique dans la ligne. Décodable à 1/√blk près (JL).
+  phase  binding positionnel SUPERPOSÉ style HRR/RoPE :
+         ligne = RMSnorm(K + A + Σ_k rot(θ·k)·ê(t_k)). L'ordre survit dans la
+         phase ; le readout déroule en appliquant rot(−θ·j). Capacité ~ n_pos/d.
+  rows   BORNE HAUTE de décodabilité : UNE ligne par token,
+         ligne_k = RMSnorm(K + A + 0.2·pos[k] + ê(t_k)). Le FIFO 8 est
+         inchangé ⇒ un fait long mange la banque (économie dégradée : c'est
+         le prix de la borne).
+
+Le readout pointer devient CANDIDAT-BASED quand code ≠ mean : chaque ligne
+engendre n_pos candidats (bloc dé-projeté / ligne dé-tournée / la ligne
+elle-même), l'attention plate du pointer choisit parmi les M×n_pos candidats.
+Le modèle APPREND l'alignement position↔décodage — aucun compteur dur. La
+cross-attention de CONTENU de r3 reste inchangée (elle voit les lignes brutes).
+
 Usage
 -----
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r0
   python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r1 --smoke --device cpu
+  python -m deepseek_v4_mini.toy_read_lab CONFIG.yaml --variant r3 --code phase
   python -m deepseek_v4_mini.toy_read_lab --selftest
 """
 from __future__ import annotations
@@ -78,6 +106,11 @@ from .persona_chat_data import fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3")
+CODES = ("mean", "chunk", "phase", "rows")
+# slots dont la valeur est un CODE arbitraire (5-8 tokens, zéro prior LM) —
+# c'est la strate que le pool moyen ne peut structurellement pas rendre.
+CODE_SLOTS = ("code", "ref", "plate")
+GROUPS = ("short", "word", "code")
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -102,6 +135,12 @@ class ToyCfg:
     ptr_bias_init: float = -8.0
     oracle_ka_scale: float = 0.2
     oracle_seed: int = 20260730
+    # ── axe FORMAT DE CODE (phase 2) ────────────────────────────────────────
+    code: str = "mean"
+    n_pos: int = 8            # tokens de valeur retenus (couverture 100 % de
+                              # la distribution ÉCHANTILLONNÉE, cf. rapport)
+    rope_base: float = 0.0    # <=0 : binding DFT (défaut, cf. phase_tables) ;
+                              # >0 : forme RoPE littérale (ablation)
 
     def __post_init__(self):
         if self.variant == "r3":
@@ -113,6 +152,27 @@ class ToyCfg:
         assert self.mem_dim % self.n_heads == 0
         assert self.x_dim % self.n_heads == 0
         assert self.variant in VARIANTS
+        assert self.code in CODES, f"code inconnu {self.code!r} (∈ {CODES})"
+        if self.code != "mean":
+            # les nouveaux formats supposent banque == espace d'embedding et
+            # pointer nu : c'est la définition de r3, on ne les porte pas
+            # ailleurs (r0/r1/r2 restent le contrôle de la phase 1).
+            assert self.variant == "r3", (
+                f"--code {self.code} n'est supporté QUE par --variant r3 "
+                f"(banque en espace d'embedding + pointer nu) ; reçu "
+                f"--variant {self.variant}. Phase 1 = --code mean.")
+            assert self.mem_dim == self.d_model
+            assert self.n_pos >= 1
+            if self.code == "chunk":
+                assert self.d_model % self.n_pos == 0, (
+                    f"chunk : d_model {self.d_model} doit être divisible par "
+                    f"n_pos {self.n_pos}")
+        assert self.d_model % 2 == 0
+
+    @property
+    def n_cand(self) -> int:
+        """Candidats engendrés PAR LIGNE par le readout position-conscient."""
+        return 1 if self.code in ("mean", "rows") else self.n_pos
 
     @property
     def uses_fw(self) -> bool:
@@ -171,13 +231,50 @@ def _rope_tables(T: int, d_head: int, theta: float, device, dtype):
     return f.cos().to(dtype), f.sin().to(dtype)
 
 
+def rot_pairs(x: torch.Tensor, cos, sin) -> torch.Tensor:
+    """Rotation 2D par paires de dims (x0,x1), (x2,x3)… — forme générique.
+
+    x : [..., d] ; cos/sin : [..., d/2] BROADCASTABLES sur x[..., 0::2].
+    rot(−θ) s'obtient en passant −sin (le format `phase` déroule comme ça).
+    """
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x1 * sin + x2 * cos
+    return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+
 def apply_rope(x: torch.Tensor, cos, sin) -> torch.Tensor:
     """x : [B, H, T, dh] — rotation par paires (x0,x1)."""
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    c, s = cos[None, None], sin[None, None]
-    o1 = x1 * c - x2 * s
-    o2 = x1 * s + x2 * c
-    return torch.stack((o1, o2), dim=-1).flatten(-2)
+    return rot_pairs(x, cos[None, None], sin[None, None])
+
+
+def phase_tables(n_pos: int, d: int, base: float, device=None, dtype=None):
+    """(cos, sin) [n_pos, d/2] du binding positionnel `phase`.
+
+    La position k applique rot(θ_i·k) à la paire de dims i ; le readout
+    applique rot(−θ_i·j) pour lire la position j. Le terme k=j revient à
+    l'identité, les termes k≠j restent tournés d'un offset Δ=k−j : leur
+    contribution parasite au score du bon token vaut ⟨cos(θ_i·Δ)⟩_i.
+
+    base <= 0 → binding DFT (DÉFAUT) : θ_i = 2π·(i mod n_pos)/n_pos, pour
+      lequel ⟨cos(θ_i·Δ)⟩_i = 0 EXACTEMENT pour tout Δ ≢ 0 [n_pos]
+      (orthogonalité des caractères) — c'est le HRR discret.
+    base > 0 → forme RoPE littérale θ_i = base^(−2i/d), gardée comme ABLATION.
+      ⚠️ MESURÉ : elle ne décorrèle PAS n_pos=8 positions (θ_max = 1 rad ⇒
+      ⟨cos(θ_i·1)⟩ = 0.95 à base 100, 0.54 à base 1) ; round-trip oracle
+      plafonné à 3-7/8 selon la base contre 8/8 en DFT.
+    """
+    if base is None or base <= 0:
+        r = (torch.arange(0, d // 2, device=device) % n_pos).float()
+        inv = 2.0 * math.pi * r / n_pos                        # [d/2]
+    else:
+        inv = 1.0 / (base ** (torch.arange(0, d, 2, device=device).float() / d))
+    k = torch.arange(n_pos, device=device).float()
+    f = torch.outer(k, inv)                                   # [n_pos, d/2]
+    c, s = f.cos(), f.sin()
+    if dtype is not None:
+        c, s = c.to(dtype), s.to(dtype)
+    return c, s
 
 
 class CausalSelfAttn(nn.Module):
@@ -320,12 +417,19 @@ class PointerReadout(nn.Module):
            embedding poolé — c'est tout le point de la variante)
     Porte par token σ(w·h_t + b), b très négatif : la porte s'ouvre si et
     seulement si citer paie.
+
+    PHASE 2 : quand cfg.code ≠ mean, on lui passe non plus la banque brute mais
+    l'ENSEMBLE DE CANDIDATS [B, M·n_pos, d] construit par le modèle (bloc
+    dé-projeté / ligne dé-tournée / ligne). Le module est le MÊME (mem_dim ==
+    d_model en r3) : seule la source des « lignes » change, donc `--code mean`
+    est bit-à-bit la phase 1.
     """
 
     def __init__(self, cfg: ToyCfg, project: bool = True):
         super().__init__()
         d = cfg.d_model
         self.dk = d
+        self.last_gate = None       # σ(porte) du dernier forward (télémétrie)
         self.norm = RMSNorm(d)
         self.wq = nn.Linear(d, self.dk, bias=False)
         self.wk = nn.Linear(cfg.mem_dim, self.dk, bias=False)
@@ -354,6 +458,7 @@ class PointerReadout(nn.Module):
             sel = self.P(sel)
         bias = self.scale * (sel @ embed_w.t())            # [B,T,V]
         g = torch.sigmoid(self.gate(hn))                   # [B,T,1]
+        self.last_gate = g.detach()
         return g * bias
 
 
@@ -405,6 +510,25 @@ class ToyReadLM(nn.Module):
         else:
             proj = torch.eye(cfg.d_model)
         self.register_buffer("val_proj", proj)
+        # ── tables ORACLE de la PHASE 2 (tirées APRÈS val_proj : l'état du
+        # générateur vu par K/A/val_proj est inchangé ⇒ --code mean est
+        # bit-à-bit la phase 1) ─────────────────────────────────────────────
+        if cfg.code == "chunk":
+            blk = cfg.d_model // cfg.n_pos
+            raw = torch.randn(cfg.n_pos, cfg.d_model, blk, generator=g)
+            # frame ORTHONORMÉ par position : e @ P_k = coordonnées de e dans
+            # un sous-espace aléatoire de dim blk, et P_k^T dé-projette
+            # EXACTEMENT (projection orthogonale). Le bruit résiduel de la
+            # dé-projection est purement JL : SNR ≈ √blk.
+            P = torch.stack([torch.linalg.qr(raw[k])[0] for k in range(cfg.n_pos)])
+            self.register_buffer("chunk_P", P)                 # [n_pos, d, blk]
+        elif cfg.code == "phase":
+            c, s = phase_tables(cfg.n_pos, cfg.d_model, cfg.rope_base)
+            self.register_buffer("ph_cos", c)                  # [n_pos, d/2]
+            self.register_buffer("ph_sin", s)
+        elif cfg.code == "rows":
+            pos = torch.randn(cfg.n_pos, cfg.d_model, generator=g) * (cfg.d_model ** -0.5)
+            self.register_buffer("pos_emb", pos)               # [n_pos, d]
 
     # ── write ORACLE ────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -423,6 +547,73 @@ class ToyReadLM(nn.Module):
         code = self.K_slot[slot_id].float() + self.A_attr[attr_id].float() + v
         return rms_unit(code).detach()
 
+    @torch.no_grad()
+    def oracle_lines(self, slot_id: int, attr_id: int, val_tok: torch.Tensor
+                     ) -> torch.Tensor:
+        """LES LIGNES d'un fait : [n_lignes, mem_dim]. Dispatch sur cfg.code.
+
+        `mean` en rend UNE et est bit-à-bit identique à la phase 1 ; `chunk` et
+        `phase` en rendent une aussi (formats à ordre INTERNE) ; `rows` en rend
+        une PAR TOKEN (borne haute de décodabilité, économie dégradée : le FIFO
+        de max_mem lignes est inchangé, un fait long mange la banque).
+
+        Comme en phase 1 : recalculé à la volée sur les embeddings COURANTS,
+        detach total, aucun gradient ne traverse la banque.
+        """
+        c = self.cfg
+        if c.code == "mean":
+            return self.oracle_code(slot_id, attr_id, val_tok).unsqueeze(0)
+        dev = self.embed.weight.device
+        toks = val_tok.to(dev)[:c.n_pos]                       # troncature n_pos
+        e = self.embed.weight[toks].float()                    # [n, d]
+        e = rms_unit(e)                                        # ê(t_k), RMS 1
+        ka = self.K_slot[slot_id].float() + self.A_attr[attr_id].float()
+        n = e.size(0)
+        if c.code == "chunk":
+            blk = c.d_model // c.n_pos
+            line = torch.zeros(c.d_model, dtype=torch.float32, device=dev)
+            # token k → bloc k, projeté par le frame figé P_k ; blocs vides = 0
+            coeff = torch.einsum("nd,ndb->nb", e, self.chunk_P[:n].float())
+            line[:n * blk] = coeff.reshape(-1)
+            out = rms_unit(ka + line).unsqueeze(0)
+        elif c.code == "phase":
+            cs = self.ph_cos[:n].float()
+            sn = self.ph_sin[:n].float()
+            bound = rot_pairs(e, cs, sn).sum(0)                # Σ_k rot(θk)·ê
+            out = rms_unit(ka + bound).unsqueeze(0)
+        else:                                                   # rows
+            pos = self.pos_emb[:n].float() * c.oracle_ka_scale
+            out = rms_unit(ka[None] + pos + e)                 # [n, d]
+        return out.detach()
+
+    # ── candidats du readout position-conscient ─────────────────────────────
+    def candidates(self, bank, bank_mask):
+        """Banque [B,M,d] → candidats [B, M·n_cand, d] (+ masque étendu).
+
+        La position n'est PAS lue par un compteur dur : on expose tous les
+        candidats (ligne i, position j) au pointer, c'est son attention plate
+        qui apprend l'alignement position↔décodage.
+        """
+        c = self.cfg
+        if c.code in ("mean", "rows"):
+            return bank, bank_mask                 # la ligne EST le candidat
+        B, M, d = bank.shape
+        n = c.n_pos
+        if c.code == "chunk":
+            blk = d // n
+            blocks = bank.view(B, M, n, blk)
+            # dé-projection EXACTE du bloc j par P_j^T (frame orthonormé)
+            Pt = self.chunk_P.transpose(1, 2).to(bank.dtype)   # [n, blk, d]
+            cand = torch.einsum("bmjc,jcd->bmjd", blocks, Pt)
+        else:                                                   # phase
+            cs = self.ph_cos.to(bank.dtype)[None, None]        # [1,1,n,d/2]
+            sn = self.ph_sin.to(bank.dtype)[None, None]
+            cand = rot_pairs(bank[:, :, None, :], cs, -sn)     # rot(−θj)
+        cand = cand.reshape(B, M * n, d)
+        cm = None if bank_mask is None else \
+            bank_mask[:, :, None].expand(B, M, n).reshape(B, M * n)
+        return cand, cm
+
     # ── forward ─────────────────────────────────────────────────────────────
     def forward(self, ids, bank=None, bank_mask=None):
         x = self.embed(ids)
@@ -431,7 +622,9 @@ class ToyReadLM(nn.Module):
         x = self.norm_f(x)
         logits = x @ self.embed.weight.t()             # embeddings tiés
         if self.ptr is not None and bank is not None and bank.size(1) > 0:
-            logits = logits + self.ptr(x, bank, bank_mask, self.embed.weight)
+            # code == mean  → candidats = les lignes (chemin phase 1, inchangé)
+            cand, cmask = self.candidates(bank, bank_mask)
+            logits = logits + self.ptr(x, cand, cmask, self.embed.weight)
         return logits
 
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
@@ -507,13 +700,28 @@ class OracleEnv:
         return sl, int(seg["fact_attr"][0, 0]), int(seg["fact_val"][0, 0])
 
     def write(self, model: ToyReadLM, bank: list, seg: dict) -> list:
-        """FIFO de max_mem lignes ; les segs sans fait n'écrivent rien."""
+        """FIFO de max_mem lignes ; les segs sans fait n'écrivent rien.
+
+        `--code rows` appende PLUSIEURS lignes d'un coup (une par token de la
+        valeur) : le FIFO reste à max_mem, donc un fait long évince les
+        précédents. C'est le prix assumé de la borne haute.
+        """
         f = self.fact_of(seg)
         if f is None:
             return bank
-        code = model.oracle_code(f[0], f[1], self.val_tokens(f[2]))
-        bank = bank + [code]
+        rows = model.oracle_lines(f[0], f[1], self.val_tokens(f[2]))
+        bank = bank + list(rows)
         return bank[-self.max_mem:]
+
+    def value_group(self, slot: str | None, truth: str) -> str:
+        """Strate de la valeur gradée : `code` (slots code/ref/plate, valeur
+        arbitraire sans prior LM), `short` (≤2 tokens), `word` (3+ tokens
+        linguistiques). Prédiction phase 2 : mean n'ouvre que `short`,
+        phase/chunk/rows doivent ouvrir `code`."""
+        if slot in CODE_SLOTS:
+            return "code"
+        n = len(self.tok(" " + truth, add_special_tokens=False)["input_ids"])
+        return "short" if n <= 2 else "word"
 
 
 def pad_bank(banks: list, device, dtype=torch.float32):
@@ -596,8 +804,9 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     tours gradés, bras LIVE (banque) vs ABLATÉ (banque vide)."""
     model.eval()
     stream.rng = random.Random(seed)
-    live_ans, abl_ans, truths_all = [], [], []
+    live_ans, abl_ans, truths_all, groups = [], [], [], []
     dnll_num, dnll_den = 0.0, 0.0
+    gate_num, gate_den = 0.0, 0.0
     shown = []
     abl_txt = None                       # sans banque, le décodage est unique
     done = 0
@@ -609,6 +818,7 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         if not truths:
             continue                     # smalltalk : rien à grader
         done += 1
+        q_slots = (conv.get("info") or {}).get("q_slots") or []
         a_idx = [i for i, s in enumerate(conv["segs"]) if s["role"] == "assistant"]
         graded = set(a_idx[-len(truths):])
         bank: list = []
@@ -628,6 +838,12 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 if float(nl) > 0:
                     dnll_num += float(sa - sl)
                     dnll_den += float(nl)
+                # ouverture de la porte du pointer sur les tokens SUPERVISÉS
+                # (diagnostic du suspect « le modèle s'en sort au prior LM »)
+                g_ptr = getattr(model.ptr, "last_gate", None) if model.ptr else None
+                if g_ptr is not None and g_ptr.shape[:2] == W.shape:
+                    gate_num += float((g_ptr[..., 0].float() * W).sum())
+                    gate_den += float(W.sum())
                 if abl_txt is None:
                     abl_txt = tok.decode(model.greedy(a_open, None, None,
                                                       max_new, stop_id))
@@ -636,6 +852,8 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 live_ans.append(live)
                 abl_ans.append(abl_txt)
                 truths_all.append(tr)
+                groups.append(env.value_group(
+                    q_slots[qi] if qi < len(q_slots) else None, tr))
                 if len(shown) < n_show:
                     shown.append((prev.strip(), tr, live.strip(),
                                   abl_txt.strip()))
@@ -643,13 +861,25 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
             bank = env.write(model, bank, seg)
             prev = tok.decode(seg["input_ids"][0].tolist())
     model.train()
-    return {
+    out = {
         "grade_live": grade_recall(live_ans, truths_all) if truths_all else 0.0,
         "grade_abl": grade_recall(abl_ans, truths_all) if truths_all else 0.0,
         "dnll": dnll_num / max(dnll_den, 1.0),
         "n": len(truths_all),
         "show": shown,
+        "ptr_gate": (gate_num / gate_den) if gate_den > 0 else float("nan"),
     }
+    # grade PAR STRATE de valeur (short / word / code)
+    for gname in GROUPS:
+        idx = [i for i, x in enumerate(groups) if x == gname]
+        out[f"n_{gname}"] = len(idx)
+        out[f"grade_{gname}"] = (
+            grade_recall([live_ans[i] for i in idx],
+                         [truths_all[i] for i in idx]) if idx else float("nan"))
+        out[f"grade_{gname}_abl"] = (
+            grade_recall([abl_ans[i] for i in idx],
+                         [truths_all[i] for i in idx]) if idx else float("nan"))
+    return out
 
 
 # ── plomberie ────────────────────────────────────────────────────────────────
@@ -680,6 +910,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("config", nargs="?")
     ap.add_argument("--variant", choices=VARIANTS, default="r0")
+    ap.add_argument("--code", choices=CODES, default="mean",
+                    help="format du code de banque (phase 2, r3 seulement) ; "
+                         "mean = phase 1 inchangée")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -691,9 +924,19 @@ def main(argv=None):
         return
 
     assert a.config, "config YAML requise (ou --selftest)"
+    if a.code != "mean" and a.variant != "r3":
+        raise SystemExit(
+            f"--code {a.code} n'est supporté QUE par --variant r3 (banque en "
+            f"espace d'embedding + pointer nu). Les variantes r0/r1/r2 sont le "
+            f"contrôle de la phase 1 : lance-les sans --code (mean).")
     raw = load_yaml(a.config)              # le toy parse son YAML lui-même :
     t = dict(raw.get("training") or {})    # PAS de cfg_schema (trainer principal)
     mc = dict(raw.get("model") or {})
+    cb = dict(raw.get("code") or {})       # knobs de l'axe format de code
+    if "n_pos" in cb:
+        mc["n_pos"] = int(cb["n_pos"])
+    if "rope_base" in cb:
+        mc["rope_base"] = float(cb["rope_base"])
     device = a.device or t.get("device") or ("cuda" if torch.cuda.is_available()
                                              else "cpu")
     steps = int(a.steps or t.get("steps", 3000))
@@ -710,22 +953,31 @@ def main(argv=None):
     env = OracleEnv(tok, int(mc.get("max_mem", 8)))
 
     mc["variant"] = a.variant
+    mc["code"] = a.code
     mc["vocab_size"] = len(tok)
     cfg = ToyCfg(**mc)
     model = ToyReadLM(cfg, env.n_slots, env.n_attrs).to(device)
 
+    # phase 1 → <variant>/ (inchangé) ; phase 2 → <variant>_<code>/
+    run_name = a.variant if a.code == "mean" else f"{a.variant}_{a.code}"
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
-                            a.variant)
+                            run_name)
     os.makedirs(save_dir, exist_ok=True)
     csv_path = os.path.join(save_dir, "metrics.csv")
     new_csv = not os.path.exists(csv_path)
 
     pr = param_report(model)
-    print(f"=== toy_read_lab variante {a.variant} | device {device} ===",
-          flush=True)
+    print(f"=== toy_read_lab variante {a.variant} | code {a.code} | "
+          f"device {device} ===", flush=True)
     print(f"  cfg d_model {cfg.d_model} L {cfg.n_layers} H {cfg.n_heads} "
           f"mem_dim {cfg.mem_dim} M {cfg.max_mem} x_dim {cfg.x_dim} "
           f"vocab {cfg.vocab_size}", flush=True)
+    if a.code != "mean":
+        print(f"  code {a.code} : n_pos {cfg.n_pos} "
+              + (f"blk {cfg.d_model // cfg.n_pos} " if a.code == "chunk" else "")
+              + (f"rope_base {cfg.rope_base} " if a.code == "phase" else "")
+              + f"| candidats pointer {cfg.max_mem * cfg.n_cand} "
+              f"({cfg.max_mem}×{cfg.n_cand})", flush=True)
     print("  params : " + "  ".join(f"{k} {v/1e6:.2f}M" for k, v in pr.items()),
           flush=True)
     print(f"  read+pointer = {(pr['read']+pr['pointer'])/1e6:.2f}M "
@@ -786,6 +1038,10 @@ def main(argv=None):
                   f"(n={ev['n']}) | TRAIN grade live {tc['grade_live']:.3f} "
                   f"abl {tc['grade_abl']:.3f} Δnll {tc['dnll']:+.4f} "
                   f"(n={tc['n']})", flush=True)
+            print("    strates held-out : " + "  ".join(
+                f"{g} {ev['grade_' + g]:.3f} (n={ev['n_' + g]})"
+                for g in GROUPS) + f"  | porte pointer σ {ev['ptr_gate']:.4f}",
+                flush=True)
             for q, tr, lv, ab in ev["show"]:
                 print(f"    Q {q[:90]!r}\n      vérité {tr!r}\n"
                       f"      LIVE   {lv[:120]!r}\n      ABLATÉ {ab[:120]!r}",
@@ -796,13 +1052,23 @@ def main(argv=None):
                     w.writerow(["step", "loss", "grade_eval_live",
                                 "grade_eval_abl", "dnll_eval",
                                 "grade_train_live", "grade_train_abl",
-                                "dnll_train", "n_eval", "n_train", "sec"])
+                                "dnll_train", "n_eval", "n_train"]
+                               + [c for g in GROUPS for c in
+                                  (f"grade_eval_{g}", f"grade_eval_{g}_abl",
+                                   f"n_eval_{g}")]
+                               + ["ptr_gate", "sec"])
                     new_csv = False
+
+                def _f(x):
+                    return "" if x != x else f"{x:.4f}"   # NaN (strate vide)
                 w.writerow([step + 1, f"{loss:.5f}", f"{ev['grade_live']:.4f}",
                             f"{ev['grade_abl']:.4f}", f"{ev['dnll']:.5f}",
                             f"{tc['grade_live']:.4f}", f"{tc['grade_abl']:.4f}",
-                            f"{tc['dnll']:.5f}", ev["n"], tc["n"],
-                            f"{time.time()-t0:.0f}"])
+                            f"{tc['dnll']:.5f}", ev["n"], tc["n"]]
+                           + [v for g in GROUPS for v in
+                              (_f(ev[f"grade_{g}"]), _f(ev[f"grade_{g}_abl"]),
+                               ev[f"n_{g}"])]
+                           + [_f(ev["ptr_gate"]), f"{time.time()-t0:.0f}"])
             if ev["grade_live"] > best:
                 best = ev["grade_live"]
                 torch.save({"step": step + 1, "model": model.state_dict(),
@@ -811,6 +1077,36 @@ def main(argv=None):
     torch.save({"step": steps, "model": model.state_dict(),
                 "cfg": cfg.__dict__}, os.path.join(save_dir, "final.pt"))
     print(f"done — best grade held-out {best:.3f} | ckpt {save_dir}", flush=True)
+
+
+# ── round-trip ORACLE d'un format de code ────────────────────────────────────
+
+@torch.no_grad()
+def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
+                   val_tok: torch.Tensor) -> tuple:
+    """(top-1 exacts, positions testées) du décodage ORACLE d'un fait.
+
+    Pose les lignes du fait, construit les candidats du readout, et vérifie
+    pour chaque position j que `argmax(cand_j @ embed^T) == t_j`. C'est la
+    BORNE SUPÉRIEURE de ce que le pointer peut apprendre : si l'oracle
+    lui-même ne rend pas l'ordre, aucun read ne le rendra (le verdict de la
+    phase 1 en un chiffre).
+    """
+    cfg = model.cfg
+    lines = model.oracle_lines(slot_id, attr_id, val_tok)
+    cand, _ = model.candidates(lines.unsqueeze(0), None)      # [1, N, d]
+    E = model.embed.weight.float()
+    n = len(val_tok) if cfg.code == "mean" else min(len(val_tok), cfg.n_pos)
+    ok = 0
+    for j in range(n):
+        if cfg.code == "mean":
+            c = cand[0, 0]                    # une seule ligne, zéro position
+        elif cfg.code == "rows":
+            c = cand[0, j]                    # une ligne par token
+        else:
+            c = cand[0, j]                    # une ligne ⇒ candidats 0..n_pos-1
+        ok += int(int(torch.argmax(c.float() @ E.t())) == int(val_tok[j]))
+    return ok, n
 
 
 # ── self-test (CPU, dimensions minuscules) ───────────────────────────────────
@@ -959,10 +1255,101 @@ def _selftest() -> None:
         lg2 = mv(torch.randint(0, 512, (2, 6)), None, None)   # bras ablaté
         assert torch.isfinite(lg2).all()
 
+    # ════════════════ PHASE 2 : l'axe FORMAT DE CODE ════════════════════════
+    # 7. round-trip ORACLE par format (embeddings figés, vocab jouet 512).
+    #    d_model=256 / n_pos=8 = les dims RÉELLES du run (blocs chunk 32 dims).
+    def _mk(code, d=256, n_pos=8, vocab=512, base=0.0):
+        c = ToyCfg(vocab_size=vocab, d_model=d, n_layers=1, n_heads=4,
+                   mem_dim=d, variant="r3", max_seq_len=64, code=code,
+                   n_pos=n_pos, rope_base=base)
+        return ToyReadLM(c, env.n_slots, env.n_attrs).eval()
+
+    tok8 = torch.tensor([11, 77, 200, 41, 305, 9, 128, 460])   # 8 positions
+    rt = {}
+    for code in CODES:
+        m = _mk(code)
+        rt[code] = code_roundtrip(m, 3, 2, tok8)
+    for code in ("chunk", "phase", "rows"):
+        ok, n = rt[code]
+        assert n == 8, (code, n)
+        assert ok == n, (
+            f"round-trip {code} : seulement {ok}/{n} positions top-1 — le "
+            f"format ne porte pas l'ordre, l'expérience n'a pas de sens")
+    # `mean` : la démonstration du BUG de la phase 1 — deux valeurs ANAGRAMMES
+    # en tokens donnent la MÊME ligne, donc l'ordre est physiquement absent.
+    m_mean = _mk("mean")
+    perm = tok8[torch.tensor([3, 0, 5, 7, 1, 6, 2, 4])]
+    l1 = m_mean.oracle_lines(3, 2, tok8)
+    l2 = m_mean.oracle_lines(3, 2, perm)
+    assert torch.allclose(l1, l2, atol=1e-6), \
+        "mean : les anagrammes devraient collapser (sinon le diagnostic tombe)"
+    ok_mean, n_mean = rt["mean"]
+    assert ok_mean < n_mean, "mean ne devrait PAS décoder l'ordre"
+
+    # 8. lane vide ≡ ablaté, et forward fini, pour CHAQUE format
+    for code in CODES:
+        m = _mk(code, d=32, n_pos=4, vocab=512)
+        rows = m.oracle_lines(3, 2, tok8[:3])
+        bmix = torch.cat([torch.cat([rows[:1], torch.zeros(1, 32)])[None],
+                          torch.zeros(1, 2, 32)], dim=0)         # [2,2,32]
+        mmix = torch.tensor([[True, False], [False, False]])
+        ids = torch.randint(0, 512, (2, 6))
+        with torch.no_grad():
+            lg = m(ids, bmix, mmix)
+        assert torch.isfinite(lg).all(), f"NaN sur lane vide (code {code})"
+        with torch.no_grad():
+            i1 = torch.randint(0, 512, (1, 6))
+            a1 = m(i1, torch.zeros(1, 2, 32), torch.tensor([[False, False]]))
+            a2 = m(i1, None, None)
+        assert torch.allclose(a1, a2, atol=1e-5), \
+            f"lane vide != ablaté (code {code})"
+        # 8bis. porte du pointer FERMÉE à l'init : biais ≈ 0
+        b1 = rows[:1][None].expand(1, -1, -1)
+        cand, cm = m.candidates(b1, torch.ones(1, b1.size(1), dtype=torch.bool))
+        with torch.no_grad():
+            bias = m.ptr(torch.randn(1, 5, 32), cand, cm, m.embed.weight)
+        assert float(bias.abs().max()) < 1e-2, (code, float(bias.abs().max()))
+        assert m.ptr.last_gate is not None and \
+            float(m.ptr.last_gate.max()) < 1e-3, f"porte ouverte à l'init ({code})"
+
+    # 9. FIFO avec `rows` : un fait de 3 tokens = 3 lignes, cap à max_mem
+    m_rows = _mk("rows", d=32, n_pos=4, vocab=512)
+    assert m_rows.oracle_lines(3, 2, tok8[:3]).shape[0] == 3
+    # via l'env (FIFO réel, max_mem=8) : 3 faits de 3 tokens ⇒ 9 lignes → 8
+    env3 = OracleEnv(tok, 8)
+    env3.val_tokens = lambda vid: tok8[:3]
+    b = []
+    for k in range(3):
+        s = dict(seg_tpl)
+        s["fact_val"] = torch.full_like(seg_tpl["fact_val"], 1 + k)
+        b = env3.write(m_rows, b, s)
+    assert len(b) == 8, f"FIFO rows : {len(b)} lignes (attendu 8)"
+    last = list(m_rows.oracle_lines(int(seg_tpl["fact_slot"][0, 0]),
+                                    int(seg_tpl["fact_attr"][0, 0]), tok8[:3]))
+    for x, y in zip(b[-3:], last):
+        assert torch.equal(x, y), "FIFO rows : mauvaises lignes conservées"
+
+    # 10. r0/r1/r2 REFUSENT les nouveaux formats (message clair)
+    for var in ("r0", "r1", "r2"):
+        try:
+            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                   variant=var, code="phase", n_pos=4)
+        except AssertionError as e:
+            assert "r3" in str(e)
+        else:
+            raise AssertionError(f"{var} aurait dû refuser --code phase")
+
     print("toy_read_lab self-test: OK (write oracle déterministe & "
           "embedding-dépendant, FIFO 8, porte pointer fermée à l'init, "
           "masque CE assistant-seul, padding de banque inerte, "
           "4 variantes forward live+ablaté)")
+    print("  phase 2 — round-trip ORACLE (top-1 exacts / positions, vocab 512, "
+          "d_model 256, n_pos 8) : " +
+          "  ".join(f"{c} {rt[c][0]}/{rt[c][1]}" for c in CODES) +
+          "   [mean DOIT échouer : anagrammes ⇒ ligne identique]")
+    print("  phase 2 — lane vide ≡ ablaté & porte fermée pour les 4 formats, "
+          "FIFO rows (3 faits × 3 tokens ⇒ 8 lignes), r0/r1/r2 refusent "
+          "chunk/phase/rows")
 
 
 if __name__ == "__main__":
