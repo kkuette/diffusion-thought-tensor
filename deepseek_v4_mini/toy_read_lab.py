@@ -214,11 +214,19 @@ from .paths import load_yaml
 from .persona_chat_data import fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
-VARIANTS = ("r0", "r1", "r2", "r3", "r4")
+VARIANTS = ("r0", "r1", "r2", "r3", "r4", "r5")
 # r4 = INJECTION À SÉLECTION ORACLE : AUCUN module de read appris. Le groupe
 # toprows du fait interrogé est injecté en PRÉFIXE de pseudo-tokens et c'est le
 # backbone NU qui doit copier. Bras « le stack natif sait-il copier ? ».
-INJECT_VARIANTS = ("r4",)
+# r5 = r4 + RETRIEVER APPRIS : la sélection oracle est remplacée par un score
+# appris sur les lignes-clés résidentes. VERDICT r4 (phase 7) : strate `code`
+# 0.708 (n=106) — la citation exige le stack natif, il ne manque QUE la
+# sélection. PRÉDICTION INSCRITE AVANT LE RUN : plafond de r5 = 0.708 ×
+# recall@2 ; l'oracle des clés sépare à 100 %, donc un recall@2 < 0.9
+# incriminerait l'apprentissage de W_q, pas la géométrie.
+INJECT_VARIANTS = ("r4", "r5")
+# variantes dotées d'un RETRIEVER appris (W_q sur les lignes-clés).
+RETRIEVER_VARIANTS = ("r5",)
 # les variantes qui LISENT UNE BANQUE (r4 n'en a pas : il lit une injection).
 BANK_VARIANTS = ("r0", "r1", "r2", "r3")
 # mélange des lignes par le readout de groupe (cf. GroupReadout) :
@@ -338,9 +346,23 @@ class ToyCfg:
                               # (GroupReadout) ajoutée à la loss. 0 = OFF
                               # (défaut, aucun terme n'est ajouté). > 0 pousse p
                               # vers un choix DUR d'une ligne du groupe.
-    # ── axe INJECTION (variante r4) ─────────────────────────────────────────
+    # ── axe INJECTION (variantes r4 / r5) ───────────────────────────────────
     inject_sep_id: int = 0    # token du vocab posé ENTRE le préfixe injecté et
                               # le tour réel. Renseigné par main() (`<blank>`).
+    retr_ce: float = 1.0      # r5 : coefficient de la CE AUXILIAIRE qui
+                              # supervise le retriever (cible = l'index du
+                              # groupe porteur du fait interrogé). Le retriever
+                              # apprend PAR CE CANAL, pas par la loss LM.
+    retr_topk: int = 2        # r5 : nombre de groupes injectés À L'ÉVAL (top-k
+                              # DUR du retriever). À l'ENTRAÎNEMENT l'injection
+                              # reste le groupe ORACLE (cf. ToyReadLM.forward).
+    retr_detach: bool = True  # r5 : la CE du retriever ne remonte PAS dans le
+                              # backbone (h_query est détaché). W_q est alors le
+                              # SEUL paramètre que ce canal entraîne — c'est ce
+                              # qui rend la prédiction lisible (« si recall@2 <
+                              # 0.9, le goulot est W_q »). False = laisser la
+                              # sélection remodeler le trunk, au risque de
+                              # déranger le circuit de copie déjà acquis.
     row_pos_tag: bool = True  # `toprows` : marquer la ligne de contenu j par
                               # pos_emb[j] × oracle_ka_scale (0.2), comme le
                               # format `rows` dont le round-trip était à 100 %.
@@ -385,11 +407,15 @@ class ToyCfg:
             # et ce préfixe EST le groupe toprows (mêmes tokens, même sélection
             # SIF). Sans ce code il n'y aurait rien à injecter.
             assert self.code == "toprows", (
-                f"--variant r4 injecte le GROUPE toprows : il exige "
-                f"--code toprows (reçu --code {self.code})")
+                f"--variant {self.variant} injecte le GROUPE toprows : il "
+                f"exige --code toprows (reçu --code {self.code})")
             assert self.write_mode == "fact", (
-                "--variant r4 est un bras fact-only (le régime `every` n'a pas "
-                "de sens : r4 n'a pas de banque, seulement une injection)")
+                f"--variant {self.variant} est un bras fact-only (le régime "
+                f"`every` n'a pas de sens ici : la banque n'est lue que par "
+                f"l'injection)")
+        if self.variant in RETRIEVER_VARIANTS:
+            assert self.retr_ce >= 0.0, self.retr_ce
+            assert self.retr_topk >= 1, self.retr_topk
         if self.code != "mean":
             # les nouveaux formats supposent banque == espace d'embedding et
             # pointer nu : c'est la définition de r3, on ne les porte pas
@@ -951,6 +977,44 @@ class GroupReadout(nn.Module):
         return g * bias
 
 
+# ── r5 : RETRIEVER appris sur les lignes-clés ────────────────────────────────
+
+class Retriever(nn.Module):
+    """Score de SÉLECTION d'un groupe de banque, appris en SUPERVISÉ.
+
+        score_g = (W_q · h_query) · clé_g / √d × exp(log_temp)
+
+    `h_query` est l'état caché du DERNIER token du SEGMENT USER (la question),
+    pris au forward de CE segment — jamais un token de la réponse. C'est le
+    point critique du bras : en teacher-forcing, un état pris dans la réponse
+    contiendrait déjà la valeur à retrouver, et le retriever apprendrait à lire
+    la réponse au lieu de la question.
+
+    W_q est ZÉRO-INIT : au step 0 tous les scores valent 0, le softmax est
+    uniforme (CE = log G) et le gradient de la CE vaut h ⊗ clé ≠ 0 — le module
+    n'est pas mort, il démarre simplement sans préférence.
+    """
+
+    def __init__(self, cfg: ToyCfg):
+        super().__init__()
+        d = cfg.d_model
+        self.d = d
+        self.wq = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.wq.weight)
+        # température apprise (init 1.0) : la CE peut vouloir durcir le softmax
+        # sans que W_q ait à gonfler sa norme.
+        self.log_temp = nn.Parameter(torch.zeros(1))
+
+    def forward(self, h, keys, key_mask=None):
+        """h [n, d] ; keys [n, G, d] ; key_mask [n, G] → scores [n, G]."""
+        q = self.wq(h)                                        # [n, d]
+        sc = torch.einsum("nd,ngd->ng", q, keys) / math.sqrt(self.d)
+        sc = sc * self.log_temp.exp()
+        if key_mask is not None:
+            sc = sc.masked_fill(~key_mask, float("-inf"))
+        return sc
+
+
 # ── le modèle jouet ──────────────────────────────────────────────────────────
 
 class ToyBlock(nn.Module):
@@ -1015,6 +1079,8 @@ class ToyReadLM(nn.Module):
         # est EXACTEMENT l'embedding brut du token).
         if cfg.variant in INJECT_VARIANTS:
             self.inject_type = nn.Parameter(torch.zeros(cfg.d_model))
+        self.retr = (Retriever(cfg) if cfg.variant in RETRIEVER_VARIANTS
+                     else None)
         if cfg.uses_ptr:
             # les PACK ont leur PROPRE readout (deux étages) ; tous les autres
             # codes gardent PointerReadout à l'identique (rétro-compat bit-à-bit
@@ -1414,14 +1480,18 @@ class ToyReadLM(nn.Module):
         return cand, cm
 
     # ── forward ─────────────────────────────────────────────────────────────
-    def forward(self, ids, bank=None, bank_mask=None, inject=None):
-        """`inject` [B, k] (variante r4) : les tokens du groupe toprows du fait
-        interrogé, posés en PRÉFIXE de pseudo-tokens devant le tour.
+    def forward(self, ids, bank=None, bank_mask=None, inject=None,
+                return_hidden=False):
+        """`inject` [B, k] (UN groupe, r4) ou [B, G, k] (G groupes, r5) : les
+        tokens des groupes toprows injectés en PRÉFIXE de pseudo-tokens.
 
-        Layout (spec) : les k lignes injectées prennent les positions RoPE
-        0..k−1, le séparateur la position k, et le tour RÉEL démarre à k+2 —
-        la position k+1 reste VIDE, c'est un trou délibéré qui marque la
-        frontière (une position qu'aucun token n'occupe jamais).
+        Layout (spec) : chaque groupe pose ses k tokens PUIS un séparateur, donc
+        le préfixe fait G·(k+1) positions RoPE contiguës (0..G·(k+1)−1), et le
+        tour RÉEL démarre une position PLUS LOIN — la position G·(k+1) reste
+        VIDE, trou délibéré qui marque la frontière. À G=1 c'est exactement le
+        layout de r4 : injecté 0..k−1, séparateur k, tour réel à k+2.
+        L'ordre des groupes est celui que l'appelant donne (r5 : score
+        DÉCROISSANT du retriever).
 
         Les lignes injectées sont les embeddings BRUTS, NON RMS-normés : la
         norme porte de l'information, et la RMS-norm de `toprows_rows` était une
@@ -1438,14 +1508,17 @@ class ToyReadLM(nn.Module):
         if inject is not None:
             assert self.cfg.variant in INJECT_VARIANTS, self.cfg.variant
             B, T = ids.shape
-            k = inject.shape[1]
-            pre = self.embed(inject) + self.inject_type    # [B,k,d], NON normé
-            sep = self.embed(torch.full((B, 1), int(self.cfg.inject_sep_id),
+            inj = inject if inject.dim() == 3 else inject[:, None, :]
+            G, k = inj.shape[1], inj.shape[2]
+            pre = self.embed(inj) + self.inject_type    # [B,G,k,d], NON normé
+            sep = self.embed(torch.full((B, G, 1), int(self.cfg.inject_sep_id),
                                         dtype=torch.long, device=ids.device))
-            x = torch.cat([pre, sep, x], dim=1)
-            npre = k + 1
-            pos = torch.cat([torch.arange(k + 1, device=ids.device),
-                             torch.arange(T, device=ids.device) + k + 2])
+            # [groupe0 | sép | groupe1 | sép | …] puis le tour, un cran plus loin
+            x = torch.cat([torch.cat([pre, sep], dim=2).reshape(B, G * (k + 1),
+                                                               -1), x], dim=1)
+            npre = G * (k + 1)
+            pos = torch.cat([torch.arange(npre, device=ids.device),
+                             torch.arange(T, device=ids.device) + npre + 1])
         for blk in self.blocks:
             x = blk(x, bank, bank_mask, pos)
         if npre:
@@ -1467,7 +1540,10 @@ class ToyReadLM(nn.Module):
                 # code == mean  → candidats = les lignes (chemin phase 1, inchangé)
                 cand, cmask = self.candidates(bank, bank_mask)
                 logits = logits + self.ptr(x, cand, cmask, self.embed.weight)
-        return logits
+        # r5 : l'état caché sert de QUERY au retriever (pris sur le segment
+        # USER, cf. Retriever) — on le rend à la demande plutôt que de refaire
+        # une passe de trunk.
+        return (logits, x) if return_hidden else logits
 
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
     @torch.no_grad()
@@ -1637,6 +1713,40 @@ class OracleEnv:
         la réponse est comptée à part — sinon r4 s'offrirait une mémoire
         infinie que les autres bras n'ont pas.
         """
+        plan = self.retr_plan(model, conv)
+        out = {i: e["res"][e["gidx"]][2] for i, e in plan.items()
+               if e["gidx"] is not None}
+        return out, sum(1 for e in plan.values() if e["gidx"] is None)
+
+    def retr_plan(self, model: ToyReadLM, conv: dict) -> dict:
+        """L'ÉTAT DE BANQUE vu par chaque segment de RÉPONSE gradé.
+
+        {index de seg → {"uidx": index du segment USER qui pose la question,
+                         "res": [(slot, attr, tokens)] des groupes RÉSIDENTS,
+                         "gidx": index du groupe PORTEUR dans `res` — le write
+                                 le PLUS RÉCENT du slot interrogé, celui dont
+                                 la valeur est la vérité — ou None si le fait
+                                 est déjà sorti du FIFO,
+                         "pos":  TOUS les index de `res` portant ce slot}}
+
+        POURQUOI `pos` : la clé d'un groupe est `pack_key[slot, attr]`, donc
+        deux writes du MÊME slot (fait MIS À JOUR, p_update=0.15) ont des clés
+        RIGOUREUSEMENT IDENTIQUES. Une CE mono-cible sur `gidx` serait alors
+        non seulement inapprenable mais à gradient EXACTEMENT NUL (mesuré : les
+        deux clés à cos 1.0 se compensent). La CE est donc MULTI-POSITIVE — elle
+        pousse la masse sur l'ENSEMBLE des groupes du bon slot — et c'est la
+        RÉCENCE, pas le score, qui départage à l'injection (cf. evaluate).
+
+        C'est la source unique du FIFO rejoué : `inject_plan` (r4) n'en garde
+        que les tokens du groupe porteur, et r5 s'en sert pour SCORER les clés
+        résidentes (le retriever) puis injecter ses top-k.
+
+        On ne matérialise PAS les lignes de la banque : la ligne-clé d'un groupe
+        est exactement `model.pack_key[slot, attr]` (cf. toprows_rows, qui la
+        pose telle quelle) et ses lignes de contenu sont exactement les tokens
+        retenus. Aucun module ne lit le CONTENU de la banque en r4/r5 — le
+        matérialiser serait un tenseur mort de 8×14×512.
+        """
         truths = (conv.get("info") or {}).get("truths") or []
         q_slots = (conv.get("info") or {}).get("q_slots") or []
         a_idx = [i for i, s in enumerate(conv["segs"])
@@ -1644,28 +1754,27 @@ class OracleEnv:
         graded = a_idx[-len(truths):] if truths else []
         qpos = {ix: qi for qi, ix in enumerate(graded)}
         plan: dict = {}
-        absent = 0
-        fifo: list = []                      # [(slot_id, tokens)] résidents
+        fifo: list = []                # [(slot_id, attr_id, tokens)] résidents
+        last_user = 0
         for i, seg in enumerate(conv["segs"]):
+            if seg["role"] == "user":
+                last_user = i
             qi = qpos.get(i)
             if qi is not None:
                 sl = self.slot_ids.get(q_slots[qi]) if qi < len(q_slots) else None
-                hit = None
-                for s_, tk in reversed(fifo):     # le write le PLUS RÉCENT
-                    if s_ == sl:
-                        hit = tk
-                        break
-                if hit is None:
-                    absent += 1
-                else:
-                    plan[i] = hit
+                pos = [g for g, r in enumerate(fifo) if r[0] == sl]
+                plan[i] = {"uidx": last_user, "res": list(fifo),
+                           # le PLUS RÉCENT porte la vérité (les précédents sont
+                           # des versions périmées du même slot)
+                           "gidx": pos[-1] if pos else None, "pos": pos}
             f = self.fact_of(seg)
             if f is not None:
                 # TAILLE FIXE : les plans d'un batch s'empilent, ils doivent
                 # tous faire top_k (cf. toprows_sel_fixed).
-                fifo.append((f[0], model.toprows_sel_fixed(self.seg_tokens(seg))))
+                fifo.append((f[0], f[1],
+                             model.toprows_sel_fixed(self.seg_tokens(seg))))
                 fifo = fifo[-self.max_mem:]
-        return plan, absent
+        return plan
 
     def value_group(self, slot: str | None, truth: str) -> str:
         """Strate de la valeur gradée : `code` (slots code/ref/plate, valeur
@@ -1717,6 +1826,40 @@ def seg_ce(logits, ids, w):
     return (ce * ww).sum(), ww.sum()
 
 
+# ── r5 : plomberie du retriever ──────────────────────────────────────────────
+
+def query_hidden(model, segs, device, max_len):
+    """h_query [n, d] : l'état caché du DERNIER token de chaque segment USER.
+
+    Le forward est fait SANS banque ni injection : c'est la question seule qui
+    doit décider quel groupe aller chercher. Et c'est le segment USER — jamais
+    la réponse : en teacher-forcing, un état pris dans la réponse contiendrait
+    déjà la valeur, et le retriever apprendrait à lire ce qu'il est censé
+    retrouver.
+    """
+    X, _ = pad_segs(segs, device, max_len)
+    lens = [min(int(s["input_ids"][0].numel()), max_len) for s in segs]
+    _, h = model(X, None, None, return_hidden=True)
+    idx = torch.tensor([n - 1 for n in lens], device=device)
+    return h[torch.arange(len(segs), device=device), idx]
+
+
+def retr_scores(model, h, entries):
+    """(scores [n, G], masque [n, G]) sur les groupes RÉSIDENTS de chaque
+    entrée. Les banques de tailles différentes sont padées à droite et masquées
+    à −inf. La clé d'un groupe est `pack_key[slot, attr]` — exactement la ligne
+    0 que la banque matérialisée porterait (cf. retr_plan)."""
+    n = len(entries)
+    G = max(max(len(e["res"]) for e in entries), 1)
+    keys = torch.zeros(n, G, model.cfg.d_model, device=h.device, dtype=h.dtype)
+    mask = torch.zeros(n, G, dtype=torch.bool, device=h.device)
+    for i, e in enumerate(entries):
+        for g, (sl, at, _) in enumerate(e["res"]):
+            keys[i, g] = model.pack_key[sl, at].to(h.dtype)
+            mask[i, g] = True
+    return model.retr(h, keys, mask), mask
+
+
 # ── entraînement ─────────────────────────────────────────────────────────────
 
 def train_step(model, env, convs, device, max_len, amp, scale_by):
@@ -1733,7 +1876,18 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
     """
     cfg = model.cfg
     r4 = cfg.variant in INJECT_VARIANTS
-    plans = [env.inject_plan(model, c)[0] for c in convs] if r4 else None
+    r5 = cfg.variant in RETRIEVER_VARIANTS
+    # r5 : l'ÉTAT DE BANQUE par réponse (clés résidentes + index du vrai
+    # groupe) ; r4 : seulement les tokens du groupe oracle.
+    rplans = [env.retr_plan(model, c) for c in convs] if r5 else None
+    plans = ([{i: e["res"][e["gidx"]][2] for i, e in p.items()
+               if e["gidx"] is not None} for p in rplans] if r5
+             else [env.inject_plan(model, c)[0] for c in convs] if r4 else None)
+    # normalisation de la CE auxiliaire : une MOYENNE sur les réponses
+    # supervisées du pas, pour qu'elle ne dépende pas du nombre de segs (la
+    # loss LM est elle aussi normalisée par le total de tokens du pas).
+    n_tgt = (sum(1 for p in rplans for e in p.values()
+                 if e["gidx"] is not None) if r5 else 0)
     ent_c = float(cfg.pos_entropy) if isinstance(model.ptr, GroupReadout) else 0.0
     banks = [[] for _ in convs]
     total_w = sum(float(s["loss_mask"][0][1:max_len].sum())
@@ -1767,12 +1921,36 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
                                 enabled=amp):
                 logits = model(X, bank, bmask, inject=inj)
             s, n = seg_ce(logits, X, W)
-            if float(n) > 0:
-                obj = s / total_w * scale_by
-                if ent_c > 0 and model.ptr.last_pos_ent is not None:
-                    # pousse la porte-position vers un choix DUR d'une ligne
-                    obj = obj + ent_c * model.ptr.last_pos_ent
+            obj = s / total_w * scale_by if float(n) > 0 else None
+            if obj is not None and ent_c > 0 and \
+                    model.ptr.last_pos_ent is not None:
+                # pousse la porte-position vers un choix DUR d'une ligne
+                obj = obj + ent_c * model.ptr.last_pos_ent
+            if r5 and has_inj and cfg.retr_ce > 0:
+                # ── CE AUXILIAIRE : le retriever apprend en SUPERVISÉ ───────
+                # (l'env connaît le groupe porteur), jamais par le canal LM.
+                ent = [rplans[i][j] for i in sub]
+                hq = query_hidden(model, [convs[i]["segs"][e["uidx"]]
+                                          for i, e in zip(sub, ent)],
+                                  device, max_len)
+                if cfg.retr_detach:
+                    hq = hq.detach()      # W_q = le SEUL apprenant de ce canal
+                sc, _ = retr_scores(model, hq, ent)
+                # CE MULTI-POSITIVE : −log Σ_{g ∈ positifs} p_g. Les writes
+                # successifs d'un MÊME slot ont la même clé (cf. retr_plan) —
+                # une cible unique y aurait un gradient exactement nul.
+                sc = sc.float()
+                pmask = torch.zeros_like(sc, dtype=torch.bool)
+                for r, e in enumerate(ent):
+                    pmask[r, e["pos"]] = True
+                aux = (torch.logsumexp(sc, -1)
+                       - torch.logsumexp(sc.masked_fill(~pmask, float("-inf")),
+                                         -1)).sum()
+                aux = cfg.retr_ce * aux / max(n_tgt, 1)
+                obj = aux if obj is None else obj + aux
+            if obj is not None:
                 obj.backward()
+            if float(n) > 0:
                 loss_sum += float(s.detach())
                 tok_sum += float(n)
         if not r4:                       # r4 n'a pas de banque
@@ -1795,9 +1973,12 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     """
     model.eval()
     r4 = model.cfg.variant in INJECT_VARIANTS
+    r5 = model.cfg.variant in RETRIEVER_VARIANTS
     stream.rng = random.Random(seed)
     live_ans, abl_ans, truths_all, groups = [], [], [], []
     resident = []                        # fait encore en banque ? (aligné)
+    hit_sel = []                         # r5 : le VRAI groupe est-il injecté ?
+    r_at1 = r_at2 = r_den = 0            # r5 : recall@1 / recall@2 du retriever
     n_absent = 0                         # r4 : faits SORTIS du FIFO (0 inject)
     ages = []                            # writes entre le fait et sa query
     dnll_num, dnll_den = 0.0, 0.0
@@ -1826,14 +2007,46 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
         # déjà évincés au moment de la question.
         wcount = 0
         slot_w: dict = {}
-        plan = env.inject_plan(model, conv)[0] if r4 else {}
+        rplan = env.retr_plan(model, conv) if r5 else {}
+        plan = ({} if r5 else env.inject_plan(model, conv)[0]) if r4 else {}
         for i, seg in enumerate(conv["segs"]):
             X = seg["input_ids"][:, :max_len].to(device)
             W = seg["loss_mask"][:, :max_len].to(device)
             b, bm = pad_bank([bank], device)
             if i in graded:
                 inj = None
-                if r4:
+                sel_ok = None
+                if r5:
+                    # ── SÉLECTION APPRISE : top-k DUR du retriever ──────────
+                    # La query est la QUESTION (segment user), pas la réponse.
+                    e = rplan.get(i)
+                    if e is not None and e["res"]:
+                        hq = query_hidden(model,
+                                          [conv["segs"][e["uidx"]]],
+                                          device, max_len)
+                        sc, _ = retr_scores(model, hq, [e])
+                        nk = min(model.cfg.retr_topk, len(e["res"]))
+                        # tri STABLE sur les groupes pris du PLUS RÉCENT au plus
+                        # ancien : à score ÉGAL — le cas EXACT de deux writes du
+                        # même slot, qui partagent leur clé — c'est le plus
+                        # récent qui passe devant, et c'est lui qui porte la
+                        # vérité. La récence est le seul discriminant que la clé
+                        # ne donne pas.
+                        rec = torch.arange(len(e["res"]) - 1, -1, -1,
+                                           device=sc.device)
+                        order = torch.argsort(-sc[0][rec], stable=True)
+                        top = [int(rec[o]) for o in order[:nk]]
+                        # ordre = score DÉCROISSANT
+                        inj = torch.stack([e["res"][g][2] for g in top]
+                                          )[None].to(device)
+                        if e["gidx"] is None:
+                            n_absent += 1          # fait déjà sorti du FIFO
+                        else:
+                            r_den += 1
+                            r_at1 += int(top[0] == e["gidx"])
+                            r_at2 += int(e["gidx"] in top)
+                            sel_ok = e["gidx"] in top
+                elif r4:
                     tk = plan.get(i)
                     if tk is None:
                         n_absent += 1     # fait ÉVINCÉ : aucune injection
@@ -1870,7 +2083,13 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                 # True  = le fait est encore dans le FIFO au moment de la query
                 # False = ÉVINCÉ (le read ne peut structurellement plus répondre)
                 # None  = inconnue (fait jamais écrit dans cette conv)
-                if r4:
+                hit_sel.append(sel_ok)
+                if r5:
+                    # « résident » en r5 = le VRAI groupe a été injecté (la
+                    # sélection a réussi) — c'est la condition sous laquelle
+                    # r4 avait mesuré 0.708.
+                    resident.append(bool(sel_ok))
+                elif r4:
                     resident.append(inj is not None)
                 elif sid in slot_w:
                     age_i = wcount - slot_w[sid]
@@ -1919,6 +2138,18 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     out["grade_resident_abl"] = (
         grade_recall([abl_ans[i] for i in ridx],
                      [truths_all[i] for i in ridx]) if ridx else float("nan"))
+    # ── r5 : LA DÉCOMPOSITION sélection vs copie ────────────────────────────
+    # recall@k = le retriever a-t-il mis le vrai groupe dans ce qu'il injecte ;
+    # grade|raté = ce que le modèle rend quand on lui a injecté les MAUVAIS
+    # groupes (doit tomber au niveau ablaté, sinon il répond au prior).
+    out["retr_r1"] = (r_at1 / r_den) if r_den else float("nan")
+    out["retr_r2"] = (r_at2 / r_den) if r_den else float("nan")
+    out["n_retr"] = r_den
+    midx = [i for i, x in enumerate(hit_sel) if x is False]
+    out["n_miss"] = len(midx)
+    out["grade_miss"] = (
+        grade_recall([live_ans[i] for i in midx],
+                     [truths_all[i] for i in midx]) if midx else float("nan"))
     # grade PAR STRATE de valeur (short / word / code)
     for gname in GROUPS:
         idx = [i for i, x in enumerate(groups) if x == gname]
@@ -1989,6 +2220,10 @@ def main(argv=None):
                          "superposition des lignes puis UNE projection "
                          "(défaut) ; mos = une distribution PAR LIGNE puis "
                          "mixture (aucun token hybride possible)")
+    ap.add_argument("--retr-ce", type=float, default=None, dest="retr_ce",
+                    help="r5 : coefficient de la CE auxiliaire du retriever")
+    ap.add_argument("--retr-topk", type=int, default=None, dest="retr_topk",
+                    help="r5 : nombre de groupes injectés À L'ÉVAL (top-k dur)")
     ap.add_argument("--final-eval-convs", type=int, default=None,
                     dest="final_eval_convs",
                     help="surcharge training.final_eval_convs (passe d'éval "
@@ -2031,6 +2266,14 @@ def main(argv=None):
         mc["row_pos_tag"] = bool(cb["row_pos_tag"])
     if "readout_mix" in cb:
         mc["readout_mix"] = str(cb["readout_mix"])
+    for key, cast in (("retr_ce", float), ("retr_topk", int),
+                      ("retr_detach", bool)):
+        if key in cb:
+            mc[key] = cast(cb[key])
+    if a.retr_ce is not None:              # la CLI gagne sur le YAML
+        mc["retr_ce"] = float(a.retr_ce)
+    if a.retr_topk is not None:
+        mc["retr_topk"] = int(a.retr_topk)
     if "pos_entropy" in cb:
         mc["pos_entropy"] = float(cb["pos_entropy"])
     if a.readout_mix is not None:          # la CLI gagne sur le YAML
@@ -2174,13 +2417,36 @@ def main(argv=None):
           f"appariement de budget entre variantes via model.x_dim (référence "
           f"= le hypernetwork fast-weight de r0 ; r3 reste structurellement "
           f"plus léger, sa V n'est pas projetée).", flush=True)
+    if cfg.variant in RETRIEVER_VARIANTS:
+        print(f"  RETRIEVER APPRIS (r5) : la sélection oracle de r4 est "
+              f"remplacée par score_g = (W_q·h_query)·clé_g/√d — W_q "
+              f"zéro-init, {cfg.d_model**2 + 1:,} params, SEUL module "
+              f"appris du bras. h_query = état caché du DERNIER token du "
+              f"SEGMENT USER (jamais la réponse : ce serait la fuite de "
+              f"teacher-forcing). CE auxiliaire supervisée coef "
+              f"{cfg.retr_ce:g}"
+              + (" (h_query DÉTACHÉ : W_q apprend seul)" if cfg.retr_detach
+                 else " (gradient RENVOYÉ dans le backbone)")
+              + f". ENTRAÎNEMENT : injection du groupe ORACLE (le circuit de "
+              f"copie s'entraîne sur du vrai). ÉVAL : top-{cfg.retr_topk} DUR "
+              f"du retriever ⇒ MISMATCH train/éval ASSUMÉ en v1 (repli si le "
+              f"gap est énorme : anneal oracle→prédit).", flush=True)
+        print(f"  PRÉDICTION (inscrite avant le run) : plafond = 0.708 "
+              f"(grade|vrai-groupe de r4, strate code) × recall@{cfg.retr_topk}. "
+              f"L'oracle des clés sépare à 100 %, donc un recall@"
+              f"{cfg.retr_topk} < 0.9 incrimine l'apprentissage de W_q, PAS la "
+              f"géométrie.", flush=True)
     if cfg.variant in INJECT_VARIANTS:
         print(f"  INJECTION À SÉLECTION ORACLE : AUCUN module de read appris "
               f"(ni cross-attn, ni pointer) — le backbone NU lit un préfixe de "
-              f"{cfg.top_k} pseudo-tokens (embeddings BRUTS, non normés, + un "
-              f"vecteur de type appris), séparateur id {cfg.inject_sep_id}, "
-              f"positions RoPE 0..{cfg.top_k - 1} puis tour réel décalé de "
-              f"{cfg.top_k + 2}. ABLATÉ = le même tour SANS préfixe. "
+              f"G×{cfg.top_k} pseudo-tokens (embeddings BRUTS, non normés, + "
+              f"un vecteur de type appris), séparateur id {cfg.inject_sep_id} "
+              f"après CHAQUE groupe, positions RoPE contiguës 0..G×"
+              f"{cfg.top_k + 1}−1 puis tour réel un cran plus loin (trou "
+              f"délibéré). G = 1 (oracle) à l'entraînement"
+              + (f", {cfg.retr_topk} à l'éval." if cfg.variant in
+                 RETRIEVER_VARIANTS else " et à l'éval.")
+              + " ABLATÉ = le même tour SANS préfixe. "
               f"PRIVILÈGE DÉCLARÉ : la sélection du groupe est l'oracle, et "
               f"l'injection est teacher-forcée à l'entraînement (aucun "
               f"curriculum de copie in-context).", flush=True)
@@ -2251,6 +2517,17 @@ def main(argv=None):
                 f"{g} {ev['grade_' + g]:.3f} (n={ev['n_' + g]})"
                 for g in GROUPS) + f"  | porte pointer σ {ev['ptr_gate']:.4f}",
                 flush=True)
+            if cfg.variant in RETRIEVER_VARIANTS:
+                # LA DÉCOMPOSITION du bras : sélection (recall) × copie
+                # (grade | vrai groupe injecté). Le grade | RATÉ dit ce que le
+                # modèle invente quand on lui injecte les mauvais groupes.
+                print(f"    retriever : recall@1 {ev['retr_r1']:.3f} "
+                      f"recall@{cfg.retr_topk} {ev['retr_r2']:.3f} "
+                      f"(n={ev['n_retr']}) | grade | VRAI GROUPE injecté "
+                      f"{ev['grade_resident']:.3f} (n={ev['n_resident']}) "
+                      f"vs | RATÉ {ev['grade_miss']:.3f} "
+                      f"(n={ev['n_miss']}) | plafond attendu "
+                      f"{0.708 * ev['retr_r2']:.3f}", flush=True)
             if cfg.write_mode == "every":
                 # RÉGIME RÉEL : combien de writes séparent le fait de sa query,
                 # et quelle fraction des faits gradés est DÉJÀ ÉVINCÉE du FIFO.
@@ -2321,6 +2598,14 @@ def main(argv=None):
         print("    [final] strates : " + "  ".join(
             f"{g} {fv['grade_' + g]:.3f} (n={fv['n_' + g]})" for g in GROUPS)
             + f"  | porte pointer σ {fv['ptr_gate']:.4f}", flush=True)
+        if cfg.variant in RETRIEVER_VARIANTS:
+            print(f"    [final] retriever : recall@1 {fv['retr_r1']:.3f} "
+                  f"recall@{cfg.retr_topk} {fv['retr_r2']:.3f} "
+                  f"(n={fv['n_retr']}) | grade | VRAI GROUPE {fv['grade_resident']:.3f} "
+                  f"(n={fv['n_resident']}) vs | RATÉ {fv['grade_miss']:.3f} "
+                  f"(n={fv['n_miss']}) | plafond attendu "
+                  f"{0.708 * fv['retr_r2']:.3f} (0.708 × recall@"
+                  f"{cfg.retr_topk})", flush=True)
         if cfg.write_mode == "every" or cfg.variant in INJECT_VARIANTS:
             lab = ("injecté" if cfg.variant in INJECT_VARIANTS
                    else "NON ÉVINCÉ")
@@ -2335,7 +2620,8 @@ def main(argv=None):
             w = csv.writer(f)
             cols = ["n_convs", "grade_live", "grade_live_se", "grade_abl",
                     "dnll", "n", "grade_resident", "grade_resident_abl",
-                    "n_resident", "n_absent", "age_evicted"] \
+                    "n_resident", "n_absent", "age_evicted",
+                    "retr_r1", "retr_r2", "n_retr", "grade_miss", "n_miss"] \
                 + [c for g in GROUPS for c in
                    (f"grade_{g}", f"grade_{g}_abl", f"n_{g}")] + ["ptr_gate"]
             w.writerow(cols)
@@ -2346,7 +2632,9 @@ def main(argv=None):
                         _g(fv["grade_abl"]), _g(fv["dnll"]), fv["n"],
                         _g(fv["grade_resident"]), _g(fv["grade_resident_abl"]),
                         fv["n_resident"], fv["n_absent"],
-                        _g(fv["age_evicted"])]
+                        _g(fv["age_evicted"]), _g(fv["retr_r1"]),
+                        _g(fv["retr_r2"]), fv["n_retr"], _g(fv["grade_miss"]),
+                        fv["n_miss"]]
                        + [v for g in GROUPS for v in
                           (_g(fv[f"grade_{g}"]), _g(fv[f"grade_{g}_abl"]),
                            fv[f"n_{g}"])] + [_g(fv["ptr_gate"])])
@@ -3423,6 +3711,171 @@ def _selftest() -> None:
     assert m_r4b.inject_type.grad is not None, \
         "aucun gradient n'a atteint l'injection : rien n'a été injecté"
 
+    # ═══ PHASE 8 : r5, RETRIEVER APPRIS ═════════════════════════════════════
+    torch.manual_seed(20260805)
+    c_r5 = ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                  mem_dim=64, variant="r5", max_seq_len=256, code="toprows",
+                  seg_n_pos=8, sif_a=A_SIF, top_k=4, inject_sep_id=5,
+                  retr_topk=2)
+    m_r5 = ToyReadLM(c_r5, env.n_slots, env.n_attrs, sif_w=_sifw())
+    # 20a. le retriever est le SEUL module appris en plus (W_q zéro-init) et
+    #      il n'y a toujours AUCUN read de contenu
+    assert m_r5.ptr is None and all(b.read is None for b in m_r5.blocks)
+    assert float(m_r5.retr.wq.weight.abs().max()) == 0.0, "W_q non zéro-init"
+    assert sorted(n for n, _ in m_r5.named_parameters()
+                  if "retr" in n or "inject" in n) == \
+        ["inject_type", "retr.log_temp", "retr.wq.weight"]
+    # 20b. LE PLAN : la query est un segment USER, ANTÉRIEUR à la réponse
+    rp = env.retr_plan(m_r5, conv)
+    assert rp, "aucune réponse gradée : le test ne prouve rien"
+    for i, e in rp.items():
+        assert conv["segs"][e["uidx"]]["role"] == "user", e["uidx"]
+        assert e["uidx"] < i, (e["uidx"], i)
+        if e["gidx"] is not None:
+            assert 0 <= e["gidx"] < len(e["res"])
+    # 20c. FUITE DE TEACHER-FORCING : changer les tokens de la RÉPONSE ne doit
+    #      RIEN changer aux scores du retriever. C'est l'invariant critique.
+    i0 = sorted(rp)[0]
+    e0 = rp[i0]
+    convL = {"info": conv["info"], "segs": [dict(s) for s in conv["segs"]]}
+    convL["segs"][i0] = dict(conv["segs"][i0])
+    convL["segs"][i0]["input_ids"] = torch.randint(
+        0, 512, conv["segs"][i0]["input_ids"].shape)
+    rpL = env.retr_plan(m_r5, convL)
+    with torch.no_grad():
+        m_r5.eval()
+        h0 = query_hidden(m_r5, [conv["segs"][e0["uidx"]]], "cpu", 256)
+        hL = query_hidden(m_r5, [convL["segs"][rpL[i0]["uidx"]]], "cpu", 256)
+    assert torch.equal(h0, hL), \
+        "h_query dépend de la RÉPONSE : fuite de teacher-forcing"
+    # … et h_query dépend bien de la QUESTION (sinon la sonde serait vide)
+    convQ = [dict(conv["segs"][e0["uidx"]])]
+    convQ[0]["input_ids"] = torch.randint(
+        0, 512, convQ[0]["input_ids"].shape)
+    with torch.no_grad():
+        hQ = query_hidden(m_r5, convQ, "cpu", 256)
+    assert not torch.allclose(h0, hQ, atol=1e-6), \
+        "h_query ne dépend pas de la question"
+    # 20d. scores : une valeur par groupe RÉSIDENT, −inf sur le padding, et
+    #      W_q zéro-init ⇒ scores tous nuls (softmax uniforme, CE = log G)
+    ents = [e for e in rp.values() if e["res"]]
+    if ents:
+        with torch.no_grad():
+            hh = query_hidden(m_r5, [conv["segs"][e["uidx"]] for e in ents],
+                              "cpu", 256)
+            sc, msk = retr_scores(m_r5, hh, ents)
+        assert sc.shape == msk.shape and sc.shape[0] == len(ents)
+        assert float(sc[msk].abs().max()) == 0.0, "W_q zéro-init : scores ≠ 0"
+        assert bool(torch.isinf(sc[~msk]).all()) if (~msk).any() else True
+        # top-k DUR : déterministe et TRIÉ par score décroissant
+        e1 = ents[0]
+        with torch.no_grad():
+            m_r5.retr.wq.weight.normal_(0, 0.05)
+            s1, _ = retr_scores(m_r5, hh[:1], [e1])
+            s2, _ = retr_scores(m_r5, hh[:1], [e1])
+        assert torch.equal(s1, s2), "scores non déterministes"
+        nk = min(2, len(e1["res"]))
+        t1 = s1[0].topk(nk).indices
+        assert float(s1[0, t1[0]]) >= float(s1[0, t1[-1]]), "top-k non trié"
+        assert torch.equal(t1, s2[0].topk(nk).indices)
+        with torch.no_grad():
+            m_r5.retr.wq.weight.zero_()
+    # 20e. PRÉFIXE MULTI-GROUPES : [B,k] ≡ [B,1,k] BIT-À-BIT (donc r4 est
+    #      inchangé par la généralisation), et 2 groupes changent la sortie.
+    ids5 = torch.randint(0, 512, (2, 6))
+    inj1 = torch.randint(0, 512, (2, 4))
+    with torch.no_grad():
+        m_r5.eval()
+        o1 = m_r5(ids5, None, None, inject=inj1)
+        o1b = m_r5(ids5, None, None, inject=inj1[:, None, :])
+        o2 = m_r5(ids5, None, None,
+                  inject=torch.stack([inj1, (inj1 + 1) % 512], dim=1))
+    assert torch.equal(o1, o1b), "[B,k] ≢ [B,1,k] : r4 aurait bougé"
+    assert o2.shape == o1.shape and not torch.allclose(o1, o2, atol=1e-5)
+    # positions attendues : G·(k+1) contigus puis le tour un cran plus loin
+    for G_ in (1, 2):
+        npre_ = G_ * (4 + 1)
+        pos_ = list(range(npre_)) + [npre_ + 1 + t for t in range(6)]
+        assert pos_[npre_ - 1] == npre_ - 1 and pos_[npre_] == npre_ + 1, pos_
+    # 20f. la CE auxiliaire ne fire QUE sur les réponses gradées
+    convN = {"info": {"truths": [], "q_slots": []},
+             "segs": [dict(s) for s in conv["segs"]]}
+    assert not env.retr_plan(m_r5, convN), "conv sans vérité : plan non vide"
+    m_r5.zero_grad(set_to_none=True)
+    train_step(m_r5, env, [convN], "cpu", 256, False, 1.0)
+    assert m_r5.retr.wq.weight.grad is None or \
+        float(m_r5.retr.wq.weight.grad.abs().max()) == 0.0, \
+        "la CE du retriever a fire sans réponse gradée"
+    # … et elle fire bien dès qu'il y a un NÉGATIF à repousser. Il faut une
+    # conv dont la banque contient, à la question, un groupe d'un AUTRE slot :
+    # si tous les résidents portent le slot interrogé, la CE multi-positive
+    # vaut 0 et un gradient nul est la BONNE réponse (rien à discriminer).
+    st5 = PersonaChatStream(tok, seed=11)
+    conv_neg = None
+    for _ in range(80):
+        cc = st5.next_conv()
+        if not (cc["info"].get("truths") or []):
+            continue
+        pl = env.retr_plan(m_r5, cc)
+        if any(e["gidx"] is not None and len(e["pos"]) < len(e["res"])
+               for e in pl.values()):
+            conv_neg = cc
+            break
+    assert conv_neg is not None, "pas de conv avec un négatif en banque"
+    m_r5.zero_grad(set_to_none=True)
+    lo5 = train_step(m_r5, env, [conv_neg, convN], "cpu", 256, False, 1.0)
+    assert lo5 == lo5
+    assert m_r5.retr.wq.weight.grad is not None and \
+        float(m_r5.retr.wq.weight.grad.abs().max()) > 0, \
+        "la CE du retriever n'a pas atteint W_q"
+    # 20f-bis. CLÉS DUPLIQUÉES (fait MIS À JOUR : deux writes du même slot) —
+    #      leurs clés sont RIGOUREUSEMENT identiques, donc aucun score ne peut
+    #      les départager. Deux garanties : (i) la CE multi-positive les traite
+    #      comme un bloc (gradient nul = rien à apprendre, PAS un bug) ;
+    #      (ii) à score égal, l'injection prend le PLUS RÉCENT — celui qui porte
+    #      la vérité.
+    dup = [e for e in rp.values()
+           if e["gidx"] is not None and len(e["pos"]) > 1]
+    if dup:
+        e_d = dup[0]
+        ka = m_r5.pack_key[e_d["res"][e_d["pos"][0]][0],
+                           e_d["res"][e_d["pos"][0]][1]]
+        kb = m_r5.pack_key[e_d["res"][e_d["pos"][-1]][0],
+                           e_d["res"][e_d["pos"][-1]][1]]
+        assert torch.equal(ka, kb), "clés d'un même slot devenues différentes"
+        assert e_d["gidx"] == e_d["pos"][-1], "le porteur n'est pas le + récent"
+        # tri stable à récence prioritaire : scores TOUS ÉGAUX ⇒ le plus récent
+        sc_eq = torch.zeros(1, len(e_d["res"]))
+        rec = torch.arange(len(e_d["res"]) - 1, -1, -1)
+        order = torch.argsort(-sc_eq[0][rec], stable=True)
+        assert int(rec[order[0]]) == len(e_d["res"]) - 1, \
+            "à score égal, l'injection doit préférer le groupe le PLUS RÉCENT"
+    # 20g. retr_detach : par DÉFAUT le canal de sélection n'entraîne QUE W_q
+    assert c_r5.retr_detach
+    m_det = ToyReadLM(ToyCfg(**{**c_r5.__dict__, "retr_ce": 1.0}),
+                      env.n_slots, env.n_attrs, sif_w=_sifw())
+    m_det.zero_grad(set_to_none=True)
+    # une conv SANS token supervisé côté LM ⇒ seul le canal retriever tire
+    convM = {"info": conv_neg["info"],
+             "segs": [dict(s) for s in conv_neg["segs"]]}
+    for s in convM["segs"]:
+        s["loss_mask"] = torch.zeros_like(s["loss_mask"])
+    train_step(m_det, env, [convM], "cpu", 256, False, 1.0)
+    assert float(m_det.retr.wq.weight.grad.abs().max()) > 0
+    assert m_det.embed.weight.grad is None or \
+        float(m_det.embed.weight.grad.abs().max()) == 0.0, \
+        "retr_detach : la CE du retriever est remontée dans le backbone"
+    # 20h. r5 refuse ce qui n'a pas de sens (mêmes gardes que r4)
+    for bad, needle in ((dict(code="segsif"), "toprows"),
+                        (dict(code="toprows", write_mode="every"), "fact-only")):
+        try:
+            ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
+                   variant="r5", seg_n_pos=8, sif_a=A_SIF, top_k=3, **bad)
+        except AssertionError as e:
+            assert needle in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"r5 aurait dû refuser {bad}")
+
     # ═══ CHANTIER 1 : grade CONDITIONNÉ À LA RÉSIDENCE ══════════════════════
     # 19. `resident` est aligné sur les réponses gradées : autant d'entrées que
     #     de vérités, et grade_resident ne grade QUE les faits encore là.
@@ -3539,6 +3992,14 @@ def _selftest() -> None:
           "décalé de k+2 (trou en k+1), plan d'injection = sélection du write "
           "avec FIFO max_mem (fait évincé ⇒ pas d'injection), r4 refuse un "
           "autre code et le régime every")
+    print("  phase 8 — r5 RETRIEVER APPRIS : W_q zéro-init seul module ajouté, "
+          "h_query = dernier token du segment USER (invariant vérifié : "
+          "changer la RÉPONSE ne bouge pas h_query, changer la QUESTION oui), "
+          "scores masqués à −inf hors résidents et top-k STABLE à récence "
+          "prioritaire, préfixe multi-groupes ([B,k] ≡ [B,1,k] BIT-À-BIT ⇒ r4 "
+          "intact), CE MULTI-POSITIVE (deux writes d'un même slot ont la MÊME "
+          "clé — cible unique = gradient nul), ne fire que sur les réponses "
+          "gradées, retr_detach n'envoie rien dans le backbone")
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "

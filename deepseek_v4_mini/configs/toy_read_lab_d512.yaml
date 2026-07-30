@@ -28,6 +28,10 @@
 #       le backbone NU qui doit copier (--variant r4 --code toprows, fact-only).
 #       Privilège déclaré : la sélection est l'oracle et l'injection est
 #       teacher-forcée à l'entraînement (pas de curriculum de copie in-context).
+#   r5  r4 + RETRIEVER APPRIS : la sélection oracle est remplacée par un score
+#       appris sur les lignes-clés résidentes (W_q, seul module appris),
+#       supervisé par une CE auxiliaire. Entraînement = injection oracle,
+#       éval = top-k dur du retriever (--variant r5 --code toprows, fact-only).
 #
 # Axe FORMAT DE CODE (r3 seulement) :
 #   --code mean|chunk|phase|rows        (phase 2, pool du SPAN VALEUR)
@@ -255,6 +259,36 @@ code:
                           # COÛT : un tenseur [B, G·k, V] par forward (les
                           # lignes ne dépendent pas de t) plus le mélange
                           # [B,T,V] — négligeable devant le [B,T,V] déjà payé.
+  # ── PHASE 8 : --variant r5 (retriever appris) ─────────────────────────────
+  # r4 a montré que le stack natif SAIT citer : strate `code` 0.708 (n=106)
+  # quand on lui injecte le bon groupe. Il ne manque que la SÉLECTION. r5
+  # remplace l'oracle par score_g = (W_q·h_query)·clé_g/√d, W_q zéro-init, seul
+  # module appris du bras.
+  # PRÉDICTION INSCRITE AVANT LE RUN : plafond = 0.708 × recall@2. L'oracle des
+  # clés sépare à 100 %, donc recall@2 < 0.9 incrimine l'apprentissage de W_q,
+  # pas la géométrie.
+  retr_ce: 1.0            # coefficient de la CE AUXILIAIRE (supervisée par
+                          # l'env, qui connaît le groupe porteur). Le retriever
+                          # apprend PAR CE CANAL, jamais par la loss LM.
+                          # La CE est MULTI-POSITIVE : deux writes du même slot
+                          # (fait mis à jour) ont la MÊME clé, une cible unique
+                          # aurait un gradient exactement nul. Elle est
+                          # normalisée par le nombre de réponses supervisées du
+                          # pas, donc comparable à la loss LM.
+  retr_topk: 2            # groupes injectés À L'ÉVAL (top-k DUR). À
+                          # l'ENTRAÎNEMENT l'injection reste le groupe ORACLE :
+                          # le circuit de copie s'entraîne sur du vrai.
+                          # MISMATCH train/éval ASSUMÉ en v1 — repli si le gap
+                          # est énorme : anneal oracle → prédit.
+                          # À score ÉGAL (clés dupliquées) l'injection prend le
+                          # groupe le PLUS RÉCENT : c'est lui qui porte la
+                          # vérité, et la clé ne peut pas le dire.
+  retr_detach: true       # la CE du retriever ne remonte PAS dans le backbone.
+                          # W_q est alors le SEUL apprenant de ce canal, ce qui
+                          # rend la prédiction lisible et protège le circuit de
+                          # copie déjà acquis par r4. false = laisser la
+                          # sélection remodeler le trunk.
+
   pos_entropy: 0.0        # pénalité d'ENTROPIE sur la porte-position p du
                           # GroupReadout, ajoutée à la loss. 0 = OFF (défaut :
                           # AUCUN terme n'est ajouté, gradient inchangé). > 0
