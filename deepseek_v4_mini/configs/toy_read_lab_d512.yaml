@@ -283,6 +283,35 @@ code:
                           # À score ÉGAL (clés dupliquées) l'injection prend le
                           # groupe le PLUS RÉCENT : c'est lui qui porte la
                           # vérité, et la clé ne peut pas le dire.
+  retr_train_groups: 0    # groupes injectés À L'ENTRAÎNEMENT. 0 = « suivre
+                          # retr_topk » (donc 2) — c'est le FIX du verdict r5 :
+                          # le retriever était PARFAIT (recall@1 1.000 sur 267)
+                          # mais le grade tombait à 0.067 contre 0.708 en r4,
+                          # parce que le circuit de copie avait été câblé sur un
+                          # préfixe MONO-groupe et que le distracteur de l'éval
+                          # le cassait. On entraîne donc avec le même nombre de
+                          # groupes qu'à l'éval : l'ORACLE + des DISTRACTEURS
+                          # tirés parmi les résidents. Banque trop courte ⇒ G
+                          # RÉDUIT pour cette réponse (jamais de doublon).
+                          # 1 = comportement v1, bit-à-bit (runs 60/61).
+  retr_train_order: random  # place de l'oracle dans le préfixe d'entraînement.
+                          # `random` : le modèle ne doit pas apprendre « copie
+                          # le groupe 1 » mais TROUVER le bon groupe.
+                          # `oracle_first` : l'oracle en tête, ce qui reproduit
+                          # EXACTEMENT l'ordre de l'éval (groupes triés par
+                          # score, le vrai sortant premier — recall@1 1.000).
+                          # ⚠️ OBJECTION STRUCTURELLE À TRANCHER AVANT LE RUN :
+                          # le décodage gradé part de A_OPEN SEUL — la question
+                          # n'est PAS dans le contexte (cf. evaluate/greedy, le
+                          # bras ablaté décode une fois pour toutes). Avec
+                          # plusieurs groupes en ordre ALÉATOIRE, aucune
+                          # information ne dit lequel copier à l'inférence : la
+                          # tâche est indécidable et le plafond retombe à
+                          # ~0.708/G au lieu de 0.708×recall@1. `oracle_first`
+                          # supprime l'ambiguïté ET ferme le mismatch, puisque
+                          # l'éval trie déjà par score. À l'inverse, si un jour
+                          # la question entre dans le prompt de décodage,
+                          # `random` redevient le bon réglage.
   retr_detach: true       # la CE du retriever ne remonte PAS dans le backbone.
                           # W_q est alors le SEUL apprenant de ce canal, ce qui
                           # rend la prédiction lisible et protège le circuit de

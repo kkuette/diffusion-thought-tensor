@@ -356,6 +356,29 @@ class ToyCfg:
     retr_topk: int = 2        # r5 : nombre de groupes injectés À L'ÉVAL (top-k
                               # DUR du retriever). À l'ENTRAÎNEMENT l'injection
                               # reste le groupe ORACLE (cf. ToyReadLM.forward).
+    retr_train_groups: int = 0   # r5 : groupes injectés À L'ENTRAÎNEMENT.
+                              # 0 = « suivre retr_topk » (résolu au
+                              # __post_init__) — c'est le DÉFAUT, et il ferme
+                              # le mismatch train/éval : v1 entraînait sur UN
+                              # groupe et évaluait sur top-2, le circuit de
+                              # copie se câblait sur un préfixe mono-groupe et
+                              # le distracteur le cassait (recall@1 1.000 mais
+                              # grade 0.067 contre 0.708 en r4).
+                              # 1 = comportement v1 (rétro-compat bit-à-bit des
+                              # runs 60/61). Si un fait n'a pas assez de voisins
+                              # résidents, G est RÉDUIT pour cette réponse — on
+                              # ne complète JAMAIS en répétant l'oracle.
+    retr_train_order: str = "random"   # r5 : place de l'oracle dans le préfixe
+                              # d'entraînement. `random` = ordre tiré au sort
+                              # (le modèle ne doit pas apprendre « copie le
+                              # groupe 1 ») ; `oracle_first` = oracle toujours
+                              # en tête, ce qui REPRODUIT l'ordre de l'éval
+                              # (les groupes y sont triés par score, et le vrai
+                              # groupe sort premier — recall@1 mesuré à 1.000).
+                              # ⚠️ CF. LE COMMENTAIRE DU YAML : le prompt de
+                              # décodage ne contient PAS la question, donc en
+                              # ordre aléatoire rien n'identifie le bon groupe
+                              # à l'inférence.
     retr_detach: bool = True  # r5 : la CE du retriever ne remonte PAS dans le
                               # backbone (h_query est détaché). W_q est alors le
                               # SEUL paramètre que ce canal entraîne — c'est ce
@@ -416,6 +439,13 @@ class ToyCfg:
         if self.variant in RETRIEVER_VARIANTS:
             assert self.retr_ce >= 0.0, self.retr_ce
             assert self.retr_topk >= 1, self.retr_topk
+            # 0 = sentinelle « suivre retr_topk » : l'entraînement voit le même
+            # nombre de groupes que l'éval, c'est TOUT le point du fix.
+            if not self.retr_train_groups:
+                self.retr_train_groups = self.retr_topk
+            assert self.retr_train_groups >= 1, self.retr_train_groups
+            assert self.retr_train_order in ("random", "oracle_first"), (
+                f"retr_train_order inconnu {self.retr_train_order!r}")
         if self.code != "mean":
             # les nouveaux formats supposent banque == espace d'embedding et
             # pointer nu : c'est la définition de r3, on ne les porte pas
@@ -1844,6 +1874,36 @@ def query_hidden(model, segs, device, max_len):
     return h[torch.arange(len(segs), device=device), idx]
 
 
+def train_group_pick(entry, n_groups: int, order: str = "random") -> list:
+    """Index des groupes injectés devant UNE réponse À L'ENTRAÎNEMENT.
+
+    L'ORACLE + (n_groups−1) DISTRACTEURS tirés au hasard parmi les autres
+    groupes résidents. S'il n'y a pas assez de voisins, G est réduit pour cette
+    réponse — jamais complété en répétant l'oracle : le préfixe multi-groupes
+    accepte déjà des tailles variables, et un doublon apprendrait au modèle que
+    deux groupes identiques sont une situation normale.
+
+    `order='random'` : la place de l'oracle est tirée au sort, pour que le
+    modèle apprenne à TROUVER le bon groupe plutôt qu'une position fixe.
+    `order='oracle_first'` : l'oracle est toujours en tête — ce qui reproduit
+    exactement l'ordre de l'éval (tri par score, le vrai groupe premier).
+
+    Le tirage passe par le RNG GLOBAL de torch : à graine de training fixée, la
+    séquence est reproductible, comme tout le reste du lab.
+    """
+    res_n = len(entry["res"])
+    g = entry["gidx"]
+    n = min(max(int(n_groups), 1), res_n)
+    others = [x for x in range(res_n) if x != g]
+    pick = [g]
+    if n > 1 and others:
+        idx = torch.randperm(len(others))[:n - 1]
+        pick += [others[int(x)] for x in idx]
+    if order == "random" and len(pick) > 1:
+        pick = [pick[int(x)] for x in torch.randperm(len(pick))]
+    return pick
+
+
 def retr_scores(model, h, entries):
     """(scores [n, G], masque [n, G]) sur les groupes RÉSIDENTS de chaque
     entrée. Les banques de tailles différentes sont padées à droite et masquées
@@ -1902,7 +1962,26 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
         # relire d'après convs[sub[0]] ferait dépendre TOUT le lot de la
         # première conv (KeyError si elle seule n'a pas de plan à j, injections
         # perdues en silence dans l'autre sens).
-        if r4:
+        if r5:
+            # ORACLE + DISTRACTEURS : le préfixe d'entraînement a le même
+            # nombre de groupes que celui de l'éval. Comme G varie d'une
+            # réponse à l'autre (banques plus ou moins remplies), les lanes
+            # sont regroupées PAR TAILLE DE PRÉFIXE — un forward exige un
+            # préfixe uniforme.
+            picks = {}
+            for i in lanes:
+                e = rplans[i].get(j)
+                if e is not None and e["gidx"] is not None:
+                    picks[i] = train_group_pick(e, cfg.retr_train_groups,
+                                                cfg.retr_train_order)
+            bysize: dict = {}
+            for i, p in picks.items():
+                bysize.setdefault(len(p), []).append(i)
+            subsets = [(v, True) for _, v in sorted(bysize.items())]
+            rest = [i for i in lanes if i not in picks]
+            if rest:
+                subsets.append((rest, False))
+        elif r4:
             subsets = [([i for i in lanes if j in plans[i]], True),
                        ([i for i in lanes if j not in plans[i]], False)]
         else:
@@ -1913,7 +1992,15 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
             segs = [convs[i]["segs"][j] for i in sub]
             X, W = pad_segs(segs, device, max_len)
             inj = None
-            if has_inj:
+            if has_inj and r5:
+                inj = torch.stack([
+                    torch.stack([rplans[i][j]["res"][g][2] for g in picks[i]])
+                    for i in sub]).to(device)          # [n, G, k]
+                if inj.shape[1] == 1:
+                    # G=1 : on retombe sur le tenseur [n, k] de la v1, donc sur
+                    # un forward BIT-À-BIT identique (cf. self-test 20e).
+                    inj = inj[:, 0]
+            elif has_inj:
                 # toutes de MÊME longueur (top_k) : cf. toprows_sel_fixed
                 inj = torch.stack([plans[i][j] for i in sub]).to(device)
             bank, bmask = pad_bank([banks[i] for i in sub], device)
@@ -2163,6 +2250,53 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     return out
 
 
+# ── nom de run (⇒ save_dir) ──────────────────────────────────────────────────
+
+def run_name_for(cfg: ToyCfg) -> str:
+    """Nom de dossier d'un run. INVARIANT : deux configs qui n'entraînent PAS
+    la même chose ne doivent JAMAIS partager un nom — un run fini ne se fait pas
+    écraser par un bras voisin.
+
+    phase 1 → <variant>/ ; phase 2 → <variant>_<code>/ ; puis un suffixe par
+    knob qui s'écarte de ce que porte déjà le dossier nu.
+
+    ⚠️ `retr_topk` manquait à l'appel : `--retr-topk 1` retombait sur
+    `r5_toprows` et aurait écrasé le run de référence (rattrapé avant
+    déploiement). L'ancre de `retr_train_groups` n'est PAS le défaut de la
+    dataclass mais 1 : le dossier `r5_toprows` existant contient un run entraîné
+    à UN groupe injecté, donc tout entraînement à plusieurs groupes doit sortir
+    ailleurs, y compris quand c'est devenu le défaut.
+    """
+    name = cfg.variant if cfg.code == "mean" else f"{cfg.variant}_{cfg.code}"
+    if cfg.pos_offset:
+        name += f"_o{cfg.pos_offset}"
+    if cfg.code in PACK_CODES and cfg.pack_blocks != ToyCfg.pack_blocks:
+        name += f"_b{cfg.pack_blocks}"         # sweep de partition = run à part
+    if cfg.code in GROUP_CODES:
+        if cfg.top_k != ToyCfg.top_k:
+            name += f"_k{cfg.top_k}"           # sweep de k = run à part
+        if not cfg.row_pos_tag:
+            name += "_notag"
+    if cfg.readout_mix != ToyCfg.readout_mix:
+        name += f"_{cfg.readout_mix}"          # bras MoS = run à part
+    if cfg.pos_entropy:
+        name += f"_ent{cfg.pos_entropy:g}"
+    if cfg.variant in RETRIEVER_VARIANTS:
+        if cfg.retr_topk != ToyCfg.retr_topk:
+            name += f"_topk{cfg.retr_topk}"
+        if cfg.retr_train_groups != 1:         # ancre = le run r5_toprows fini
+            name += f"_tg{cfg.retr_train_groups}"
+        if cfg.retr_train_order != ToyCfg.retr_train_order:
+            name += f"_{cfg.retr_train_order}"
+        if cfg.retr_ce != ToyCfg.retr_ce:
+            name += f"_ce{cfg.retr_ce:g}"
+        if not cfg.retr_detach:
+            name += "_nodetach"
+    if cfg.write_mode == "every":
+        name += "_wev"
+    return name
+
+
 # ── plomberie ────────────────────────────────────────────────────────────────
 
 def build_tokenizer(name):
@@ -2224,6 +2358,13 @@ def main(argv=None):
                     help="r5 : coefficient de la CE auxiliaire du retriever")
     ap.add_argument("--retr-topk", type=int, default=None, dest="retr_topk",
                     help="r5 : nombre de groupes injectés À L'ÉVAL (top-k dur)")
+    ap.add_argument("--retr-train-groups", type=int, default=None,
+                    dest="retr_train_groups",
+                    help="r5 : groupes injectés À L'ENTRAÎNEMENT (oracle + "
+                         "distracteurs) ; 0 = suivre --retr-topk, 1 = v1")
+    ap.add_argument("--retr-train-order", choices=("random", "oracle_first"),
+                    default=None, dest="retr_train_order",
+                    help="r5 : place de l'oracle dans le préfixe d'entraînement")
     ap.add_argument("--final-eval-convs", type=int, default=None,
                     dest="final_eval_convs",
                     help="surcharge training.final_eval_convs (passe d'éval "
@@ -2267,13 +2408,18 @@ def main(argv=None):
     if "readout_mix" in cb:
         mc["readout_mix"] = str(cb["readout_mix"])
     for key, cast in (("retr_ce", float), ("retr_topk", int),
-                      ("retr_detach", bool)):
+                      ("retr_detach", bool), ("retr_train_groups", int),
+                      ("retr_train_order", str)):
         if key in cb:
             mc[key] = cast(cb[key])
     if a.retr_ce is not None:              # la CLI gagne sur le YAML
         mc["retr_ce"] = float(a.retr_ce)
     if a.retr_topk is not None:
         mc["retr_topk"] = int(a.retr_topk)
+    if a.retr_train_groups is not None:
+        mc["retr_train_groups"] = int(a.retr_train_groups)
+    if a.retr_train_order is not None:
+        mc["retr_train_order"] = a.retr_train_order
     if "pos_entropy" in cb:
         mc["pos_entropy"] = float(cb["pos_entropy"])
     if a.readout_mix is not None:          # la CLI gagne sur le YAML
@@ -2325,25 +2471,7 @@ def main(argv=None):
                                  seed=int(t.get("seed", 0)))
     model = ToyReadLM(cfg, env.n_slots, env.n_attrs, sif_w=sif_w).to(device)
 
-    # phase 1 → <variant>/ (inchangé) ; phase 2 → <variant>_<code>/ ;
-    # extensions → suffixes _o<k> (pos_offset) et _wev (write=every) pour ne
-    # JAMAIS écraser un run déjà fini sous le même nom.
-    run_name = a.variant if a.code == "mean" else f"{a.variant}_{a.code}"
-    if cfg.pos_offset:
-        run_name += f"_o{cfg.pos_offset}"
-    if cfg.code in PACK_CODES and cfg.pack_blocks != ToyCfg.pack_blocks:
-        run_name += f"_b{cfg.pack_blocks}"     # sweep de partition = run à part
-    if cfg.code in GROUP_CODES:
-        if cfg.top_k != ToyCfg.top_k:
-            run_name += f"_k{cfg.top_k}"       # sweep de k = run à part
-        if not cfg.row_pos_tag:
-            run_name += "_notag"
-    if cfg.readout_mix != ToyCfg.readout_mix:
-        run_name += f"_{cfg.readout_mix}"      # bras MoS = run à part
-    if cfg.pos_entropy:
-        run_name += f"_ent{cfg.pos_entropy:g}"
-    if cfg.write_mode == "every":
-        run_name += "_wev"
+    run_name = run_name_for(cfg)
     save_dir = os.path.join(t.get("save_dir", "./checkpoints/toy_read_lab"),
                             run_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -2427,10 +2555,22 @@ def main(argv=None):
               f"{cfg.retr_ce:g}"
               + (" (h_query DÉTACHÉ : W_q apprend seul)" if cfg.retr_detach
                  else " (gradient RENVOYÉ dans le backbone)")
-              + f". ENTRAÎNEMENT : injection du groupe ORACLE (le circuit de "
-              f"copie s'entraîne sur du vrai). ÉVAL : top-{cfg.retr_topk} DUR "
-              f"du retriever ⇒ MISMATCH train/éval ASSUMÉ en v1 (repli si le "
-              f"gap est énorme : anneal oracle→prédit).", flush=True)
+              + f". ENTRAÎNEMENT : {cfg.retr_train_groups} groupe(s) injecté(s) "
+              f"— l'ORACLE + {cfg.retr_train_groups - 1} DISTRACTEUR(S) tirés "
+              f"parmi les résidents, ordre {cfg.retr_train_order} (G réduit si "
+              f"la banque est trop courte, JAMAIS complété par un doublon). "
+              f"ÉVAL : top-{cfg.retr_topk} DUR du retriever, trié par score.",
+              flush=True)
+    if cfg.variant in RETRIEVER_VARIANTS and cfg.retr_train_groups > 1 and \
+            cfg.retr_train_order == "random":
+        print("  ⚠️ ORDRE ALÉATOIRE + PROMPT SANS QUESTION : le décodage gradé "
+              "part de A_OPEN seul (la question n'est PAS dans le contexte, "
+              "cf. evaluate/greedy). Avec plusieurs groupes en ordre "
+              "aléatoire, RIEN n'identifie le bon groupe à l'inférence : le "
+              "plafond attendu devient ~0.708/G au lieu de 0.708×recall@1. "
+              "`code.retr_train_order: oracle_first` reproduit l'ordre de "
+              "l'éval (le vrai groupe y sort premier, recall@1 mesuré 1.000) "
+              "et lève la dégénérescence.", flush=True)
         print(f"  PRÉDICTION (inscrite avant le run) : plafond = 0.708 "
               f"(grade|vrai-groupe de r4, strate code) × recall@{cfg.retr_topk}. "
               f"L'oracle des clés sépare à 100 %, donc un recall@"
@@ -2443,13 +2583,17 @@ def main(argv=None):
               f"un vecteur de type appris), séparateur id {cfg.inject_sep_id} "
               f"après CHAQUE groupe, positions RoPE contiguës 0..G×"
               f"{cfg.top_k + 1}−1 puis tour réel un cran plus loin (trou "
-              f"délibéré). G = 1 (oracle) à l'entraînement"
-              + (f", {cfg.retr_topk} à l'éval." if cfg.variant in
-                 RETRIEVER_VARIANTS else " et à l'éval.")
+              f"délibéré). "
+              + (f"G = {cfg.retr_train_groups} à l'entraînement (oracle + "
+                 f"distracteurs), {cfg.retr_topk} à l'éval."
+                 if cfg.variant in RETRIEVER_VARIANTS else
+                 "G = 1 (oracle) à l'entraînement et à l'éval.")
               + " ABLATÉ = le même tour SANS préfixe. "
-              f"PRIVILÈGE DÉCLARÉ : la sélection du groupe est l'oracle, et "
-              f"l'injection est teacher-forcée à l'entraînement (aucun "
-              f"curriculum de copie in-context).", flush=True)
+              f"PRIVILÈGE DÉCLARÉ : la SÉLECTION du groupe est "
+              + ("APPRISE à l'éval (r5) mais l'entraînement voit l'oracle"
+                 if cfg.variant in RETRIEVER_VARIANTS else "l'oracle")
+              + ", et l'injection est teacher-forcée à l'entraînement (aucun "
+              "curriculum de copie in-context).", flush=True)
     if cfg.code in GROUP_CODES and cfg.readout_mix == "mos":
         print(f"  readout MoS : une distribution PAR LIGNE puis mixture "
               f"pondérée s·p (aucune superposition dans l'espace d'embedding, "
@@ -3865,6 +4009,83 @@ def _selftest() -> None:
     assert m_det.embed.weight.grad is None or \
         float(m_det.embed.weight.grad.abs().max()) == 0.0, \
         "retr_detach : la CE du retriever est remontée dans le backbone"
+    # 20i. ENTRAÎNEMENT AVEC DISTRACTEUR (fix du mismatch train/éval)
+    e_pick = next(e for e in env.retr_plan(m_r5, conv_neg).values()
+                  if e["gidx"] is not None and len(e["res"]) >= 2)
+    torch.manual_seed(99)
+    p1 = train_group_pick(e_pick, 2)
+    torch.manual_seed(99)
+    p2 = train_group_pick(e_pick, 2)
+    assert p1 == p2, "tirage des distracteurs non reproductible sous graine"
+    assert len(p1) == 2 and e_pick["gidx"] in p1 and len(set(p1)) == 2, p1
+    # l'ORACLE n'est pas toujours en tête (ordre aléatoire) …
+    torch.manual_seed(7)
+    firsts = {train_group_pick(e_pick, 2)[0] for _ in range(40)}
+    assert len(firsts) >= 2 and e_pick["gidx"] in firsts, (
+        f"l'oracle est toujours (ou jamais) en tête : {firsts}")
+    # … sauf en `oracle_first`
+    assert all(train_group_pick(e_pick, 2, "oracle_first")[0] == e_pick["gidx"]
+               for _ in range(10))
+    # G RÉDUIT quand la banque est trop courte (jamais de doublon)
+    e_one = dict(e_pick)
+    e_one["res"] = [e_pick["res"][e_pick["gidx"]]]
+    e_one["gidx"] = 0
+    assert train_group_pick(e_one, 3) == [0]
+    assert len(train_group_pick(e_pick, 99)) == len(e_pick["res"])
+    # le forward voit bien G groupes, et la CE aux reste sur le BON index
+    m_dis = ToyReadLM(ToyCfg(**{**c_r5.__dict__, "retr_train_groups": 2}),
+                      env.n_slots, env.n_attrs, sif_w=_sifw())
+    assert m_dis.cfg.retr_train_groups == 2
+    m_dis.zero_grad(set_to_none=True)
+    ld = train_step(m_dis, env, [conv_neg, convN], "cpu", 256, False, 1.0)
+    assert ld == ld and float(m_dis.retr.wq.weight.grad.abs().max()) > 0, \
+        "la CE du retriever ne fire plus avec distracteur"
+    # la cible de la CE est l'index dans `res` (donc INDÉPENDANTE de l'ordre du
+    # préfixe injecté) — l'invariant qui rend le distracteur inoffensif pour le
+    # retriever.
+    e_chk = e_pick
+    assert e_chk["gidx"] == e_chk["pos"][-1] and \
+        e_chk["gidx"] < len(e_chk["res"])
+    # 0 = sentinelle « suivre retr_topk »
+    assert ToyCfg(**{**c_r5.__dict__, "retr_train_groups": 0,
+                     "retr_topk": 3}).retr_train_groups == 3
+    # 20j. NOMMAGE : deux configs qui n'entraînent PAS la même chose ne doivent
+    #      JAMAIS partager un save_dir. `retr_topk` manquait — `--retr-topk 1`
+    #      serait retombé sur `r5_toprows` et aurait écrasé le run de référence.
+    # config de DÉPLOIEMENT (knobs aux défauts), pas celle du self-test
+    _r5b = dict(vocab_size=512, d_model=64, n_heads=4, mem_dim=64,
+                variant="r5", code="toprows", seg_n_pos=8, sif_a=A_SIF)
+
+    def _n(**kw):
+        return run_name_for(ToyCfg(**{**_r5b, **kw}))
+    base = _n(retr_train_groups=1)          # = le run de référence fini
+    assert base == "r5_toprows", base
+    assert _n(retr_topk=1, retr_train_groups=1) == "r5_toprows_topk1"
+    assert _n(retr_train_groups=2) == "r5_toprows_tg2"
+    assert _n(retr_train_groups=2, retr_train_order="oracle_first") == \
+        "r5_toprows_tg2_oracle_first"
+    assert _n(retr_train_groups=1, retr_ce=0.5) == "r5_toprows_ce0.5"
+    assert _n(retr_train_groups=1, retr_detach=False) == "r5_toprows_nodetach"
+    # tous DISTINCTS deux à deux
+    variants_n = [base, _n(retr_topk=1, retr_train_groups=1),
+                  _n(retr_train_groups=2),
+                  _n(retr_train_groups=2, retr_train_order="oracle_first"),
+                  _n(retr_train_groups=1, retr_ce=0.5),
+                  _n(retr_train_groups=1, retr_detach=False),
+                  _n(retr_train_groups=3, retr_topk=3)]
+    assert len(set(variants_n)) == len(variants_n), variants_n
+    # et les conventions des phases précédentes n'ont pas bougé
+    _b = dict(vocab_size=512, d_model=512, n_heads=4, mem_dim=512,
+              variant="r3", seg_n_pos=8, sif_a=A_SIF)
+    assert run_name_for(ToyCfg(**{**_b, "code": "segsif"})) == "r3_segsif"
+    assert run_name_for(ToyCfg(**{**_b, "code": "toprows", "top_k": 8})) == \
+        "r3_toprows_k8"
+    assert run_name_for(ToyCfg(**{**_b, "code": "toprows",
+                                  "readout_mix": "mos"})) == "r3_toprows_mos"
+    assert run_name_for(ToyCfg(**{**_b, "code": "segsif",
+                                  "write_mode": "every"})) == "r3_segsif_wev"
+    assert run_name_for(ToyCfg(vocab_size=512, d_model=32, n_heads=4,
+                               mem_dim=32, variant="r0")) == "r0"
     # 20h. r5 refuse ce qui n'a pas de sens (mêmes gardes que r4)
     for bad, needle in ((dict(code="segsif"), "toprows"),
                         (dict(code="toprows", write_mode="every"), "fact-only")):
@@ -4000,6 +4221,13 @@ def _selftest() -> None:
           "intact), CE MULTI-POSITIVE (deux writes d'un même slot ont la MÊME "
           "clé — cible unique = gradient nul), ne fire que sur les réponses "
           "gradées, retr_detach n'envoie rien dans le backbone")
+    print("  phase 8b — DISTRACTEUR à l'entraînement : oracle + distracteurs "
+          "tirés au sort (reproductible sous graine), ordre aléatoire par "
+          "défaut / oracle_first en option, G RÉDUIT si la banque est courte "
+          "(jamais de doublon), retr_train_groups=1 ≡ v1 ; NOMMAGE : "
+          "retr_topk/retr_train_groups/order/ce/detach entrent tous dans le "
+          "save_dir, 7 configs r5 ⇒ 7 noms DISTINCTS (r5_toprows reste le run "
+          "de référence à G=1)")
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "
