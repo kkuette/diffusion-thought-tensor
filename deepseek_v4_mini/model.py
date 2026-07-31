@@ -480,6 +480,7 @@ class ThoughtBankLM(nn.Module):
         layer_banks: Optional[list] = None,
         write: bool = True,
         cache: Optional[list] = None,
+        inject: Optional[torch.Tensor] = None,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -487,6 +488,31 @@ class ThoughtBankLM(nn.Module):
 
         # ── Step 1: embed text ────────────────────────────────────────────────
         h = self.drop(self.embed(input_ids))                              # [B,T,d]
+
+        # ── Step 1bis: RETRIEVE-THEN-INJECT (rti) ─────────────────────────────
+        # `inject` [B, P, d] : des pseudo-embeddings posés EN PRÉFIXE de la
+        # séquence. Ils entrent APRÈS l'embedding et AVANT tout le reste, donc
+        # ils traversent exactement le même stack que de vrais tokens : mêmes
+        # positions RoPE (contiguës, le préfixe occupe 0..P−1 et le tour est
+        # décalé d'autant), mêmes blocs CSA/HCA, même causalité.
+        #
+        # POURQUOI PAS DE TROU DE POSITION (le toy en posait un) : ici
+        # l'attention est COMPRESSÉE par blocs (csa_m/hca_m) et les positions
+        # viennent de `_rope_cache(T)`, contiguës par construction. Un trou
+        # exigerait de faire descendre des index explicites dans CSA/HCA/fenêtre
+        # glissante — un chantier à soi seul, pour un gain que le séparateur
+        # (token réservé, appris) rend inutile.
+        #
+        # Les logits/hidden rendus ne couvrent QUE le tour réel : l'appelant
+        # (loss, décodage) ne voit aucune différence de forme.
+        npre = 0
+        if inject is not None:
+            assert inject.dim() == 3 and inject.size(0) == B, inject.shape
+            npre = int(inject.size(1))
+            h = torch.cat([inject.to(h.dtype), h], dim=1)
+            if pad_mask is not None:
+                pad_mask = torch.cat(
+                    [pad_mask.new_ones(B, npre), pad_mask], dim=1)
 
         # ── Step 2: seed a fresh bank, or reuse the carried-in one ────────────
         if init_mem is None or init_mem.size(1) == 0:
@@ -510,6 +536,12 @@ class ThoughtBankLM(nn.Module):
         A = torch.softmax(self.A_out_net(X_mean), dim=-1)               # [B,T,n_hc]
         H_text = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B,T,d]
         H_text = self.norm_out(H_text)
+        if npre:
+            # seul le TOUR RÉEL sort (cf. Step 1bis) — et le write, s'il tourne,
+            # ne poole donc pas le préfixe injecté.
+            H_text = H_text[:, npre:]
+            if pad_mask is not None:
+                pad_mask = pad_mask[:, npre:]
 
         # ── Step 5: gated thought write + FIFO eviction ───────────────────────
         # write=False : le décodage jette de toute façon la banque écrite (il ne
@@ -610,6 +642,36 @@ def _selftest() -> None:
     assert m(ids, init_mem=full)["mem_bank"].shape == (B, 4, 16)
     # une banque vide est traitée comme absente (seedée), jamais comme une erreur
     assert m(ids, init_mem=torch.zeros(B, 0, 16))["mem_bank"].shape == (B, 3, 16)
+
+    # ── rti : PRÉFIXE INJECTÉ (retrieve-then-inject) ────────────────────────
+    # Contrat : la forme rendue est celle du TOUR SEUL (l'appelant ne voit pas
+    # le préfixe), le préfixe CHANGE la sortie, son CONTENU compte, et un
+    # préfixe absent est bit-à-bit le forward nu.
+    torch.manual_seed(11)
+    pre = torch.randn(B, 5, 32)
+    m.eval()                       # dropout OFF ; banque FIXE (init_mem=None
+    bk_i = torch.randn(B, 4, 16)   # tire des slots ALÉATOIRES à chaque appel)
+    with torch.no_grad():
+        o_i = m(ids, init_mem=bk_i, inject=pre)
+        base_l = m(ids, init_mem=bk_i)["logits"]
+        assert o_i["logits"].shape == (B, T, V), o_i["logits"].shape
+        assert torch.equal(base_l, m(ids, init_mem=bk_i, inject=None)["logits"]), \
+            "inject=None n'est pas le forward nu"
+        assert not torch.allclose(o_i["logits"], base_l, atol=1e-6), \
+            "le préfixe injecté ne change rien : l'injection est morte"
+        assert not torch.allclose(
+            o_i["logits"], m(ids, init_mem=bk_i, inject=pre + 1)["logits"],
+            atol=1e-6), "le CONTENU du préfixe ne compte pas"
+    m.train()
+    # le write ne poole PAS le préfixe (H_text est tranché avant), et le
+    # pad_mask est étendu puis retranché : les formes restent celles du tour
+    pm_i = torch.ones(B, T, dtype=torch.bool)
+    pm_i[:, -2:] = False
+    assert m(ids, inject=pre, pad_mask=pm_i)["mem_bank"].shape == (B, 3, 16)
+    # gradient : il remonte dans le préfixe (le vecteur de type est entraînable)
+    pg = pre.clone().requires_grad_(True)
+    m(ids, inject=pg)["logits"].sum().backward()
+    assert pg.grad is not None and float(pg.grad.abs().max()) > 0
 
     # ── la banque INFLUENCE la sortie (sinon tout le programme est vide) ────
     torch.manual_seed(7)
