@@ -119,8 +119,69 @@ def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None,
     return loss, o["mem_bank"], ce_t, ce_lane
 
 
+def _chat_loss_rti(model, x, lmask, balw, amp, parts, layer_banks,
+                   pad_mask=None, m_any=None):
+    """`_chat_loss` du bras RTI : le batch est PARTITIONNÉ par longueur de
+    préfixe injecté.
+
+    Une tranche de séquence ne peut pas varier À L'INTÉRIEUR d'un batch (crash
+    payé au job 58 du labo jouet) : les lanes qui reçoivent G groupes injectés
+    (P = G·(top_k+1) pseudo-tokens) et celles qui n'en reçoivent aucun ne
+    peuvent pas passer dans le MÊME forward. `RtiRunner.parts` rend donc une
+    partition des lanes, et on fait un forward par part.
+
+    La NORMALISATION RESTE GLOBALE au batch : on accumule numérateur et
+    dénominateur de la CE à travers les parts avant de diviser. Normaliser
+    part par part ferait dépendre le poids d'une lane du nombre de lanes
+    injectées à ce seg — c'est-à-dire du hasard de la banque.
+
+    La banque fast-weight est ENTIÈREMENT contournée : `layer_banks` tout à
+    None (aucune couche ne lit) et `write=False` (aucun gist écrit). Le seul
+    canal mémoire de ce bras est le préfixe. Rend (loss, ce_detached_or_None,
+    ce_lane_or_None) — pas de banque : il n'y en a plus.
+    """
+    B = x.size(0)
+    loss = None
+    num = den = None
+    per = x.new_zeros(B, dtype=torch.float32)
+    wln = x.new_zeros(B, dtype=torch.float32)
+    for rows, inj in parts:
+        rows = rows.to(x.device)
+        xs, ms = x[rows], lmask[rows]
+        pms = None if pad_mask is None else pad_mask[rows]
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            o = model(xs, init_mem=None, layer_banks=layer_banks, write=False,
+                      pad_mask=pms, inject=inj)
+        bl = balw * o["balance_loss"].float() * (rows.numel() / B)
+        loss = bl if loss is None else loss + bl
+        m2 = ms[:, 1:]
+        lg = o["logits"].float()
+        ce_tok = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
+                                 xs[:, 1:].reshape(-1), reduction="none")
+        n_, d_ = (ce_tok * m2.reshape(-1)).sum(), m2.sum()
+        num = n_ if num is None else num + n_
+        den = d_ if den is None else den + d_
+        w_ = m2.sum(1)
+        per[rows] = ((ce_tok.view_as(m2) * m2).sum(1)
+                     / w_.clamp_min(1e-6)).detach().float()
+        wln[rows] = w_.detach().float()
+    ce_t = ce_lane = None
+    # `m_any` est décidé côté CPU par l'appelant (cf. _chat_loss) : sans lui il
+    # faudrait synchroniser le device au milieu du forward.
+    if m_any is None:
+        m_any = den is not None and bool(den > 0)
+    if m_any and den is not None:
+        ce = num / den.clamp_min(1e-6)
+        loss = loss + ce
+        ce_t = ce.detach()
+        if B > 1:
+            has = (wln > 0).float()
+            ce_lane = (per * has).sum() / has.sum().clamp_min(1.0)
+    return loss, ce_t, ce_lane
+
+
 def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False,
-            pool=None):
+            pool=None, inject=None, layer_banks=None):
     """Greedy-decode max_new tokens after prefix from the CURRENT bank (reads
     only). Une seule ligne : l'éval décode conv par conv. Voir decode.generate
     pour la boucle (et pour le décodage batché, qui sert au RL).
@@ -131,12 +192,14 @@ def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False,
     le même chemin, la comparaison reste interne. Le bras ablaté (bank None)
     reste eager : GraphDecodeRunner exige une banque explicite, et ce bras est
     décodé UNE fois par palier de toute façon."""
-    if pool is not None and bank is not None:
+    if pool is not None and bank is not None and inject is None \
+            and layer_banks is None:
         out = pool.decode(prefix, bank, max_new, stop_id)
         if out is not None:
             return out
     gen, lens = generate(model, prefix, bank=bank, max_new=max_new,
-                         stop_id=stop_id, amp=amp, use_cache=use_cache)
+                         stop_id=stop_id, amp=amp, use_cache=use_cache,
+                         inject=inject, layer_banks=layer_banks)
     return gen[:, :int(lens[0])]
 
 
@@ -196,7 +259,7 @@ AGE_BUCKETS = ("<=4", "5-8", "9-16", ">16")
 
 @torch.no_grad()
 def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
-                  use_cache=False, decode=True, graphs=False):
+                  use_cache=False, decode=True, graphs=False, rti=None):
     """Chat eval (math_school | persona): canonical segments advance the bank
     (teacher-forced writes). Only the GRADED assistant turns (the last
     len(truths) — the answers to memory queries) are greedy-decoded TWICE —
@@ -209,6 +272,18 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     quand le stream fournit info.ages. Bank-only (no cascade), like evaluate().
     Kinds sans truths (smalltalk) = contrôles : nll seule, pas de décodage.
     Returns {kind: {...}} + clé "_by_age" (à pop avant itération par kind).
+
+    `rti` (bras retrieve-then-inject) : `RtiRunner` à UNE lane. Le bras LIVE
+    n'est alors plus « la banque fast-weight », c'est le PRÉFIXE injecté — top-N
+    du retriever trié par score, la sélection est celle de l'inférence, aucun
+    oracle. Le bras ABLATÉ reste exactement ce qu'il était (aucun préfixe,
+    aucune banque), donc Δgrade et Δnll gardent leur sens : « ce que le canal
+    mémoire ajoute ». Contrairement au reste de l'éval, la FIFO de groupes n'est
+    PAS remise à zéro entre convs : le train tourne en vie unique
+    (no_reset_files: 0) et les distracteurs y viennent des sessions
+    précédentes — remettre la banque à zéro par conv rendrait l'éval plus facile
+    que l'entraînement, et surtout non isomorphe (une seule conv fournit
+    rarement `eval_groups` groupes).
 
     LE BRAS ABLATÉ EST DÉCODÉ UNE SEULE FOIS PAR APPEL. Son décodage part d'un
     préfixe constant (`a_open`) avec `init_mem=None`, en greedy, à poids gelés :
@@ -240,6 +315,10 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     abl_txt1 = None                   # le bras ablaté, décodé une fois (docstring)
     pool = _GraphPool(model) if (graphs and decode
                                  and next(model.parameters()).is_cuda) else None
+    rti_lb = None if rti is None else [None] * len(model.blocks)
+    rti_g: dict = {}                  # sélection réussie/ratée -> [n, grade, top1]
+    if rti is not None:
+        rti.reset()                    # une vie par APPEL d'éval, pas par conv
     for _ in range(n_conv):
         conv = stream.next_conv()
         info = conv.get("info", {})
@@ -256,17 +335,36 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
         for i, s in enumerate(conv["segs"]):
             x = s["input_ids"].to(device)
             lmask = s["loss_mask"].to(device)
+            inj = None
+            if rti is not None:
+                # le préfixe DÛ à ce seg (décidé au seg précédent = la question)
+                prt = rti.parts(model.embed.weight, model.rti_type.vec, 1,
+                                roles=(s["role"],), train=False)
+                inj = prt[0][1]
             if i in graded and decode:
                 if abl_txt1 is None:              # constant sur tout l'appel
                     abl_txt1 = tok.decode(_greedy(
                         model, a_open, None, max_new, stop_id, amp,
-                        use_cache)[0].tolist())
+                        use_cache, layer_banks=rti_lb)[0].tolist())
                 live_txt.append(tok.decode(_greedy(
                     model, a_open, bank, max_new, stop_id, amp, use_cache,
-                    pool=pool)[0].tolist()))
+                    pool=pool, inject=inj,
+                    layer_banks=rti_lb)[0].tolist()))
                 abl_txt.append(abl_txt1)
+                if rti is not None and qi < len(truths):
+                    # grade CONDITIONNÉ : une sélection ratée et une copie ratée
+                    # rendent toutes deux 0.00 — les séparer est la seule façon
+                    # de savoir lequel des deux étages ferme le canal.
+                    _k = ("hit" if rti.last_hit[0] else
+                          "miss" if rti.last_hit[0] is False else "none")
+                    _c = rti_g.setdefault(_k, [0, 0.0, 0])
+                    _c[0] += 1
+                    _c[1] += grade_recall([live_txt[-1]], [truths[qi]])
+                    _c[2] += int(bool(rti.last_top1[0]))
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                o = model(x, init_mem=bank)
+                o = (model(x, init_mem=bank) if rti is None else
+                     model(x, init_mem=None, layer_banks=rti_lb, write=False,
+                           inject=inj))
             m = lmask[:, 1:].reshape(-1)
             if float(m.sum()) > 0:
                 lg = o["logits"].float()
@@ -277,7 +375,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                 if i in graded:
                     with torch.autocast("cuda", dtype=torch.bfloat16,
                                         enabled=amp):
-                        oa = model(x, init_mem=None)
+                        oa = model(x, init_mem=None, layer_banks=rti_lb,
+                                   write=rti is None)
                     lga = oa["logits"].float()
                     cea = F.cross_entropy(
                         lga[:, :-1].reshape(-1, lga.size(-1)),
@@ -294,7 +393,20 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                                      - grade_recall([abl_txt[-1]], [truths[qi]]))
                             b[3] += 1
                     qi += 1
-            bank = o["mem_bank"]
+            if rti is None:
+                bank = o["mem_bank"]
+            else:
+                # write PROCÉDURAL (sélection d'embeddings natifs, zéro
+                # gradient) puis, si ce seg pose une question, la requête qui
+                # servira le seg SUIVANT — même ordre qu'à l'entraînement.
+                rti.write(model.embed.weight, x, s.get("fact_slot"))
+                if s.get("q_slot") is not None and int(s["q_slot"].max()):
+                    with torch.autocast("cuda", dtype=torch.bfloat16,
+                                        enabled=amp):
+                        oq = model(x, init_mem=None, compute_logits=False,
+                                   layer_banks=rti_lb, write=False)
+                    rti.query(model.rti_retriever, s["q_slot"],
+                              oq["hidden"].float())
         a[0] += nll_s; a[1] += nll_n
         if decode:
             a[2] += grade(conv, live_txt)
@@ -312,6 +424,11 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     out["_by_age"] = {k: {"n": v[0], "dgrade": v[1] / max(v[3], 1),
                           "dnll": v[2] / v[0], "n_dg": v[3]}
                       for k, v in by_age.items()}
+    if rti is not None:
+        out["_rti"] = {**rti.telemetry(),
+                       "by_sel": {k: {"n": v[0], "grade": v[1] / max(v[0], 1),
+                                      "top1": v[2] / max(v[0], 1)}
+                                  for k, v in rti_g.items()}}
     return out
 
 
@@ -569,14 +686,62 @@ def main(cfg_path: str, resume: bool = False) -> None:
           f"max_mem {cfg.max_mem} | <think>={think_id} <blank>={blank_id} vocab {cfg.vocab_size}",
           flush=True)
 
+    # ── RTI (retrieve-then-inject) : le bras porté du labo jouet ─────────────
+    # Deux modules NEUFS accrochés au modèle — donc pris automatiquement par
+    # `_split_muon_params` (W_q 2-D → Muon, vecteur de type et log_temp 1-D →
+    # AdamW), sauvés dans les checkpoints, et broadcastés en DDP comme le reste.
+    # La banque fast-weight est intégralement contournée (voir _chat_loss_rti).
+    rt = raw.get("rti") or {}
+    rti_on = bool(rt.get("enabled", False))
+    rti_cfg = None
+    if rti_on:
+        from .rti import InjectType, Retriever, RtiConfig
+        rti_cfg = RtiConfig(
+            top_k=int(rt.get("top_k", 13)),
+            max_groups=int(rt.get("max_groups", cfg.max_mem)),
+            sif_a=float(rt.get("sif_a", 1e-2)),
+            train_groups=int(rt.get("train_groups", 2)),
+            eval_groups=int(rt.get("eval_groups", 2)),
+            train_order=str(rt.get("train_order", "oracle_first")),
+            retr_ce=float(rt.get("retr_ce", 1.0)),
+            retr_detach=bool(rt.get("retr_detach", True)),
+            write_every_turn=bool(rt.get("write_every_turn", False)),
+            sep_token=str(rt.get("sep_token", "<blank>")))
+        model.rti_retriever = Retriever(cfg.d_model).to(device)
+        model.rti_type = InjectType(cfg.d_model).to(device)
+        rti_sep_id = tok.convert_tokens_to_ids(rti_cfg.sep_token)
+        assert rti_sep_id is not None and rti_sep_id >= 0, \
+            f"rti.sep_token {rti_cfg.sep_token!r} absent du vocabulaire"
+        _rti_np = sum(p.numel() for p in list(model.rti_retriever.parameters())
+                      + list(model.rti_type.parameters()))
+        print(f"rti ON: top_k {rti_cfg.top_k} groups {rti_cfg.train_groups}/"
+              f"{rti_cfg.eval_groups} (train/éval, ordre {rti_cfg.train_order}) "
+              f"préfixe {rti_cfg.train_groups * rti_cfg.group_prefix} pseudo-tokens "
+              f"| FIFO {rti_cfg.max_groups} groupes/lane, sif_a {rti_cfg.sif_a:g}, "
+              f"sép {rti_cfg.sep_token}={rti_sep_id} | retr_ce {rti_cfg.retr_ce} "
+              f"detach {rti_cfg.retr_detach} | +{_rti_np:,} params | banque "
+              f"fast-weight CONTOURNÉE (layer_banks=None, write=False)",
+              flush=True)
+
     # init_from: CONTINUED pretraining — model weights from a finished run's
     # checkpoint, fresh optimizer/schedule/data (unlike --resume, which restores
     # the full training state of THIS run). Used by the var-chunk phase (v2c).
     init_from = t.get("init_from")
     if init_from:
         ck0 = torch.load(init_from, map_location="cpu")
-        model.load_state_dict(ck0["model"])
-        print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})",
+        # strict=False : le checkpoint de base ne connaît pas les modules rti
+        # (W_q, vecteur de type, température). Les manquantes sont ÉNUMÉRÉES et
+        # comparées à ce qu'on attend — une clé manquante inattendue serait un
+        # ckpt d'une autre architecture, et le run partirait sur des poids
+        # partiellement aléatoires sans le dire.
+        miss, unexp = model.load_state_dict(ck0["model"], strict=False)
+        want = ({"rti_retriever.wq.weight", "rti_retriever.log_temp",
+                 "rti_type.vec"} if rti_on else set())
+        assert set(miss) == want, \
+            f"init_from: clés manquantes inattendues {sorted(set(miss) - want)}"
+        assert not unexp, f"init_from: clés en trop {sorted(unexp)[:8]}"
+        print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})"
+              + (f" | rti neuf : {sorted(want)} (zéro-init)" if want else ""),
               flush=True)
 
     # `base` is the eager module — the source of truth for state_dict / named params
@@ -1016,6 +1181,57 @@ def main(cfg_path: str, resume: bool = False) -> None:
         assert grad_accum == 1, "chunk_budget remplace grad_accum (laisser grad_accum: 1)"
         assert chat_stream is None and ra_prob == 0.0, \
             "chunk_budget: chemin batché pur (pas de chat/reset_announce)"
+    # ── RTI : le pilote (une FIFO de groupes par lane) ───────────────────────
+    rti_run = rti_eval = None
+    rti_lb = None                              # layer_banks tout à None
+    if rti_on:
+        from .rti import RtiRunner, sif_table
+        assert chat_stream is not None, "rti: exige un bloc chat:"
+        assert not tf_on, (
+            "rti + teacher : le teacher distille la banque FAST-WEIGHT, que ce "
+            "bras contourne entièrement (write=False) — la cible n'aurait aucun "
+            "gradient. Mettre teacher.enabled: false.")
+        assert no_reset_files == 0, (
+            "rti: la FIFO de groupes vit aussi longtemps que les lanes du "
+            "chat_batch — une vie unique (no_reset_files: 0).")
+        assert cascade_depth == 0 and delta is None, \
+            "rti: pas de cascade ni de canal delta (la banque est contournée)"
+
+        def _sif_src(s, seen=()):
+            """Le stream qui EXPOSE la table unigram (persona), à travers les
+            enveloppes (chat_batch → chat_mix → sous-streams)."""
+            if s is None or id(s) in seen:
+                return None
+            if hasattr(s, "_sif_table"):
+                return s
+            seen = seen + (id(s),)
+            for nxt in [getattr(s, "inner", None)] + list(getattr(s, "subs", [])
+                                                          or []):
+                r = _sif_src(nxt, seen)
+                if r is not None:
+                    return r
+            return None
+
+        _src = _sif_src(chat_stream)
+        assert _src is not None, \
+            "rti: aucun stream n'expose _sif_table (poids SIF indisponibles)"
+        rti_sif = sif_table(_src, cfg.vocab_size, rti_cfg.sif_a).to(device)
+        rti_run = RtiRunner(rti_cfg, rti_sif, rti_sep_id, chat_B,
+                            seed=train_seed + 7)
+        rti_eval = RtiRunner(rti_cfg, rti_sif, rti_sep_id, 1, seed=4242)
+        rti_lb = [None] * cfg.n_layers
+        if decode_graphs:
+            # Les runners CUDA graphs sont capturés à FORME FIXE ; le préfixe
+            # injecté change la longueur de séquence du premier forward, et le
+            # bras ablaté n'en a pas du tout. Deux formes par palier = deux
+            # armements, pour un chemin qui n'est plus celui qu'on mesure.
+            decode_graphs = False
+            print("rti: decode_graphs FORCÉ OFF (longueur de séquence variable "
+                  "avec le préfixe injecté — repli cache KV)", flush=True)
+        print(f"rti: pilote prêt — {chat_B} lanes, table SIF lue sur "
+              f"{type(_src).__name__} (a={rti_cfg.sif_a:g}, "
+              f"w méd {float(rti_sif.median()):.3f})", flush=True)
+
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -1090,6 +1306,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
 
     start_step = 0; ema_ic = ema_d = ema_a = ema_chat = ema_lane = None
     ema_reach = [None, None, None]              # EMA de perte par strate d'âge
+    ema_retr = None                             # rti : EMA de la CE du retriever
     if resume:
         _rs, _rp, _done = find_resume(save_dir)
         if _done:
@@ -1165,6 +1382,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # contenu ; les deux plats = le write n'imite rien (lever distill_w/α).
         dist_c = dist_f = 0.0; dist_cn = dist_fn = 0
         chat_v = 0.0; chat_cnt = 0
+        # rti : CE auxiliaire du retriever (tenseur accumulé sur le device, une
+        # seule matérialisation par step — cf. chat_v)
+        retr_v = 0.0; retr_cnt = 0
         # ce/lane : la CE normalisée DANS chaque lane puis moyennée — hors
         # gradient, c'est la seule quantité comparable au `chat` d'un run B=1
         # (la loss, elle, normalise globalement sur le batch).
@@ -1252,7 +1472,52 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 pre0 = (bank[:, 0].detach()
                         if casc is not None and bank.size(1) >= cfg.max_mem else None)
                 lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
-                if chat_seg:
+                if chat_seg and rti_run is not None:
+                    # ── RTI : parts → forward → write → query ────────────────
+                    # L'ordre compte. Le préfixe posé ici est celui DÛ à ce seg,
+                    # c'est-à-dire décidé au seg PRÉCÉDENT (la question) ; le
+                    # write de ce seg-ci ne peut donc pas se citer lui-même, et
+                    # la requête qu'il pose n'est servie qu'au seg suivant (la
+                    # réponse). C'est l'invariant qui interdit au retriever de
+                    # lire la valeur qu'il est censé aller chercher.
+                    _lm = s["loss_mask"]
+                    _any = bool(_lm[:, 1:].any())
+                    _pm = s.get("pad_mask")
+                    _pmd = None if _pm is None else _pm.to(device)
+                    _emb = model.embed.weight
+                    parts = rti_run.parts(_emb, model.rti_type.vec, x.size(0),
+                                          roles=s.get("roles"), train=True)
+                    loss, ce, ce_lane = _chat_loss_rti(
+                        _fwd, xt, _lm.to(device), balw, amp, parts, rti_lb,
+                        pad_mask=_pmd, m_any=_any)
+                    loss = chat_w * loss
+                    # longueurs réelles côté CPU (le collate right-pade) : les
+                    # lire sur le device coûterait une synchro par seg
+                    _lens = (None if _pm is None else _pm.sum(1))
+                    rti_run.write(_emb, x, s.get("fact_slot"), _lens)
+                    if s.get("q_slot") is not None and int(s["q_slot"].max()):
+                        # forward DÉDIÉ du seg user : on veut l'état caché du
+                        # dernier token, pas des logits. Sous no_grad quand
+                        # retr_detach (le défaut) : W_q est alors le seul
+                        # apprenant de la sélection, le trunk ne bouge pas pour
+                        # elle, et ce forward ne coûte aucun graphe.
+                        with torch.set_grad_enabled(not rti_cfg.retr_detach):
+                            with torch.autocast("cuda", dtype=torch.bfloat16,
+                                                enabled=amp):
+                                oq = model(x, init_mem=None, compute_logits=False,
+                                           layer_banks=rti_lb, write=False,
+                                           pad_mask=_pmd)
+                        ce_r = rti_run.query(model.rti_retriever, s["q_slot"],
+                                             oq["hidden"].float(), _lens)
+                        if ce_r is not None:
+                            loss = loss + rti_cfg.retr_ce * ce_r
+                            retr_v = retr_v + ce_r.detach(); retr_cnt += 1
+                    if ce is not None:
+                        chat_v = chat_v + ce; chat_cnt += 1
+                    if ce_lane is not None:
+                        lane_v = lane_v + ce_lane; lane_cnt += 1
+                    ce = None
+                elif chat_seg:
                     _lm = s["loss_mask"]
                     # décidé côté CPU, AVANT le .to(device) : cf. _chat_loss
                     _any = bool(_lm[:, 1:].any())
@@ -1604,8 +1869,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 rv = reach_v[_s] / reach_cnt[_s]
                 ema_reach[_s] = (rv if ema_reach[_s] is None
                                  else 0.9 * ema_reach[_s] + 0.1 * rv)
+        if retr_cnt:
+            retr_v = float(retr_v) / retr_cnt
+            ema_retr = retr_v if ema_retr is None else 0.95 * ema_retr + 0.05 * retr_v
         if step % log_every == 0:
             addr_s = f"addr {ema_a:.3f}  " if ema_a is not None else ""
+            if ema_retr is not None:
+                # CE du retriever + recall CUMULÉ depuis le début du run : la
+                # sonde « la sélection s'ouvre-t-elle ? », lisible bien avant le
+                # grade. log(train_groups) = le point de départ zéro-init.
+                _tl = rti_run.telemetry()
+                addr_s = (f"retr {ema_retr:.3f} r@1 {_tl['recall1']:.2f} "
+                          f"(q {_tl['n_query']}, sans cible {_tl['n_nopos']}, "
+                          f"inj {_tl['n_inject']})  ") + addr_s
             if ema_chat is not None:
                 addr_s = f"chat {ema_chat:.3f}  " + addr_s
             if ema_lane is not None:                  # batch chat : cf. lane_v
@@ -1714,8 +1990,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 mm = evaluate_math(model, chat_eval, tok, device, amp,
                                    chat_eval_convs, chat_max_new,
                                    use_cache=decode_cache, decode=dec_on,
-                                   graphs=decode_graphs)
+                                   graphs=decode_graphs, rti=rti_eval)
                 by_age = mm.pop("_by_age", {})
+                rti_ev = mm.pop("_rti", None)
                 for kind in sorted(mm):
                     v = mm[kind]
                     if v["n_ans"]:
@@ -1738,10 +2015,23 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         for b in AGE_BUCKETS if b in by_age)
                     print(f"[math @{step}] recall par âge (writes fait→réponse)"
                           f" : {curve}", flush=True)
+                if rti_ev is not None:
+                    sel = "  ".join(
+                        f"{k} n{v['n']} grade {v['grade']:.2f} "
+                        f"(top1 {v['top1']:.2f})"
+                        for k, v in sorted(rti_ev["by_sel"].items()))
+                    print(f"[rti @{step}] retrieval : r@1 "
+                          f"{rti_ev['recall1']:.3f} r@2 {rti_ev['recall2']:.3f} "
+                          f"({rti_ev['n_query']} requêtes, "
+                          f"{rti_ev['n_nopos']} sans cible résidente, "
+                          f"{rti_ev['n_inject']} préfixes injectés)"
+                          + (f" | grade par sélection : {sel}" if sel else ""),
+                          flush=True)
                 if metrics_file:
                     with open(metrics_file, "a") as f:
                         f.write(json.dumps({"step": step, "math": mm,
-                                            "math_by_age": by_age}) + "\n")
+                                            "math_by_age": by_age,
+                                            "rti": rti_ev}) + "\n")
                 if writer is not None:
                     for kind, v in mm.items():
                         writer.add_scalar(f"eval_math/{kind}/nll", v["nll"], step)

@@ -41,12 +41,11 @@
 # amplifier, et le max à +1.000 (deux énonciations du même fait) est exactement
 # le cas que la CE multi-positive et le tie-break de récence traitent.
 #
-# ⚠️ ÉTAT : la spec, le noyau (deepseek_v4_mini/rti.py) et le point d'entrée du
-# préfixe dans le modèle (ThoughtBankLM.forward(inject=…)) sont livrés et
-# testés. LE CÂBLAGE TRAINER N'EST PAS FAIT — cette config ne tourne pas encore
-# telle quelle. Voir le rapport de passation.
+# ÉTAT : câblage COMPLET (noyau rti.py + RtiRunner, q_slot côté générateur,
+# trainer, éval, chargement strict=False, schéma). Smoke 4 steps passé sur la
+# 3090. Le run complet n'a jamais tourné.
 #
-# LANCEMENT (une fois le câblage livré ; --check d'abord) :
+# LANCEMENT (--check d'abord) :
 #   TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
 #     deepseek_v4_mini/configs/sft_recall_350m_rti.yaml --check
 
@@ -221,13 +220,15 @@ training:
                                            # s'ouvre (decode_every 2 pose un
                                            # grade à la fin de chaque palier).
   decode_cache: true
-  decode_graphs: true                      # décision user 2026-07-28 : le bras
-                                           # LIVE des paliers décode par CUDA
-                                           # graphs (~14x/pas, bench 07-28).
-                                           # Classe ULP — cohérent PAR RUN, ne
-                                           # pas comparer à un grade cache d'un
-                                           # autre run. Bras ablaté : eager
-                                           # (décodé une fois, banque None).
+  decode_graphs: false                     # INCOMPATIBLE avec rti : les runners
+                                           # CUDA graphs sont capturés à FORME
+                                           # FIXE, et le préfixe injecté change
+                                           # la longueur de séquence du premier
+                                           # forward (bras live) alors que le
+                                           # bras ablaté n'en a pas. Le trainer
+                                           # le force OFF de toute façon, avec
+                                           # un message ; on l'écrit ici pour
+                                           # que --check dise la vérité.
   grad_checkpoint: true
   gc_save_topk: false
   log_every: 1
@@ -354,7 +355,15 @@ chat:
           surprisal_mode: sif
           sif_a: 0.0001
 teacher:
-  enabled: true
+  enabled: false                           # OBLIGATOIRE sous rti : le teacher
+                                           # distille la banque FAST-WEIGHT, que
+                                           # ce bras contourne entièrement
+                                           # (write=False, layer_banks tout à
+                                           # None). Sa cible n'aurait aucun
+                                           # gradient — le trainer refuse de
+                                           # partir si les deux sont ON.
+                                           # Les clés ci-dessous restent pour
+                                           # documenter le réglage de stair.
   distill_weight: 2.0
   target: value_sif                        # val_mask = span de LA VALEUR du
                                            # fait planté (persona) — le slot

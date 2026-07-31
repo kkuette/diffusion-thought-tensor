@@ -30,34 +30,17 @@ CE QUI CHANGE EN PASSANT AU 350M
 
 Ce module est autonome (aucun import du trainer) et testé par `_selftest`.
 
-⚠️ BLOQUANT IDENTIFIÉ POUR LE CÂBLAGE TRAINER (à traiter EN PREMIER)
-────────────────────────────────────────────────────────────────────
-La CE du retriever a besoin, devant chaque RÉPONSE, de savoir QUEL FAIT est
-interrogé (la cible multi-positive). Cette information n'existe pas côté segs :
+LA CIBLE DE LA CE DU RETRIEVER (résolu 2026-07-31)
+──────────────────────────────────────────────────
+La CE a besoin, devant chaque RÉPONSE, de savoir QUEL fait est interrogé.
+L'information n'existait pas côté segs : seul le seg d'ÉNONCIATION portait
+`fact_slot`, et le lien question→slot ne vivait que dans
+`conv["info"]["q_slots"]`, au niveau de la conversation — que `chat_batch._collate`
+ne propage pas. Le seg de QUESTION porte désormais `q_slot` (long [1,T]
+constant, zéro-paddé), posé par `PersonaChatStream._user_query` en symétrie
+exacte du `fact_slot` de l'énonciation. Le même entier relie les deux, et c'est
+tout le lien dont `RtiRunner` a besoin.
 
-  • `_user_valued` (le segment qui ÉNONCE un fait) porte bien `fact_slot`,
-    `fact_val`, `fact_attr` — c'est le déclencheur du WRITE, tout va bien ;
-  • le segment de QUESTION et le segment de RÉPONSE (`_assistant_valued`) ne
-    portent AUCUN identifiant de fait. Le lien question→slot ne vit que dans
-    `conv["info"]["q_slots"]`, au niveau de la CONVERSATION ;
-  • et `chat_batch` collate des segs LANE PAR LANE : `conv["info"]` ne survit
-    pas au batch (seul `roles` est propagé, cf. `_collate`).
-
-Donc, en l'état, l'entraînement ne peut pas savoir devant quelle réponse
-injecter quoi. Deux issues, la première est la bonne :
-
-  (a) TAGUER LE SEG DE QUESTION côté générateur : ajouter `q_slot` (long
-      [1,T] constant, 0 = pas une question) dans PersonaChatStream au moment où
-      la question est construite — le stream connaît déjà le slot. C'est la
-      symétrie exacte du `fact_slot` déjà posé sur le seg d'énonciation, ça
-      traverse `_collate` sans rien changer (clé long, zéro-paddée comme
-      `fact_slot`), et l'éval y gagne de ne plus dépendre de `info`.
-  (b) rejouer le lien côté trainer en reconstruisant les convs — non : ça
-      duplique la logique du générateur et casse au premier changement.
-
-Tant que (a) n'est pas fait, le bras ne peut pas s'entraîner : la sélection
-n'a pas de cible. C'est un travail de ~20 lignes dans persona_chat_data.py,
-plus le self-test correspondant.
 """
 from __future__ import annotations
 
@@ -355,6 +338,197 @@ def retr_ce_loss(scores: torch.Tensor, positives: list) -> torch.Tensor:
             - torch.logsumexp(sc.masked_fill(~pm, float("-inf")), -1)).sum()
 
 
+# ── le PILOTE : l'état rti d'un batch de lanes, du côté du trainer ───────────
+
+class RtiRunner:
+    """L'état vivant du bras : une FIFO de groupes PAR LANE, et la requête en
+    attente devant chaque réponse.
+
+    Le trainer l'appelle dans CET ordre, une fois par seg :
+
+        parts  = r.parts(...)      # 1. le préfixe DÛ à ce seg (posé au seg
+                                   #    précédent, qui était la question)
+        …forward + loss…
+        r.write(...)               # 2. ce seg énonce-t-il un fait ? -> groupe
+        ce = r.query(...)          # 3. ce seg pose-t-il une question ? -> la
+                                   #    requête devient DUE au seg suivant
+
+    Pourquoi la requête est décalée d'un seg : `q_slot` est posé sur le tour
+    UTILISATEUR, et le préfixe doit précéder la RÉPONSE. h_query vient donc du
+    dernier token du seg user — jamais d'un token de la réponse, qui en
+    teacher-forcing contient déjà la valeur à retrouver (l'invariant du bras).
+
+    La vie de la banque est celle du trainer (`no_reset_files: 0` = une vie
+    infinie) : `reset()` n'est appelé qu'à l'ouverture d'une vie.
+    """
+
+    def __init__(self, cfg: RtiConfig, sif_w, sep_id: int, n_lanes: int,
+                 seed: int = 0) -> None:
+        self.cfg = cfg
+        self.sif_w = sif_w
+        self.sep_id = int(sep_id)
+        self.n = int(n_lanes)
+        self.gen = torch.Generator().manual_seed(int(seed))
+        self.reset()
+        self.tel = dict(query=0, no_pos=0, inject=0, hit1=0, hit2=0, ce_n=0)
+        self.last_hit: list = [None] * self.n
+        self.last_top1: list = [None] * self.n
+
+    def reset(self) -> None:
+        self.banks = [LaneBank() for _ in range(self.n)]
+        self.pending: list = [None] * self.n
+
+    # ── 1. WRITE : sélection procédurale, zéro gradient ─────────────────────
+
+    @torch.no_grad()
+    def write(self, embed_w, ids, fact_slot=None, lens=None) -> int:
+        """Pousse un groupe pour chaque lane PORTEUSE de ce seg. Rend le nombre
+        de writes. Le tag est le SLOT : deux énonciations du même slot (une
+        supersession) sont deux positifs, et le tie-break de récence de
+        `pick_eval_groups` fait gagner celle qui porte la valeur en vigueur.
+
+        `fact_slot` [B,T] et `lens` [B] sont lus token par token côté PYTHON :
+        les passer depuis le CPU (c'est là que le collate les produit) évite une
+        synchro de device par seg — le même réflexe que `_chat_loss(m_any=…)`.
+        Le right-padding rend `ids[b, :lens[b]]` exactement le tour réel.
+        """
+        n = min(self.n, int(ids.size(0)))
+        done = 0
+        for b in range(n):
+            tag = None
+            if fact_slot is not None:
+                sid = int(fact_slot[b].max())
+                tag = sid if sid > 0 else None
+            if tag is None and not self.cfg.write_every_turn:
+                continue
+            L = int(ids.size(1)) if lens is None else int(lens[b])
+            row = ids[b, :L]
+            if row.numel() == 0:
+                continue
+            key, toks = build_group(embed_w, self.sif_w, row, self.cfg)
+            self.banks[b].push(key, toks, tag, self.cfg.max_groups)
+            done += 1
+        return done
+
+    # ── 2. QUERY : la CE auxiliaire, et la requête due au seg suivant ───────
+
+    def query(self, retr: Retriever, q_slot, hidden, lens=None):
+        """`hidden` [B,T,d] du seg USER (forward compute_logits=False), `q_slot`
+        [B,T] et `lens` [B] côté CPU. Rend la CE MULTI-POSITIVE (tenseur
+        scalaire, moyennée sur les requêtes du seg) ou None s'il n'y a aucune
+        requête.
+
+        Une requête dont AUCUN positif ne réside plus (le fait a été évincé)
+        n'a pas de cible : elle est comptée (`tel['no_pos']`) et écartée — la
+        supervisier vers un groupe faux apprendrait le contraire du but.
+        """
+        if q_slot is None:
+            return None
+        G = self.cfg.max_groups
+        rows, hs, keys, msk, poss, tags = [], [], [], [], [], []
+        n = min(self.n, int(hidden.size(0)))
+        for b in range(n):
+            self.pending[b] = None
+            tag = int(q_slot[b].max())
+            if tag <= 0:
+                continue
+            self.tel["query"] += 1
+            bank = self.banks[b]
+            pos = bank.positives(tag)
+            if not pos:
+                self.tel["no_pos"] += 1
+                continue
+            L = int(hidden.size(1)) if lens is None else int(lens[b])
+            h = hidden[b, max(L - 1, 0)]
+            if self.cfg.retr_detach:
+                h = h.detach()
+            kb = torch.stack(bank.keys)                       # [n_res, d]
+            pad = torch.zeros(G, kb.size(1), dtype=kb.dtype, device=kb.device)
+            pad[:kb.size(0)] = kb
+            m = torch.zeros(G, dtype=torch.bool, device=kb.device)
+            m[:kb.size(0)] = True
+            rows.append(b); hs.append(h); keys.append(pad); msk.append(m)
+            poss.append(pos); tags.append(tag)
+        if not rows:
+            return None
+        H = torch.stack(hs)
+        K = torch.stack(keys)
+        M = torch.stack(msk)
+        sc = retr(H, K, M)                                    # [n, G]
+        ce = retr_ce_loss(sc, poss) / len(rows)
+        self.tel["ce_n"] += len(rows)
+        sd = sc.detach()
+        for r, b in enumerate(rows):
+            n_res = len(self.banks[b])
+            top = pick_eval_groups(sd[r, :n_res], n_res, self.cfg)
+            self.tel["hit1"] += int(bool(top) and top[0] in poss[r])
+            self.tel["hit2"] += int(any(i in poss[r] for i in top))
+            self.pending[b] = {"tag": tags[r], "scores": sd[r, :n_res],
+                               "n_res": n_res, "pos": poss[r]}
+        return ce
+
+    # ── 3. PARTS : le préfixe dû à CE seg, partitionné par longueur ─────────
+
+    def parts(self, embed_w, type_vec, B: int, roles=None, train: bool = True):
+        """[(rows LongTensor, inject [n,P,d] | None)] — une PARTITION des B
+        lanes du seg par longueur de préfixe.
+
+        Une tranche de séquence ne peut pas varier à l'intérieur d'un batch
+        (crash payé au job 58) : les lanes injectées et les autres ne peuvent
+        pas passer dans le même forward. L'appelant fait donc un forward par
+        part, et recombine les sommes de CE.
+
+        STRICTE ISOMORPHIE : on n'injecte que `train_groups` (resp.
+        `eval_groups`) groupes, jamais moins. Une banque trop courte pour en
+        fournir autant ne donne AUCUNE injection plutôt qu'un préfixe d'une
+        autre forme — c'est la leçon de r5 v1 (le circuit de copie se câble sur
+        le LAYOUT du préfixe).
+        """
+        cfg = self.cfg
+        want = cfg.train_groups if train else cfg.eval_groups
+        buckets: dict = {}
+        # `last_hit[b]` : la sélection RÉELLEMENT injectée contenait-elle un
+        # positif ? None = pas d'injection. C'est ce qui permet de conditionner
+        # un grade sur « le retriever a-t-il trouvé », donc de séparer une
+        # sélection ratée d'une copie ratée — les deux rendent 0.00 sinon.
+        self.last_hit: list = [None] * B
+        self.last_top1: list = [None] * B
+        for b in range(B):
+            p = self.pending[b] if b < self.n else None
+            sel: list = []
+            ok_role = roles is None or roles[b] == "assistant"
+            if p is not None and ok_role:
+                bank = self.banks[b]
+                sel = (pick_train_groups(bank, p["tag"], cfg, self.gen)
+                       if train else
+                       pick_eval_groups(p["scores"], p["n_res"], cfg))
+                if len(sel) != want:
+                    sel = []
+                if sel:
+                    self.last_hit[b] = bool(set(sel) & set(p["pos"]))
+                    self.last_top1[b] = bool(sel[0] in p["pos"])
+            buckets.setdefault(len(sel), []).append(
+                (b, [self.banks[b].toks[i] for i in sel]))
+        self.pending = [None] * self.n            # la requête est CONSOMMÉE
+        out = []
+        for g in sorted(buckets):
+            items = buckets[g]
+            rows = torch.tensor([b for b, _ in items], dtype=torch.long)
+            if g == 0:
+                out.append((rows, None))
+                continue
+            self.tel["inject"] += len(items)
+            out.append((rows, build_prefix(embed_w, type_vec, self.sep_id,
+                                           [t for _, t in items], cfg)))
+        return out
+
+    def telemetry(self) -> dict:
+        q = max(self.tel["ce_n"], 1)
+        return {"n_query": self.tel["query"], "n_nopos": self.tel["no_pos"],
+                "n_inject": self.tel["inject"],
+                "recall1": self.tel["hit1"] / q, "recall2": self.tel["hit2"] / q}
+
+
 # ── self-test ────────────────────────────────────────────────────────────────
 
 def _selftest() -> None:
@@ -467,6 +641,82 @@ def _selftest() -> None:
     st = key_separation(E, w, segs, cfg)
     assert 0.0 <= st["rank1"] <= 1.0 and st["n"] == 40
     assert st["rank1"] > st["chance"], st
+
+    # 7. LE PILOTE : write -> query -> parts, sur 2 lanes en lockstep
+    #    Scénario par lane : [énonce slot 1] [énonce slot 2] [question slot 1]
+    #    [réponse]. Le préfixe doit tomber sur la RÉPONSE, pas avant, et il
+    #    doit contenir le groupe du slot 1 EN TÊTE.
+    cfgR = RtiConfig(top_k=4, max_groups=8, train_groups=2, eval_groups=2)
+    run = RtiRunner(cfgR, w, sep_id=5, n_lanes=2, seed=1)
+    ty2 = InjectType(d)
+    retr = Retriever(d)
+    with torch.no_grad():
+        retr.wq.weight.normal_(0, 0.05)
+
+    def _seg(ids, fact=0, q=0, role="user"):
+        T = ids.size(1)
+        s = {"input_ids": ids, "pad_mask": torch.ones(2, T, dtype=torch.bool),
+             "roles": (role, role)}
+        if fact:
+            s["fact_slot"] = torch.full((2, T), fact, dtype=torch.long)
+        if q:
+            s["q_slot"] = torch.full((2, T), q, dtype=torch.long)
+        return s
+
+    s1 = _seg(torch.tensor([[100, 101, 102, 103, 104, 105],
+                            [110, 111, 112, 113, 114, 115]]), fact=1)
+    s2 = _seg(torch.tensor([[200, 201, 202, 203, 204, 205],
+                            [210, 211, 212, 213, 214, 215]]), fact=2)
+    sq = _seg(torch.tensor([[300, 301, 302, 303],
+                            [310, 311, 312, 313]]), q=1)
+    sa = _seg(torch.tensor([[400, 401, 402, 403],
+                            [410, 411, 412, 413]]), role="assistant")
+
+    # avant tout write, une question n'a pas de cible : écartée, pas de préfixe
+    assert run.query(retr, sq["q_slot"], torch.randn(2, 4, d)) is None
+    assert run.tel["no_pos"] == 2
+    assert all(p is None for _, p in run.parts(E, ty2.vec, 2, sa["roles"]))
+
+    assert run.write(E, s1["input_ids"], s1["fact_slot"]) == 2 and run.write(E, s2["input_ids"], s2["fact_slot"]) == 2
+    assert [len(b) for b in run.banks] == [2, 2]
+    assert run.banks[0].tags == [1, 2]
+    # un seg SANS fact_slot n'écrit rien (write_every_turn=False)
+    assert run.write(E, sq["input_ids"], sq.get("fact_slot")) == 0
+    ce = run.query(retr, sq["q_slot"], torch.randn(2, 4, d))
+    assert ce is not None and float(ce) > 0
+    ce.backward()
+    assert float(retr.wq.weight.grad.abs().max()) > 0, "CE du pilote sans gradient"
+    assert all(p is not None for p in run.pending)
+    # le préfixe tombe sur la RÉPONSE, contient train_groups groupes, et le vrai
+    # (slot 1 = index 0 de la banque) est EN TÊTE
+    prt = run.parts(E, ty2.vec, 2, sa["roles"])
+    assert len(prt) == 1 and prt[0][1] is not None
+    rows, inj = prt[0]
+    assert rows.tolist() == [0, 1]
+    assert inj.shape == (2, 2 * cfgR.group_prefix, d), inj.shape
+    assert torch.allclose(inj[0, :4], E[run.banks[0].toks[0]]), \
+        "oracle_first : le groupe du fait interrogé doit ouvrir le préfixe"
+    # la requête est CONSOMMÉE : le seg d'après ne reçoit plus rien
+    assert all(p is None for _, p in run.parts(E, ty2.vec, 2, sa["roles"]))
+    # un rôle non-assistant ne reçoit jamais le préfixe (garde de désalignement)
+    run.query(retr, sq["q_slot"], torch.randn(2, 4, d))
+    assert all(p is None for _, p in run.parts(E, ty2.vec, 2, sq["roles"]))
+
+    # PARTITION : une lane injectée et une lane vide = DEUX sous-lots
+    run2 = RtiRunner(cfgR, w, sep_id=5, n_lanes=2, seed=1)
+    run2.write(E, s1["input_ids"], s1["fact_slot"])
+    run2.write(E, s2["input_ids"], s2["fact_slot"])
+    run2.banks[1] = LaneBank()                       # lane 1 : banque vidée
+    run2.query(retr, sq["q_slot"], torch.randn(2, 4, d))
+    prt2 = run2.parts(E, ty2.vec, 2, sa["roles"])
+    assert len(prt2) == 2, "les lanes de longueurs de préfixe différentes "\
+                           "doivent partir en sous-lots séparés"
+    assert {tuple(r.tolist()) for r, _ in prt2} == {(1,), (0,)}
+    assert sorted(int(i is None) for _, i in prt2) == [0, 1]
+    # la partition COUVRE le batch exactement une fois
+    assert sorted(int(b) for r, _ in prt2 for b in r) == [0, 1]
+    tl = run2.telemetry()
+    assert tl["recall1"] <= 1.0 and tl["n_inject"] == 1, tl
 
     print("rti self-test: OK — groupe (top-k SIF ordonné, taille fixe, clé "
           "procédurale unitaire), FIFO par groupe + positifs multiples, "

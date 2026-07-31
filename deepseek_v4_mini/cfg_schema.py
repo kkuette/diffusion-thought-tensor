@@ -46,7 +46,8 @@ class ConfigError(ValueError):
 
 SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
     "code_defer_native": {
-        "": ({"tokenizer", "model", "data", "training"}, {"chat", "teacher"}),
+        "": ({"tokenizer", "model", "data", "training"},
+             {"chat", "rti", "teacher"}),
         "training": (
             {"save_dir", "steps"},
             {"adam_fused", "addr_label", "addr_max", "addr_prob", "allreduce_bf16",
@@ -75,6 +76,9 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
                   "p_chat", "stream", "weight"}),
         "teacher": (set(), {"anneal", "distill_weight", "enabled", "target",
                             "table_lr"}),
+        "rti": (set(), {"enabled", "eval_groups", "max_groups", "retr_ce",
+                        "retr_detach", "sep_token", "sif_a", "top_k",
+                        "train_groups", "train_order", "write_every_turn"}),
     },
     "rl_disagg": {
         "": ({"tokenizer", "model", "data", "rl"}, set()),

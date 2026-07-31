@@ -43,7 +43,7 @@ def _pick(logits, temp: float, top_p: float, generator=None):
 def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
              stop_id=None, amp: bool = False, temp: float = 0.0,
              top_p: float = 1.0, generator=None, write: bool = False,
-             use_cache: bool = False):
+             use_cache: bool = False, inject=None):
     """Génère au plus `max_new` tokens après `prefix`, depuis la banque COURANTE.
 
     prefix : [B, T]. Renvoie (gen, lens) :
@@ -91,8 +91,16 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
     for i in range(max_new):
         with torch.autocast("cuda", dtype=torch.bfloat16,
                             enabled=amp and out.is_cuda):
+            # `inject` [B,P,d] (rti) : le préfixe de pseudo-tokens précède le
+            # prompt. SANS cache, `fed` est la séquence ENTIÈRE recalculée à
+            # chaque pas — le préfixe doit donc y être remis à chaque fois.
+            # AVEC cache, il n'entre qu'une fois : sa KV est dans le cache, le
+            # repasser le dupliquerait.
             o = model(fed, init_mem=bank, layer_banks=layer_banks, write=write,
-                      **({"cache": cache} if cache is not None else {}))
+                      **({"cache": cache} if cache is not None else {}),
+                      **({"inject": inject}
+                         if inject is not None and (cache is None or i == 0)
+                         else {}))
         nt = _pick(o["logits"][:, -1], temp, top_p, generator)   # [B,1]
         out = torch.cat([out, nt], dim=1)
         fed = nt if cache is not None else out

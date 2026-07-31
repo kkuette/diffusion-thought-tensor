@@ -104,7 +104,10 @@ import torch
 _ZERO_PAD_KEYS = ("loss_mask", "attention_mask", "val_mask", "surp_w",
                   # identité du fait (teacher value_table) : [1,T] long,
                   # 1-based — le pad 0 vaut « pas de fait » par construction
-                  "fact_slot", "fact_val", "fact_attr")
+                  "fact_slot", "fact_val", "fact_attr",
+                  # rti : slot INTERROGÉ par un seg de question (cible de la CE
+                  # du retriever). Même convention 1-based, même pad 0.
+                  "q_slot")
 
 
 class ChatBatchStream:

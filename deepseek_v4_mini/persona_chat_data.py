@@ -614,6 +614,28 @@ class PersonaChatStream:
                                       dtype=torch.long)
         return seg
 
+    def _user_query(self, text: str, slot: str) -> dict:
+        """Seg user qui INTERROGE un fait : porte `q_slot`, l'identité du slot
+        demandé, en SYMÉTRIE EXACTE du `fact_slot` posé sur l'énonciation.
+
+        Pourquoi ce canal existe (rti, 2026-07-31) : la sélection apprise a
+        besoin, devant chaque réponse, de savoir QUEL fait est interrogé — c'est
+        la cible de sa CE auxiliaire. Cette liaison ne vivait que dans
+        `conv["info"]["q_slots"]`, au niveau de la CONVERSATION, et `info` ne
+        survit pas à `chat_batch._collate` (seul `roles` est propagé). Posée
+        ICI, elle voyage avec le seg : clé long [1, T] constante, zéro-paddée
+        comme les trois canaux de fait, donc `_collate` et `_split_seg` la
+        traitent sans une ligne de plus. 0 = ce seg n'interroge rien.
+
+        L'ÉNONCIATION porte fact_slot, la QUESTION porte q_slot, et le même
+        entier les relie : c'est tout le lien dont le retriever a besoin.
+        """
+        seg = self._user(text)
+        T = seg["input_ids"].size(1)
+        seg["q_slot"] = torch.full((1, T), self.slot_ids.get(slot, 0),
+                                   dtype=torch.long)
+        return seg
+
     def _assistant(self, text: str) -> dict:
         return self._seg([(A_OPEN, False), (text, True), ("\n", True),
                           (CLOSE, True)], "assistant")
@@ -714,7 +736,7 @@ class PersonaChatStream:
             queries.append(q)
             truths.append(f["v"])
             q_slots.append(f["slot"])
-            segs.append(self._user(q))
+            segs.append(self._user_query(q, f["slot"]))
             # age = writes between the fact seg and this answer's decode
             ages.append(len(segs) - fact_seg[f["slot"]])
             # réponse de rappel : valeur hors contexte (le fait est dans un seg
@@ -776,7 +798,7 @@ def _self_test() -> None:
     ps = PersonaChatStream(tok, seed=0)
     from collections import Counter
     kinds, ages = Counter(), Counter()
-    n_updated = n_beyond = 0
+    n_updated = n_beyond = n_q = 0
 
     for _ in range(600):
         c = ps.next_conv()
@@ -826,8 +848,28 @@ def _self_test() -> None:
                     assert int(s["fact_val"][0, 0]) >= 1
                 else:
                     assert "fact_slot" not in s
+            # q_slot : la CIBLE du retriever (rti). Un seg de QUESTION par
+            # requête, DANS L'ORDRE de info["q_slots"], portant l'entier qui
+            # nomme le slot interrogé — le MÊME que le fact_slot du seg qui
+            # l'énonce. Sans cette égalité, la sélection apprendrait à viser un
+            # groupe qui n'existe pas.
+            qs = [s for s in c["segs"] if "q_slot" in s]
+            assert len(qs) == len(info["q_slots"]), (len(qs), info["q_slots"])
+            for s, name in zip(qs, info["q_slots"]):
+                ch = s["q_slot"]
+                assert ch.shape == s["input_ids"].shape and ch.dtype == torch.long
+                assert int(ch.min()) == int(ch.max()) == ps.slot_ids[name] >= 1
+                assert s["role"] == "user" and "fact_slot" not in s
+                n_q += 1
+            # et l'énonciation du MÊME slot porte le MÊME entier
+            fs = {int(s["fact_slot"][0, 0]) for s in c["segs"]
+                  if "fact_slot" in s}
+            assert {ps.slot_ids[n] for n in info["q_slots"]} <= fs, (fs, info)
+        else:
+            assert all("q_slot" not in s for s in c["segs"])
 
     assert kinds["smalltalk"] > 60 and kinds["recall"] > 300, kinds
+    assert n_q > 300, n_q
     assert n_updated > 20 and n_beyond > 30
     assert max(ages) >= 16, f"no beyond-FIFO stratum sampled: {dict(ages)}"
     # ids de faits STABLES entre instances, splits et seeds (tables du teacher)
@@ -837,7 +879,8 @@ def _self_test() -> None:
     assert ps.n_val_ids == len(ps.val_ids) + 1
     print(f"persona_chat self-test: OK ({dict(kinds)}, "
           f"age octaves {dict(sorted(ages.items()))}, "
-          f"updated {n_updated}, beyond {n_beyond})")
+          f"updated {n_updated}, beyond {n_beyond}, q_slot posé sur {n_q} "
+          f"segs de question)")
 
 
 # ── real-tokenizer smoke ─────────────────────────────────────────────────────

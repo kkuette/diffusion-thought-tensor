@@ -43,6 +43,7 @@ MODULES=(
   cfg_schema          # schéma des configs : clé inconnue = arrêt (anti-dérive ast)
   chat_mix            # mix pondéré de streams derrière le contrat mono-stream
   chat_batch          # B lanes chat en lockstep par tour (padding, pas de ligne vide)
+  rti                 # retrieve-then-inject : groupe, FIFO, retriever, préfixe, pilote
 )
 
 [ $# -gt 0 ] && MODULES=("$@")
