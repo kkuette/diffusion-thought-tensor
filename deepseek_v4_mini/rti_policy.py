@@ -194,6 +194,11 @@ def pl_logp(scores: torch.Tensor, order, temp: float = 1.0,
     for i in order:
         av = s.masked_fill(mask, float("-inf"))
         out = out + av[int(i)] - torch.logsumexp(av, -1)
+        # HORS PLACE, et ce n'est pas un détail : `masked_fill` garde le masque
+        # pour son backward. Le muter en place ferait échouer le backward du
+        # learner (« modified by an inplace operation », version du tenseur) —
+        # or c'est précisément ici que passe le gradient du retriever.
+        mask = mask.clone()
         mask[int(i)] = True
     return out
 

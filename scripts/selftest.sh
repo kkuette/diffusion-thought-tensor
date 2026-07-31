@@ -46,6 +46,7 @@ MODULES=(
   rti                 # retrieve-then-inject : groupe, FIFO, retriever, préfixe, pilote
   recall_env          # vies de rappel scriptées/appariées + reward vérifiable
   rti_policy          # les 3 ACTIONS RL du bras rti : write, Plackett-Luce, décodage
+  rti_learner         # passe 2 rti : ratios on-policy, CISPO, GiGPO, leave-one-slot
 )
 
 [ $# -gt 0 ] && MODULES=("$@")

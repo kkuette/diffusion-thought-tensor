@@ -130,7 +130,14 @@ recall_env:
 
 rl:
   seed: 0
-  train_scope: think_row
+  train_scope: rti                         # retriever + tête de write + vecteur
+                                           # de type SEULS, backbone gelé. Sous
+                                           # rti la ligne `<think>` du lm_head
+                                           # n'est l'action de personne (le
+                                           # write est une tête dédiée) : le
+                                           # learner REFUSE `think_row` à
+                                           # l'assert. `all` ouvre le backbone —
+                                           # pas au premier run.
   init_from: ${TB_ROOT}/checkpoints/v350_sft_recall_rti/final.pt
   n_lives_per_worker: 2
   max_episodes_per_life: 0
@@ -161,6 +168,46 @@ rl:
                                            # forward, les graphs sont capturés à
                                            # forme FIXE. Refus à l'assert côté
                                            # worker (jamais un désarmement muet).
+  # ── L'ALGO DU LEARNER (rti_learner.py) ─────────────────────────────────────
+  # Recette actée (recherche SOTA 2026-07), et NON du GRPO vanilla :
+  # avantage Dr.GRPO (baseline de groupe, jamais /σ) + second niveau GiGPO
+  # ancré sur l'index de tour, loss CISPO (on clippe le POIDS d'importance, pas
+  # la mise à jour), crédit write contrefactuel leave-one-slot, filtrage
+  # zéro-variance. Aucun terme KL : le cliquet SFT joue ce rôle ENTRE phases.
+  learner:
+    algo: cispo
+    cispo_low: 0.0                         # r >= 0 par construction : pas de
+                                           # borne basse ⇒ les actions rares
+                                           # (write froid) gardent leur gradient
+    cispo_high: 2.0                        # borne haute LARGE : avec
+                                           # write_floor 0.5 le ratio d'un write
+                                           # confiant vaut déjà ~p/0.5
+    omega: 1.0                             # poids de l'avantage de TOUR
+    gamma: 1.0                             # vies courtes : escompter
+                                           # n'ajouterait qu'un biais de récence
+    adv_scale: 1.0                         # normalisation batch-level = une
+                                           # CONSTANTE (jamais une stat de
+                                           # groupe : c'est le biais Dr.GRPO)
+    cf_coef: 0.5                           # crédit leave-one-slot (0 = off).
+                                           # Coût : 1 forward par (write, sonde)
+    cf_signed: true                        # pondéré par (2·reward − 1) : un
+                                           # slot qui a porté une MAUVAISE
+                                           # réponse n'est pas un bon write
+    cf_clip: 5.0                           # |Δ| borné (réponse vide = −40 nats)
+    w_write: 1.0                           # poids des trois familles d'actions
+    w_retr: 1.0
+    w_dec: 1.0
+    tok_norm: 0.0                          # 0 ⇒ rl.max_new. Diviseur FIXE de la
+                                           # famille tokens — JAMAIS la longueur
+                                           # réalisée (biais de longueur)
+    drop_zero_var: true                    # groupe à reward uniforme = zéro
+                                           # gradient d'épisode ⇒ jeté et compté
+    keep_turn_only: true                   # …sauf s'il reste de la variance PAR
+                                           # TOUR (deux rollouts qui réussissent
+                                           # chacun une sonde différente)
+    write_cost: 0.0                        # pénalité de coût des writes, OFF :
+                                           # la FIFO price déjà l'écriture par
+                                           # éviction
   disagg:
     root: ${TB_ROOT}/rl/recall_env_smoke
     publish_every: 1

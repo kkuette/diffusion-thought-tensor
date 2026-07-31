@@ -104,11 +104,20 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
              "decode_cache", "decode_graphs", "explore_floor", "grad_clip",
              "group_size",
              "groups_per_step", "kl_coef",
-             "lambda_write", "lr", "max_episodes_per_life", "max_new",
+             "lambda_write", "learner", "lr", "max_episodes_per_life", "max_new",
              "max_resample", "min_reward_std", "n_lives_per_worker", "save_every",
              "seed", "temp", "think_floor", "think_id", "think_nmax",
              "train_scope"},
         ),
+        # `rl.learner:` = l'ALGO du bras rti (rti_learner.RtiLearnConfig) :
+        # avantage Dr.GRPO + GiGPO, loss CISPO, crédit contrefactuel,
+        # filtrage zéro-variance. La dataclass lève déjà sur une clé inconnue ;
+        # la déclarer ici la fait tomber au --check, AVANT le GPU.
+        "rl.learner": (set(),
+                       {"adv_scale", "algo", "cf_clip", "cf_coef", "cf_signed",
+                        "cispo_high", "cispo_low", "drop_zero_var", "gamma",
+                        "keep_turn_only", "omega", "tok_norm", "w_dec",
+                        "w_retr", "w_write", "write_cost"}),
         "rl.disagg": (
             {"root"},
             {"keep_weights", "lives_save_every", "max_groups", "max_lag",

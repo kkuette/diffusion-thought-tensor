@@ -65,6 +65,8 @@ from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_rewards import make_exec_reward, make_recall_reward, make_tool_reward
+from .rti_learner import learn_from_raw, step_groups, telemetry
+from .rti_policy import attach_rti_modules, rti_from_raw
 from .cfg_schema import check as check_cfg
 from .paths import load_yaml
 
@@ -509,6 +511,35 @@ class Worker:
                 self.rti_cfg.sif_a).to(self.device)
         return w
 
+    def _rti_payload(self, conv, traces, env) -> dict:
+        """De quoi REJOUER le groupe sans le stream, le tokenizer ni le corpus.
+
+        La passe 2 refait des forwards : sans les ids des segs elle n'a rien à
+        forwarder. Reconstruire le script côté learner (`conv_for_life`) le
+        rendrait dépendant du corpus de filler réel et du tokenizer, et un
+        écart d'un token y serait INVISIBLE (le digest porte sur le script, pas
+        sur la tokenisation). On expédie donc les segs — ~1 k entiers, partagés
+        par les G rollouts, négligeable devant les traces.
+
+        `sif` est la table SIF RESTREINTE aux tokens que `build_group` indexe
+        réellement (ids des segs + tokens décodés, seules sources d'un groupe
+        écrit) : quelques centaines d'entrées au lieu du vocabulaire entier.
+        """
+        ids = set()
+        for s in conv["segs"]:
+            ids |= set(s["input_ids"].reshape(-1).tolist())
+        for tr in traces:
+            for t in tr["turns"]:
+                if t["decode"] is not None:
+                    ids |= set(t["decode"]["tokens"])
+        ids.add(self.rti_sep)
+        sid = torch.tensor(sorted(ids), dtype=torch.long)
+        return {"segs": [s["input_ids"].detach().cpu() for s in conv["segs"]],
+                "a_open": self.a_open.detach().cpu(),
+                "sep_id": int(self.rti_sep),
+                "sif": {"ids": sid,
+                        "w": self._sif_w(env).detach().cpu()[sid].float()}}
+
     def _next_life(self) -> int:
         """Vie SUIVANTE de la partition de ce worker. Les vies ne migrent
         jamais d'un worker à l'autre (même invariant que les lives du chemin
@@ -549,7 +580,9 @@ class Worker:
                             "worker": self.wid, "life": int(life),
                             "digest": traces[0]["digest"],
                             "layout": traces[0]["layout"],
-                            "rollouts": traces}, self.wstep, self.wid)
+                            "rollouts": traces,
+                            **self._rti_payload(conv, traces, env)},
+                           self.wstep, self.wid)
             self.n_groups += 1
             dec = [t for tr in traces for t in tr["turns"] if t["decode"]]
             raw = [t["raw"] for t in dec if t.get("raw") is not None]
@@ -933,12 +966,44 @@ class Learner:
         if not hasattr(self, "_think_id"):
             self._think_id = int(r.get("think_id", 0)) or 0
         self.ids = (self._think_id, -1)        # blank unused in the update
-        self.ref = copy.deepcopy(self.model).eval()
-        for p in self.ref.parameters():
-            p.requires_grad_(False)
+        # bras rti : les knobs des actions (partagés avec le worker) + l'algo
+        self.rti_cfg, self.rti_pol, self.rti_on = rti_from_raw(raw or {})
+        self.lcfg = learn_from_raw(raw)
+        # PAS de référence sous rti : la recette n'a PAS de terme KL (le cliquet
+        # SFT joue ce rôle entre phases). Un deepcopy du 350M coûterait 1,4 Go
+        # de VRAM pour un tenseur jamais lu.
+        self.ref = None
+        if not self.rti_on:
+            self.ref = copy.deepcopy(self.model).eval()
+            for p in self.ref.parameters():
+                p.requires_grad_(False)
 
         scope = r.get("train_scope", "think_row")
-        if scope == "think_row":
+        if self.rti_on:
+            assert scope in ("rti", "all"), (
+                f"train_scope {scope!r} n'a pas de sens sous rti : la ligne "
+                "`<think>` du lm_head n'est l'action de personne sur ce bras "
+                "(le write est une tête dédiée). Mettre `rti` (retriever + "
+                "write + type seuls) ou `all`.")
+            names = attach_rti_modules(self.model,
+                                       int(self.model.embed.weight.size(1)))
+            if scope == "rti":
+                for p in self.model.parameters():
+                    p.requires_grad_(False)
+                byname = dict(self.model.named_parameters())
+                opt_params = [byname[k] for k in names]
+                for p in opt_params:
+                    p.requires_grad_(True)
+            else:
+                opt_params = list(self.model.parameters())
+            print(f"learner: rti ON — scope {scope} "
+                  f"({sum(p.numel() for p in opt_params)} params entraînés), "
+                  f"CISPO [{self.lcfg.cispo_low}, {self.lcfg.cispo_high}], "
+                  f"ω {self.lcfg.omega}, γ {self.lcfg.gamma}, contrefactuel "
+                  f"{self.lcfg.cf_coef}, poids w/r/d "
+                  f"{self.lcfg.w_write}/{self.lcfg.w_retr}/{self.lcfg.w_dec}",
+                  flush=True)
+        elif scope == "think_row":
             for p in self.model.parameters():
                 p.requires_grad_(False)
             W = self.model.lm_head.weight
@@ -1024,8 +1089,58 @@ class Learner:
                     } for ro in g["rollouts"]],
                 }) + "\n")
 
+    # ── l'update du bras rti ────────────────────────────────────────────────
+    def step_rti(self, groups) -> dict:
+        """Un pas CISPO sur des groupes rti (`rti_learner` : passe 2, avantage
+        à deux niveaux, crédit contrefactuel). Le modèle reste en fp32 et la
+        passe 2 ne prend PAS d'autocast : le décalage numérique sampler/learner
+        est un facteur de premier ordre sur les ratios."""
+        self.model.train()
+        self.opt.zero_grad(set_to_none=True)
+        agg = step_groups(self.model, groups, self.rti_cfg, self.rti_pol,
+                          self.lcfg, device=self.device, amp=False)
+        gn = float(torch.nn.utils.clip_grad_norm_(
+            [p for p in self.model.parameters() if p.requires_grad],
+            float(self.r.get("grad_clip", 1.0))))
+        if agg["n_groups"]:
+            self.opt.step()
+        self.step += 1
+        if self.step % self.publish_every == 0:
+            self.hub.publish(self.model.state_dict(), self.step)
+        line = telemetry(agg)
+        line.update(step=self.step, grad_norm=gn,
+                    lag=st.mean([self.step - 1 - g["weights_step"]
+                                 for g in groups]),
+                    env_mix={g["env"]: 1 for g in groups})
+        return line
+
+    @staticmethod
+    def fmt_rti(line: dict, n_stale: int = 0) -> str:
+        """La ligne du bras rti. `hit`/`top1` séparent un échec de SÉLECTION
+        d'un échec de COPIE, les trois ratios disent lequel des trois canaux
+        part off-policy, `cfΔ` dit si les slots injectés portent quelque
+        chose. Une métrique absente s'affiche `—` plutôt que de tuer le run."""
+        f = lambda k: ("—" if line.get(k) is None else f"{line[k]:+.3f}")
+        return (f"step {line['step']:4d}  r {f('reward')}/{f('reward_max')}  "
+                f"hit {f('hit')} top1 {f('top1')}  "
+                f"p(w) {f('p_write')} H {f('h_write')}  "
+                f"ratio w/r/d {f('r_write')}/{f('r_retr')}/{f('r_dec')} "
+                f"clip {line['clip_frac']:.2f}  cfΔ {f('cf_delta')}  "
+                f"|A| {f('adv')}  gn {line['grad_norm']:.2e}  "
+                f"loss {line['loss']:+.3f}  groups {line['groups']}"
+                f"(-{line['dropped']})  act {line['n_act']}  "
+                f"lag {line['lag']:.1f}  stale {n_stale}  "
+                f"{line.get('s_per_step', 0.0):.1f}s/step")
+
     def step_once(self, groups) -> dict:
         """One GRPO update from consumed groups (advantages in-group)."""
+        fmt = {g.get("format") for g in groups}
+        if fmt == {"rti"}:
+            return self.step_rti(groups)
+        assert "rti" not in fmt, (
+            f"lot HÉTÉROGÈNE {fmt} : les deux bras n'ont ni les mêmes actions "
+            "ni le même avantage, un lot mixte ferait deux updates masquées "
+            "l'une par l'autre. Le worker refuse déjà de mélanger les kinds.")
         self.model.train()
         self.opt.zero_grad(set_to_none=True)
         p0 = next(self.model.parameters())
@@ -1033,13 +1148,6 @@ class Learner:
              "kl": [], "env": {}, "p": [], "lag": []}
         rolls_flat = []
         for g in groups:
-            assert g.get("format") != "rti", (
-                "groupe rti reçu par le learner v1 : la passe 2 de ce bras "
-                "(ratio Plackett-Luce + Bernoulli du write + tokens décodés, "
-                "crédit leave-one-slot) est le chantier de l'agent 3 — voir "
-                "rti_policy.pl_logp / write_logp / replay_logp / "
-                "forward_probe_with_masked_slot. Les groupes sont archivés "
-                "dans traces.jsonl, rien n'est perdu.")
             m["lag"].append(self.step - g["weights_step"])
             rolls = group_to_device(g, self.device, p0.dtype)
             rs = [ro["reward"] for ro in rolls]
@@ -1100,6 +1208,15 @@ class Learner:
             line["t"] = time.time()
             line["s_per_step"] = (time.time() - t0) / max(self.step, 1)
             pw = line["p_write"]
+            if self.rti_on:
+                print(self.fmt_rti(line, n_stale_tot), flush=True)
+                with open(self.mfile, "a") as fh:
+                    fh.write(json.dumps(line) + "\n")
+                if self.step % save_every == 0 or self.step >= steps:
+                    _atomic_save({"model": self.model.state_dict(),
+                                  "opt": self.opt.state_dict(),
+                                  "step": self.step}, self.ck_path)
+                continue
             print(f"step {line['step']:4d}  r {line['reward']:+.3f}  "
                   f"ce {line['ce']:.3f}  "
                   f"p(w) {'—' if pw is None else f'{pw:.2f}'}  "
@@ -1366,7 +1483,9 @@ def _self_test():
     # tous les rewards valent 0 et le dynamic sampling rejetterait chaque
     # groupe. Ce bloc prouve le CÂBLAGE, pas la variance de la politique.
     raw_r["rl"].update(group_size=4, max_new=4, decode_graphs=False,
-                       min_reward_std=0.0)
+                       min_reward_std=0.0, train_scope="rti",
+                       learner={"cispo_high": 2.0, "omega": 1.0,
+                                "cf_coef": 0.5})
     raw_r["recall_env"] = {"life_seed": 0, "n_facts": [3, 3], "n_probes": [2, 2],
                            "filler_per_fact": [1, 1], "p_beyond": 0.0,
                            "inject_groups": 2, "max_groups": 4,
@@ -1418,17 +1537,45 @@ def _self_test():
             n_tokdec += len(dcd["decode"]["logp"])
             assert len(dcd["decode"]["logp"]) == len(dcd["decode"]["tokens"])
     assert n_ret and n_tokdec, (n_ret, n_tokdec)
-    # le learner v1 refuse le groupe rti — mais l'archive, elle, passe
+    # de quoi REJOUER le groupe sans stream ni tokenizer (agent 3)
+    assert len(grp["segs"]) == len(grp["rollouts"][0]["turns"])
+    assert grp["sep_id"] == wr.rti_sep and grp["a_open"].numel() > 0
+    assert grp["sif"]["ids"].numel() == grp["sif"]["w"].numel() > 0
+
+    # 10. UN PAS D'UPDATE RTI (le (g) de l'agent 3) : les params rti bougent,
+    #     le backbone GELÉ ne bouge pas, la loss est finie. Le groupe est
+    #     archivé avant consommation, comme sur le chemin historique.
     gr, _ = lr.store.take(1, -5)
     lr.archive(gr)
     assert any(json.loads(l).get("format") == "rti"
                for l in open(lr.trace_path))
-    try:
-        lr.step_once(gr)
-    except AssertionError as e:
-        assert "agent 3" in str(e)
-    else:
-        raise AssertionError("le learner v1 a consommé un groupe rti")
+    before = {k: v.detach().clone() for k, v in lr.model.named_parameters()}
+    # min_reward_std 0 côté worker : le groupe peut être PLAT (modèle
+    # aléatoire ⇒ aucune sonde juste). On force alors de la variance pour que
+    # le filtrage zéro-variance ne mange pas le seul groupe du test.
+    rs = [t["reward"] for t in gr[0]["rollouts"]]
+    if rs and all(x is not None for x in rs) and max(rs) - min(rs) < 1e-9:
+        for j, t in enumerate(gr[0]["rollouts"]):
+            for tt in t["turns"]:
+                if tt["decode"] is not None and tt["reward"] is not None:
+                    tt["reward"] = float(j % 2)
+            ok = [x["reward"] for x in t["turns"]
+                  if x["decode"] is not None and x["reward"] is not None]
+            t["reward"] = sum(ok) / len(ok)
+    line_r = lr.step_once(gr)
+    assert math.isfinite(line_r["loss"]) and line_r["groups"] == 1, line_r
+    assert math.isfinite(line_r["grad_norm"]) and line_r["n_act"] > 0
+    assert 0.0 <= line_r["clip_frac"] <= 1.0 and line_r["p_write"] is not None
+    moved = {k for k, v in lr.model.named_parameters()
+             if not torch.equal(v.detach(), before[k])}
+    assert moved and all(k.startswith("rti_") for k in moved), sorted(moved)
+    assert {"rti_retriever.wq.weight", "rti_write.w.weight"} <= moved, \
+        f"le retriever et la tête de write doivent bouger (vu {sorted(moved)})"
+    # la ligne de télémétrie se FORMATE (un run entier meurt sur une clé
+    # absente, et ça arrive au step 1, après le bring-up)
+    txt = lr.fmt_rti({**line_r, "s_per_step": 1.0}, 0)
+    assert "ratio w/r/d" in txt and "cfΔ" in txt, txt
+    assert "—" in lr.fmt_rti({**line_r, "hit": None, "s_per_step": 1.0}, 0)
 
     shutil.rmtree(root)
     shutil.rmtree(root_r)
@@ -1438,7 +1585,11 @@ def _self_test():
           f"dégrade en generate, bras RTI de bout en bout : env recall_env "
           f"branché, {wr.G} rollouts appariés (1 script, ancres alignées), "
           f"groupe rti expédié avec les 3 log-probs ({n_ret} tirages "
-          f"Plackett-Luce, {n_tokdec} tokens), learner v1 refuse et archive)")
+          f"Plackett-Luce, {n_tokdec} tokens) + segs/a_open/sep/sif pour la "
+          f"passe 2, un pas CISPO consommé : loss {line_r['loss']:+.3f}, "
+          f"{line_r['n_act']} actions créditées, |∇| "
+          f"{line_r['grad_norm']:.2e}, bougent {sorted(moved)} et RIEN "
+          f"d'autre)")
 
 
 if __name__ == "__main__":
