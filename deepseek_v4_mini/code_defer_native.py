@@ -119,8 +119,30 @@ def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None,
     return loss, o["mem_bank"], ce_t, ce_lane
 
 
+def _val_split(ce_tok, m2, vm2):
+    """(num_val, den_val, num_tpl, den_tpl) — la CE supervisée COUPÉE en deux
+    par le span valeur.
+
+    `ce_tok` [n·(T−1)], `m2` [n,T−1] = le loss_mask des CIBLES (déjà décalé,
+    PONDÉRÉ — value_weight ×4 sur persona), `vm2` [n,T−1] ∈ {0,1} = le val_mask
+    des mêmes cibles. Les deux morceaux sont pris avec les MÊMES poids que la
+    CE totale, donc num_val + num_tpl = num_total et den_val + den_tpl =
+    den_total AU BIT : la décomposition est une partition, pas une seconde
+    mesure (c'est ce que vérifie le self-test).
+
+    Pourquoi ça existe : 800 steps de run rti ont affiché un Δnll qui montait
+    (3.0 → 1.7) alors que la nll des tokens VALEUR — la seule chose que la
+    banque puisse apporter — n'avait pas bougé. La moyenne mélangeait le
+    format et la citation, et le format est ~90 % des positions supervisées.
+    """
+    ce = ce_tok.view_as(m2)
+    wv = m2 * vm2
+    wt = m2 - wv
+    return (ce * wv).sum(), wv.sum(), (ce * wt).sum(), wt.sum()
+
+
 def _chat_loss_rti(model, x, lmask, balw, amp, parts, layer_banks,
-                   pad_mask=None, m_any=None):
+                   pad_mask=None, m_any=None, val_mask=None, copy_head=None):
     """`_chat_loss` du bras RTI : le batch est PARTITIONNÉ par longueur de
     préfixe injecté.
 
@@ -138,24 +160,49 @@ def _chat_loss_rti(model, x, lmask, balw, amp, parts, layer_banks,
     La banque fast-weight est ENTIÈREMENT contournée : `layer_banks` tout à
     None (aucune couche ne lit) et `write=False` (aucun gist écrit). Le seul
     canal mémoire de ce bras est le préfixe. Rend (loss, ce_detached_or_None,
-    ce_lane_or_None) — pas de banque : il n'y en a plus.
+    ce_lane_or_None, diag) — pas de banque : il n'y en a plus.
+
+    `parts` accepte les PAIRES `(rows, inject)` comme les TRIPLETS
+    `(rows, inject, prefix_ids)` de `RtiRunner.parts(with_ids=True)` : les
+    `prefix_ids` ne sont passés au forward QUE s'ils existent, donc le chemin
+    copy-head OFF est bit-identique à l'existant (invariant : le run en cours
+    ré-importe ce fichier à une reprise éventuelle).
+
+    `val_mask` [B,T] + `copy_head` : la TÉLÉMÉTRIE, hors gradient. `diag` rend
+    des tenseurs 0-d accumulés (aucune synchro de device ici — l'appelant
+    matérialise une fois par log) : nll VALEUR et nll TEMPLATE séparées, et
+    p_copy moyen sur chacune des deux classes de positions. C'est la mesure qui
+    a manqué 800 steps : la nll-valeur doit décrocher, et la porte doit s'ouvrir
+    SUR LA VALEUR — une porte qui s'ouvre partout serait un lissage, pas une
+    citation.
     """
     B = x.size(0)
     loss = None
     num = den = None
     per = x.new_zeros(B, dtype=torch.float32)
     wln = x.new_zeros(B, dtype=torch.float32)
-    for rows, inj in parts:
+    diag = None
+    if val_mask is not None:
+        z = x.new_zeros((), dtype=torch.float32)
+        diag = {k: z.clone() for k in ("nv", "dv", "nt", "dt",
+                                       "pv", "pn_v", "pt", "pn_t")}
+    for part in parts:
+        rows, inj = part[0], part[1]
+        pids = part[2] if len(part) > 2 else None
         rows = rows.to(x.device)
         xs, ms = x[rows], lmask[rows]
         pms = None if pad_mask is None else pad_mask[rows]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             o = model(xs, init_mem=None, layer_banks=layer_banks, write=False,
-                      pad_mask=pms, inject=inj)
+                      pad_mask=pms, inject=inj,
+                      **({"prefix_ids": pids} if pids is not None else {}))
         bl = balw * o["balance_loss"].float() * (rows.numel() / B)
         loss = bl if loss is None else loss + bl
         m2 = ms[:, 1:]
         lg = o["logits"].float()
+        # `logits_are_logprobs` (tête de copie) : la CE reste EXACTE telle
+        # quelle, log_softmax d'une log-proba normalisée est l'identité. On ne
+        # touche donc à rien — c'est le contrat posé par rti_copy.
         ce_tok = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
                                  xs[:, 1:].reshape(-1), reduction="none")
         n_, d_ = (ce_tok * m2.reshape(-1)).sum(), m2.sum()
@@ -165,6 +212,24 @@ def _chat_loss_rti(model, x, lmask, balw, amp, parts, layer_banks,
         per[rows] = ((ce_tok.view_as(m2) * m2).sum(1)
                      / w_.clamp_min(1e-6)).detach().float()
         wln[rows] = w_.detach().float()
+        if diag is not None:
+            with torch.no_grad():
+                vm2 = (val_mask[rows][:, 1:] > 0).to(m2.dtype)
+                nv, dv, nt, dt = _val_split(ce_tok.detach(), m2, vm2)
+                diag["nv"] += nv.float(); diag["dv"] += dv.float()
+                diag["nt"] += nt.float(); diag["dt"] += dt.float()
+                gate = (getattr(copy_head, "last_gate", None)
+                        if (copy_head is not None and pids is not None)
+                        else None)
+                if gate is not None:
+                    # la porte de la position t décide du token t+1 : on
+                    # l'aligne donc sur les CIBLES, comme la CE.
+                    g = gate[:, :-1].float()
+                    sup = (m2 > 0).to(g.dtype)
+                    diag["pv"] += (g * sup * vm2).sum()
+                    diag["pn_v"] += (sup * vm2).sum()
+                    diag["pt"] += (g * sup * (1 - vm2)).sum()
+                    diag["pn_t"] += (sup * (1 - vm2)).sum()
     ce_t = ce_lane = None
     # `m_any` est décidé côté CPU par l'appelant (cf. _chat_loss) : sans lui il
     # faudrait synchroniser le device au milieu du forward.
@@ -177,11 +242,11 @@ def _chat_loss_rti(model, x, lmask, balw, amp, parts, layer_banks,
         if B > 1:
             has = (wln > 0).float()
             ce_lane = (per * has).sum() / has.sum().clamp_min(1.0)
-    return loss, ce_t, ce_lane
+    return loss, ce_t, ce_lane, diag
 
 
 def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False,
-            pool=None, inject=None, layer_banks=None):
+            pool=None, inject=None, layer_banks=None, prefix_ids=None):
     """Greedy-decode max_new tokens after prefix from the CURRENT bank (reads
     only). Une seule ligne : l'éval décode conv par conv. Voir decode.generate
     pour la boucle (et pour le décodage batché, qui sert au RL).
@@ -191,15 +256,22 @@ def _greedy(model, prefix, bank, max_new, stop_id, amp, use_cache=False,
     (largeur pleine, cf. decode_graphs) : les DEUX bras d'un palier passent par
     le même chemin, la comparaison reste interne. Le bras ablaté (bank None)
     reste eager : GraphDecodeRunner exige une banque explicite, et ce bras est
-    décodé UNE fois par palier de toute façon."""
+    décodé UNE fois par palier de toute façon.
+
+    `prefix_ids` (rti + tête de copie) : ce que DIT chaque position du préfixe
+    injecté. Sans lui, le décodage d'éval mesurerait un modèle AMPUTÉ de la
+    tête de copie alors que l'entraînement l'a apprise — c'est-à-dire pas le
+    modèle. `generate` le porte entre les pas (report de h_prefix sous cache).
+    """
     if pool is not None and bank is not None and inject is None \
-            and layer_banks is None:
+            and layer_banks is None and prefix_ids is None:
         out = pool.decode(prefix, bank, max_new, stop_id)
         if out is not None:
             return out
     gen, lens = generate(model, prefix, bank=bank, max_new=max_new,
                          stop_id=stop_id, amp=amp, use_cache=use_cache,
-                         inject=inject, layer_banks=layer_banks)
+                         inject=inject, layer_banks=layer_banks,
+                         prefix_ids=prefix_ids)
     return gen[:, :int(lens[0])]
 
 
@@ -259,7 +331,8 @@ AGE_BUCKETS = ("<=4", "5-8", "9-16", ">16")
 
 @torch.no_grad()
 def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
-                  use_cache=False, decode=True, graphs=False, rti=None):
+                  use_cache=False, decode=True, graphs=False, rti=None,
+                  copy_head=None, skip_kinds=()):
     """Chat eval (math_school | persona): canonical segments advance the bank
     (teacher-forced writes). Only the GRADED assistant turns (the last
     len(truths) — the answers to memory queries) are greedy-decoded TWICE —
@@ -301,7 +374,25 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     forward ablaté par tour gradé). C'est le levier de cadence : le grade
     exact-match est aveugle tant que le canal n'existe pas, la sonde Δnll ne
     l'est pas — voir `chat.decode_every` côté trainer. Les clés grade/grade_abl
-    sont alors normalisées par `n_dec` = 0 et le trainer ne les imprime pas."""
+    sont alors normalisées par `n_dec` = 0 et le trainer ne les imprime pas.
+
+    `skip_kinds` (chat.eval_skip_kinds) : kinds dont AUCUN tour n'est gradé —
+    ils restent dans le flux (leurs writes peuplent la banque, ce sont les
+    distracteurs), mais ne coûtent aucun décodage et ne polluent aucune
+    ventilation. Motivé par le kind `requote` : sa vérité est le message
+    assistant ENTIER d'un échange antérieur, jamais un span citable, et le
+    préfixe rti n'y est jamais injecté (pas de q_slot) — un tour gradé
+    structurellement ingagnable, qui mangeait la moitié du budget de décodage
+    et diluait le Δnll du seul kind que ce bras peut trancher.
+
+    `copy_head` : le module `model.rti_copy` quand il est actif. Deux effets —
+    (1) le bras LIVE décode et se mesure AVEC les `prefix_ids` (sinon on
+    évaluerait un modèle amputé de la tête qu'on entraîne), (2) la nll des
+    tours gradés est ventilée VALEUR / TEMPLATE (clés `val_nll*`,
+    `tpl_nll*`) et la porte de copie est moyennée sur chacune des deux
+    classes de positions (`p_copy_val`, `p_copy_tpl`). Le verdict du run se lit
+    là : val_nll doit décrocher sous val_nll_abl, p_copy_val doit s'ouvrir, et
+    p_copy_tpl rester bas."""
     from .math_school_data import A_OPEN, grade_conv
     from .persona_chat_data import grade_recall
     grade = getattr(stream, "grade_conv", grade_conv)   # persona ships its own
@@ -317,6 +408,10 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                                  and next(model.parameters()).is_cuda) else None
     rti_lb = None if rti is None else [None] * len(model.blocks)
     rti_g: dict = {}                  # sélection réussie/ratée -> [n, grade, top1]
+    skip_kinds = tuple(skip_kinds or ())
+    # kind -> [nv_l, dv_l, nt_l, dt_l, nv_a, dv_a, nt_a, dt_a, pv, pn_v, pt, pn_t]
+    vt: dict = {}
+    n_skip = 0
     if rti is not None:
         rti.reset()                    # une vie par APPEL d'éval, pas par conv
     for _ in range(n_conv):
@@ -327,6 +422,12 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
         a_idx = [i for i, s in enumerate(conv["segs"])
                  if s["role"] == "assistant"]
         graded = set(a_idx[-len(truths):]) if truths else set()
+        if conv["kind"] in skip_kinds:
+            # la conv TRAVERSE quand même (ses writes sont les distracteurs de
+            # la banque, et les retirer rendrait l'éval plus facile que
+            # l'entraînement) ; simplement, aucun de ses tours n'est gradé.
+            graded, truths, ages = set(), [], []
+            n_skip += 1
         bank = None
         live_txt, abl_txt = [], []
         nll_s, nll_n = 0.0, 0
@@ -335,12 +436,15 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
         for i, s in enumerate(conv["segs"]):
             x = s["input_ids"].to(device)
             lmask = s["loss_mask"].to(device)
-            inj = None
+            inj = pids = None
             if rti is not None:
                 # le préfixe DÛ à ce seg (décidé au seg précédent = la question)
                 prt = rti.parts(model.embed.weight, model.rti_type.vec, 1,
-                                roles=(s["role"],), train=False)
+                                roles=(s["role"],), train=False,
+                                with_ids=copy_head is not None)
                 inj = prt[0][1]
+                if copy_head is not None:
+                    pids = prt[0][2]
             if i in graded and decode:
                 if abl_txt1 is None:              # constant sur tout l'appel
                     abl_txt1 = tok.decode(_greedy(
@@ -348,7 +452,7 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                         use_cache, layer_banks=rti_lb)[0].tolist())
                 live_txt.append(tok.decode(_greedy(
                     model, a_open, bank, max_new, stop_id, amp, use_cache,
-                    pool=pool, inject=inj,
+                    pool=pool, inject=inj, prefix_ids=pids,
                     layer_banks=rti_lb)[0].tolist()))
                 abl_txt.append(abl_txt1)
                 if rti is not None and qi < len(truths):
@@ -364,7 +468,14 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 o = (model(x, init_mem=bank) if rti is None else
                      model(x, init_mem=None, layer_banks=rti_lb, write=False,
-                           inject=inj))
+                           inject=inj,
+                           **({"prefix_ids": pids} if pids is not None else {})))
+            # capturée ICI : le forward ABLATÉ qui suit ne passe pas de
+            # prefix_ids, donc la tête n'est pas rappelée et `last_gate` reste
+            # celle du bras live — mais s'appuyer sur ça serait un piège.
+            gate_live = (copy_head.last_gate
+                         if (copy_head is not None and pids is not None)
+                         else None)
             m = lmask[:, 1:].reshape(-1)
             if float(m.sum()) > 0:
                 lg = o["logits"].float()
@@ -383,6 +494,28 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                         x[:, 1:].reshape(-1), reduction="none")
                     nll_a = float((cea * m).sum() / m.sum())
                     a[5] += nll; a[6] += nll_a; a[7] += 1
+                    # ── VALEUR vs TEMPLATE (la sonde qui a manqué 800 steps) ──
+                    # Le Δnll global est dominé par le format : ~90 % des
+                    # positions supervisées d'une réponse sont du template. On
+                    # coupe donc la même CE en deux avec le val_mask du seg —
+                    # live ET ablatée — et on moyenne la porte de copie sur
+                    # chacune des deux classes.
+                    vmk = s.get("val_mask")
+                    if vmk is not None and float(vmk.sum()) > 0:
+                        m2 = lmask[:, 1:]
+                        vm2 = (vmk.to(device)[:, 1:] > 0).to(m2.dtype)
+                        c = vt.setdefault(conv["kind"], [0.0] * 12)
+                        for off, cet in ((0, ce), (4, cea)):
+                            nv, dv, nt, dt = _val_split(cet, m2, vm2)
+                            c[off] += float(nv); c[off + 1] += float(dv)
+                            c[off + 2] += float(nt); c[off + 3] += float(dt)
+                        if gate_live is not None:
+                            g = gate_live[:, :-1].float()
+                            sup = (m2 > 0).to(g.dtype)
+                            c[8] += float((g * sup * vm2).sum())
+                            c[9] += float((sup * vm2).sum())
+                            c[10] += float((g * sup * (1 - vm2)).sum())
+                            c[11] += float((sup * (1 - vm2)).sum())
                     if qi < len(ages):
                         b = by_age.setdefault(_age_bucket(ages[qi]),
                                               [0, 0.0, 0.0, 0])
@@ -408,7 +541,7 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                     rti.query(model.rti_retriever, s["q_slot"],
                               oq["hidden"].float())
         a[0] += nll_s; a[1] += nll_n
-        if decode:
+        if decode and conv["kind"] not in skip_kinds:
             a[2] += grade(conv, live_txt)
             a[3] += grade(conv, abl_txt)
             a[8] += 1
@@ -421,6 +554,24 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                "ans_nll": v[5] / max(v[7], 1),
                "ans_nll_abl": v[6] / max(v[7], 1), "n_ans": v[7]}
            for k, v in agg.items()}
+    # nll VALEUR / TEMPLATE (live et ablatée) + porte de copie par classe de
+    # positions. `n_val` = tokens valeur pondérés : le poids est celui de la CE
+    # (value_weight ×4), donc val_nll et tpl_nll se recombinent EXACTEMENT en
+    # ans_nll — c'est une partition, pas une seconde mesure.
+    for k, c in vt.items():
+        if k in out:
+            out[k].update({
+                "val_nll": c[0] / max(c[1], 1e-6),
+                "tpl_nll": c[2] / max(c[3], 1e-6),
+                "val_nll_abl": c[4] / max(c[5], 1e-6),
+                "tpl_nll_abl": c[6] / max(c[7], 1e-6),
+                "n_val": c[1], "n_tpl": c[3]})
+            if c[9] > 0:
+                out[k]["p_copy_val"] = c[8] / c[9]
+            if c[11] > 0:
+                out[k]["p_copy_tpl"] = c[10] / c[11]
+    if skip_kinds:
+        out["_skipped"] = {"n": n_skip, "kinds": list(skip_kinds)}
     out["_by_age"] = {k: {"n": v[0], "dgrade": v[1] / max(v[3], 1),
                           "dnll": v[2] / v[0], "n_dg": v[3]}
                       for k, v in by_age.items()}
@@ -989,6 +1140,17 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # coûte un forward par tour gradé. 1 (défaut) = comportement historique.
     chat_decode_every = int(chat_cfg.get("decode_every", 1))
     assert chat_decode_every >= 1, f"decode_every >= 1, vu {chat_decode_every}"
+    # eval_skip_kinds : kinds traversés mais JAMAIS gradés (leurs writes restent
+    # les distracteurs de la banque). Motif : `requote`, dont la vérité est un
+    # message assistant entier et qui n'a pas de q_slot — donc pas de préfixe
+    # injecté : un tour structurellement ingagnable, qui mangeait la moitié du
+    # budget de décodage du palier. Défaut () = comportement historique.
+    chat_eval_skip = tuple(chat_cfg.get("eval_skip_kinds") or ())
+    # eval_seed_stride : 0 (défaut) = graine d'éval FIXE ; n > 0 = graine
+    # 1234 + n·step, un jeu de convs NEUF par palier (cf. le commentaire au
+    # point d'appel).
+    chat_eval_seed_stride = int(chat_cfg.get("eval_seed_stride", 0) or 0)
+    assert chat_eval_seed_stride >= 0, chat_eval_seed_stride
     if chat_cfg:
         from .streams import chat_stream_class
         sname = chat_cfg.get("stream", "math_school")
@@ -1247,6 +1409,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
         print(f"rti: pilote prêt — {chat_B} lanes, table SIF lue sur "
               f"{type(_src).__name__} (a={rti_cfg.sif_a:g}, "
               f"w méd {float(rti_sif.median()):.3f})", flush=True)
+    # La tête de copie, une fois pour toutes : sa présence est ce qui décide de
+    # `with_ids=True` côté parts, de `prefix_ids` côté forward et décodage, et
+    # de la télémétrie p_copy. Absente ⇒ pas une ligne de ce chemin ne tourne
+    # et le bras rti est BIT-IDENTIQUE à celui du run en cours.
+    copy_head = getattr(model, "rti_copy", None)
 
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
@@ -1405,6 +1572,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # gradient, c'est la seule quantité comparable au `chat` d'un run B=1
         # (la loss, elle, normalise globalement sur le batch).
         lane_v = 0.0; lane_cnt = 0
+        # copy-head : nll VALEUR / TEMPLATE + porte de copie par classe de
+        # positions, accumulées EN TENSEURS (aucune synchro dans la boucle de
+        # seg ; une seule matérialisation au log). C'est la sonde qui manquait :
+        # la nll globale d'une réponse est ~90 % du template.
+        vt_acc = {k: torch.zeros((), device=device)
+                  for k in ("nv", "dv", "nt", "dt", "pv", "pn_v", "pt", "pn_t")}
         _step_convs = []                     # trace repro nan-guard (voir plus bas)
         reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
@@ -1502,11 +1675,17 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     _pmd = None if _pm is None else _pm.to(device)
                     _emb = model.embed.weight
                     parts = rti_run.parts(_emb, model.rti_type.vec, x.size(0),
-                                          roles=s.get("roles"), train=True)
-                    loss, ce, ce_lane = _chat_loss_rti(
+                                          roles=s.get("roles"), train=True,
+                                          with_ids=copy_head is not None)
+                    _vm = s.get("val_mask")
+                    loss, ce, ce_lane, _dg = _chat_loss_rti(
                         _fwd, xt, _lm.to(device), balw, amp, parts, rti_lb,
-                        pad_mask=_pmd, m_any=_any)
+                        pad_mask=_pmd, m_any=_any, copy_head=copy_head,
+                        val_mask=None if _vm is None else _vm.to(device))
                     loss = chat_w * loss
+                    if _dg is not None:
+                        for _k in vt_acc:
+                            vt_acc[_k] = vt_acc[_k] + _dg[_k]
                     # longueurs réelles côté CPU (le collate right-pade) : les
                     # lire sur le device coûterait une synchro par seg
                     _lens = (None if _pm is None else _pm.sum(1))
@@ -1609,6 +1788,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # exactement leur comportement historique (bit à bit).
                 vmask = (s.get("val_mask")
                          if tf_target in ("value", "value_sif") else None)
+                if vmask is not None:
+                    # Depuis 2026-07-31 la RÉPONSE assistant porte elle aussi un
+                    # val_mask (télémétrie nll-valeur du bras copy-head). Le
+                    # teacher, lui, n'a JAMAIS poolé que l'ÉNONCIATION : sur une
+                    # réponse il retombait sur le repli SIF. On rétablit ce
+                    # comportement AU BIT en annulant le masque des lanes
+                    # assistant — sans quoi ajouter une clé de télémétrie
+                    # changerait la cible d'un teacher, en silence.
+                    _rl = s.get("roles") or ((s.get("role"),) * vmask.size(0))
+                    if any(r == "assistant" for r in _rl):
+                        _keep = torch.tensor([r != "assistant" for r in _rl],
+                                             dtype=vmask.dtype)
+                        vmask = vmask * _keep.unsqueeze(1)
                 surpw = (s.get("surp_w")
                          if tf_target in ("surprisal", "value_sif") else None)
                 fire = tf_on and beta > 0.0 and (
@@ -1898,6 +2090,32 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 addr_s = (f"retr {ema_retr:.3f} r@1 {_tl['recall1']:.2f} "
                           f"(q {_tl['n_query']}, sans cible {_tl['n_nopos']}, "
                           f"inj {_tl['n_inject']})  ") + addr_s
+            if copy_head is not None:
+                # UNE seule synchro : les 8 accumulateurs partent ensemble.
+                # `val` = nll des tokens VALEUR, `tpl` = celle du template,
+                # `p` = la porte de copie sur chacune des deux classes. Le
+                # verdict du run se lit ici step par step : val doit décrocher
+                # sous tpl et p_val s'ouvrir SANS que p_tpl suive.
+                _v = torch.stack([vt_acc[k] for k in ("nv", "dv", "nt", "dt",
+                                                      "pv", "pn_v", "pt",
+                                                      "pn_t")]).tolist()
+                if _v[1] > 0 or _v[3] > 0:
+                    _pv = f"{_v[4] / _v[5]:.3f}" if _v[5] > 0 else "—"
+                    _pt = f"{_v[6] / _v[7]:.3f}" if _v[7] > 0 else "—"
+                    addr_s = (f"val {_v[0] / max(_v[1], 1e-6):.3f} "
+                              f"tpl {_v[2] / max(_v[3], 1e-6):.3f} "
+                              f"p_copy {_pv}/{_pt}  ") + addr_s
+                    if writer is not None:
+                        writer.add_scalar("train/nll_val",
+                                          _v[0] / max(_v[1], 1e-6), step)
+                        writer.add_scalar("train/nll_tpl",
+                                          _v[2] / max(_v[3], 1e-6), step)
+                        if _v[5] > 0:
+                            writer.add_scalar("train/p_copy_val",
+                                              _v[4] / _v[5], step)
+                        if _v[7] > 0:
+                            writer.add_scalar("train/p_copy_tpl",
+                                              _v[6] / _v[7], step)
             if ema_chat is not None:
                 addr_s = f"chat {ema_chat:.3f}  " + addr_s
             if ema_lane is not None:                  # batch chat : cf. lane_v
@@ -2000,15 +2218,28 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         for d in eval_depths:
                             writer.add_scalar(f"eval_depth/{pfx}gap_d{d}", bd[d]["gap"], step)
             if chat_eval is not None:
-                chat_eval.rng.seed(1234)          # same conv set every eval
+                # Graine d'éval : FIXE (1234) par défaut = le même jeu de convs
+                # à chaque palier, donc une comparaison appariée à variance
+                # minimale — mais qui ne mesure QUE ces convs-là. Au run rti
+                # c'était 4 sondes répétées 20 fois : un estimateur de grade sur
+                # n≈5, dont on ne pouvait rien conclure, et rien n'aurait
+                # distingué « le canal s'ouvre » de « ces 4 questions-là sont
+                # apprises ». `chat.eval_seed_stride` > 0 tire un jeu NEUF par
+                # palier (graine 1234 + stride·step) : l'estimateur devient
+                # non-biaisé, au prix d'une variance d'échantillonnage — c'est
+                # le bon échange dès que n est grand (cf. chat.eval_convs).
+                chat_eval.rng.seed(1234 + chat_eval_seed_stride * step)
                 dec_on = (step % (eval_every * chat_decode_every) == 0
                           or step == steps)
                 mm = evaluate_math(model, chat_eval, tok, device, amp,
                                    chat_eval_convs, chat_max_new,
                                    use_cache=decode_cache, decode=dec_on,
-                                   graphs=decode_graphs, rti=rti_eval)
+                                   graphs=decode_graphs, rti=rti_eval,
+                                   copy_head=copy_head,
+                                   skip_kinds=chat_eval_skip)
                 by_age = mm.pop("_by_age", {})
                 rti_ev = mm.pop("_rti", None)
+                skipped = mm.pop("_skipped", None)
                 for kind in sorted(mm):
                     v = mm[kind]
                     if v["n_ans"]:
@@ -2020,9 +2251,31 @@ def main(cfg_path: str, resume: bool = False) -> None:
                               f"{v['ans_nll']:.3f} abl {v['ans_nll_abl']:.3f} "
                               f"Δnll {v['ans_nll_abl'] - v['ans_nll']:+.3f} "
                               f"(n={v['n']})", flush=True)
+                        if "val_nll" in v:
+                            # LA ligne du bras copy : la nll GLOBALE ci-dessus
+                            # est ~90 % du template. Δval > 0 qui monte pendant
+                            # que Δtpl stagne = la citation s'ouvre ; l'inverse
+                            # = on ré-apprend le format une fois de plus.
+                            pc = ""
+                            if "p_copy_val" in v:
+                                pc = (f" | p_copy val {v['p_copy_val']:.3f} "
+                                      f"tpl {v.get('p_copy_tpl', 0.0):.3f}")
+                            print(f"[math @{step}] {kind:10s}   VALEUR nll "
+                                  f"{v['val_nll']:.3f} abl {v['val_nll_abl']:.3f} "
+                                  f"Δ {v['val_nll_abl'] - v['val_nll']:+.3f}  |  "
+                                  f"TEMPLATE nll {v['tpl_nll']:.3f} abl "
+                                  f"{v['tpl_nll_abl']:.3f} Δ "
+                                  f"{v['tpl_nll_abl'] - v['tpl_nll']:+.3f}"
+                                  f" (poids val {v['n_val']:.0f}/"
+                                  f"{v['n_val'] + v['n_tpl']:.0f}){pc}",
+                                  flush=True)
                     else:                     # contrôle sans truths (smalltalk)
                         print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
                               f"(n={v['n']}, contrôle)", flush=True)
+                if skipped:
+                    print(f"[math @{step}] non gradés : {skipped['n']} convs "
+                          f"{skipped['kinds']} (traversées pour leurs writes, "
+                          f"jamais décodées)", flush=True)
                 if by_age:
                     curve = "  ".join(
                         (f"{b}: Δg {by_age[b]['dgrade']:+.2f} "
@@ -2074,6 +2327,60 @@ def main(cfg_path: str, resume: bool = False) -> None:
 
 
 # ── self-test ────────────────────────────────────────────────────────────────
+
+def _eval_stub_run(skip=()):
+    """Un appel d'`evaluate_math` sur des stubs (aucun GPU, aucun tokenizer) :
+    deux convs `recall` et deux convs `requote`. Sert à épingler ce que
+    `skip_kinds` change — et surtout ce qu'il NE change pas."""
+    from .math_school_data import A_OPEN
+
+    class _Tok:
+        def __call__(self, s, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+        def convert_tokens_to_ids(self, s):
+            return 9
+
+        def decode(self, ids):
+            return "reponse " + " ".join(str(int(i)) for i in ids)
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = nn.Parameter(torch.zeros(1))
+            self.blocks = [None, None]
+
+        def forward(self, ids, init_mem=None, **kw):
+            b, t = ids.shape
+            lg = torch.zeros(b, t, 20)
+            lg[:, :, 4] = 1.0
+            return {"logits": lg, "mem_bank": torch.zeros(b, 2, 4),
+                    "balance_loss": torch.zeros(())}
+
+    class _S:
+        """2 convs recall (1 vérité chacune) puis 2 convs requote."""
+
+        def __init__(self):
+            self.i = 0
+
+        def next_conv(self):
+            kind = "recall" if self.i < 2 else "requote"
+            self.i += 1
+            u = {"input_ids": torch.tensor([[5, 6, 7]]),
+                 "loss_mask": torch.zeros(1, 3), "role": "user"}
+            vm = torch.zeros(1, 4); vm[0, 2] = 1.0
+            a = {"input_ids": torch.tensor([[5, 6, 7, 8]]),
+                 "loss_mask": torch.ones(1, 4), "role": "assistant",
+                 "val_mask": vm}
+            return {"kind": kind, "segs": [u, a],
+                    "info": {"truths": ["x"], "ages": [2]}}
+
+        def grade_conv(self, conv, texts):
+            return 1.0 if texts else 0.0
+
+    return evaluate_math(_M(), _S(), _Tok(), "cpu", False, 4, max_new=3,
+                         decode=True, skip_kinds=skip)
+
 
 def _selftest() -> None:
     """L'alignement des cibles, épinglé.
@@ -2188,6 +2495,176 @@ def _selftest() -> None:
     assert float(ce_g) != float(ce_l), \
         "si les deux normalisations coïncident, le test ne prouve rien"
 
+    # ── bras RTI + tête de COPIE ────────────────────────────────────────────
+    # (1) copy_head OFF : le forward ne voit AUCUN prefix_ids et la CE est
+    #     exactement celle du bras rti historique — c'est l'invariant qui
+    #     protège le run en cours, qui ré-importe ce fichier à une reprise.
+    seen_kw = []
+
+    class _RtiOracle(_Oracle):
+        def __call__(self, ids, init_mem=None, layer_banks=None, **kw):
+            seen_kw.append(dict(kw))
+            return super().__call__(ids, init_mem=init_mem,
+                                    layer_banks=layer_banks)
+
+    mr = torch.zeros(B, T); mr[:, p] = 1.0; mr[1, p + 1] = 1.0
+    rows_all = torch.arange(B)
+    pairs = [(rows_all, None)]
+    lo, ce_r, cel_r, dg = _chat_loss_rti(_RtiOracle(broken={p}), x, mr, 0.0,
+                                         False, pairs, None)
+    assert all("prefix_ids" not in kw for kw in seen_kw), \
+        "copy_head OFF : aucun prefix_ids ne doit atteindre le forward"
+    assert dg is None, "pas de val_mask ⇒ pas de télémétrie (et pas son coût)"
+    # référence indépendante : CE masquée normalisée GLOBALEMENT sur le batch
+    _lg = _Oracle(broken={p})(x)["logits"].float()
+    _cet = F.cross_entropy(_lg[:, :-1].reshape(-1, _lg.size(-1)),
+                           x[:, 1:].reshape(-1), reduction="none")
+    _m2 = mr[:, 1:]
+    _ref = float((_cet * _m2.reshape(-1)).sum() / _m2.sum())
+    assert float(ce_r) == _ref, (float(ce_r), _ref)
+    assert cel_r is not None and float(lo) == float(ce_r)   # balw = 0
+
+    # (2) la DÉCOMPOSITION valeur/template est une PARTITION (elle somme à la
+    #     CE totale au bit) — la sonde qui a manqué 800 steps ne doit pas être
+    #     une seconde mesure approximative.
+    vmk = torch.zeros(B, T); vmk[:, p] = 1.0
+    _vm2 = (vmk[:, 1:] > 0).float()
+    nv, dv, nt, dt = _val_split(_cet, _m2, _vm2)
+    assert torch.allclose(nv + nt, (_cet * _m2.reshape(-1)).sum())
+    assert float(dv + dt) == float(_m2.sum())
+    assert float(dv) > 0 and float(dt) > 0, "la partition doit être non triviale"
+    # le poids du val_mask est celui de la CE (value_weight x4 sur persona)
+    mr4 = mr.clone(); mr4[:, p] = 4.0
+    nv4, dv4, _, _ = _val_split(_cet, mr4[:, 1:], _vm2)
+    assert abs(float(dv4) - 4.0 * float(dv)) < 1e-5
+    assert abs(float(nv4) - 4.0 * float(nv)) < 1e-4
+
+    # (3) copy_head ON, sur un VRAI modèle : loss finie, prefix_ids transmis,
+    #     gradient sur rti_copy.* — et la télémétrie ventile p_copy.
+    from .rti_copy import CopyHead, CopyHeadConfig
+    torch.manual_seed(3)
+    Vm, Bm, Tm = 40, 2, 12
+    mcfg = ThoughtBankConfig(vocab_size=Vm, d_model=32, n_layers=2, n_heads=2,
+                             d_head=8, csa_m=2, hca_m=4, top_k_csa=2, n_win=4,
+                             d_latent_q=8, n_groups=1, n_experts=4, n_shared=1,
+                             top_k_experts=2, d_ff=32, mem_dim=16, max_mem=4,
+                             mem_seed_slots=2, mem_read_rank=4, sinkhorn_iters=5)
+    mm = ThoughtBankLM(mcfg)
+    mm.rti_copy = CopyHead(32, CopyHeadConfig(enabled=True))
+    xm = torch.randint(0, Vm, (Bm, Tm))
+    lmm = torch.zeros(Bm, Tm); lmm[:, 4:] = 1.0
+    vmm = torch.zeros(Bm, Tm); vmm[:, 6:8] = 1.0        # le span « valeur »
+    P = 6
+    pid = torch.randint(0, Vm, (Bm, P)); pid[:, -1] = -1   # séparateur
+    injm = mm.embed.weight[pid.clamp_min(0)].detach()
+    trip = [(torch.arange(Bm), injm, pid)]
+    lm_, cem, _, dgm = _chat_loss_rti(mm, xm, lmm, 0.0, False, trip,
+                                      [None] * mcfg.n_layers, val_mask=vmm,
+                                      copy_head=mm.rti_copy)
+    assert torch.isfinite(lm_) and float(cem) > 0
+    assert dgm is not None and float(dgm["dv"]) > 0 and float(dgm["dt"]) > 0
+    # la ventilation de p_copy couvre EXACTEMENT les positions supervisées
+    assert float(dgm["pn_v"] + dgm["pn_t"]) == float((lmm[:, 1:] > 0).sum())
+    assert 0.0 < float(dgm["pv"]) / float(dgm["pn_v"]) < 1.0
+    lm_.backward()
+    assert float(mm.rti_copy.wc.weight.grad.abs().max()) > 0, \
+        "aucun gradient sur W_c : la tête de copie est débranchée de la loss"
+    assert float(mm.rti_copy.b_g.grad.abs().max()) > 0
+    assert float(mm.lm_head.weight.grad.abs().max()) > 0    # et le backbone
+
+    # (4) la CHAÎNE réelle : RtiRunner.parts(with_ids=True) → _chat_loss_rti.
+    #     Les `prefix_ids` rendus sont DÉJÀ indexés par part (alignés sur rows) :
+    #     les ré-indexer serait le bug silencieux type — un préfixe attribué à
+    #     la mauvaise lane, une copie qui cite le voisin.
+    from .rti import InjectType, Retriever, RtiConfig, RtiRunner
+    mm.zero_grad()
+    mm.rti_retriever, mm.rti_type = Retriever(32), InjectType(32)
+    rc = RtiConfig(top_k=3, max_groups=4, train_groups=2, eval_groups=2)
+    rr = RtiRunner(rc, torch.rand(Vm) + 0.1, sep_id=5, n_lanes=Bm, seed=1)
+    for k in range(3):                       # 3 énonciations ⇒ 3 groupes
+        rr.write(mm.embed.weight, torch.randint(6, Vm, (Bm, Tm)),
+                 torch.full((Bm, Tm), 1 + k))
+    xq = torch.randint(6, Vm, (Bm, Tm))
+    oq = mm(xq, init_mem=None, compute_logits=False,
+            layer_banks=[None] * mcfg.n_layers, write=False)
+    rr.query(mm.rti_retriever, torch.full((Bm, Tm), 1), oq["hidden"].float())
+    prt = rr.parts(mm.embed.weight, mm.rti_type.vec, Bm,
+                   roles=("assistant",) * Bm, train=True, with_ids=True)
+    assert all(len(p) == 3 for p in prt), "with_ids doit rendre des TRIPLETS"
+    for rows, inj, pids in prt:
+        if inj is None:
+            continue
+        assert inj.shape[:2] == pids.shape and pids.size(0) == rows.numel(), \
+            (tuple(inj.shape), tuple(pids.shape), rows.numel())
+        assert int(pids[0, rc.top_k]) < 0, "le séparateur doit être la sentinelle"
+    l4, _, _, d4 = _chat_loss_rti(mm, xm, lmm, 0.01, False, prt,
+                                  [None] * mcfg.n_layers, val_mask=vmm,
+                                  copy_head=mm.rti_copy)
+    assert torch.isfinite(l4)
+    # b_g = −4 à l'init ⇒ la porte est QUASI FERMÉE partout : le run ne subit
+    # aucun choc de distribution au step 0, quelle que soit la classe.
+    for _n, _d in (("pv", "pn_v"), ("pt", "pn_t")):
+        assert abs(float(d4[_n]) / float(d4[_d]) - 0.0180) < 5e-3, _n
+
+    # ── val_mask ASSISTANT : posé sur le span, propagé, nul sur le padding ──
+    from .chat_batch import ChatBatchStream
+    from .persona_chat_data import PersonaChatStream, _StubTok
+    ps = PersonaChatStream(_StubTok(), seed=5)
+    _seen = 0
+    for _ in range(30):
+        c = ps.next_conv()
+        for s_ in c["segs"]:
+            if s_["role"] != "assistant" or "val_mask" not in s_:
+                continue
+            _seen += 1
+            vm = s_["val_mask"]
+            assert vm.shape == s_["input_ids"].shape
+            span = vm[0].nonzero().flatten()
+            assert span.numel() > 0 and int(span[-1] - span[0]) + 1 == span.numel(), \
+                "le val_mask doit couvrir UN span contigu"
+            # …et le loss_mask y est surpondéré (la valeur est supervisée)
+            assert float(s_["loss_mask"][0, span].min()) >= 1.0
+    assert _seen > 20, _seen
+
+    class _VmStub:
+        """Deux lanes de LONGUEURS différentes, val_mask sur la seconde."""
+
+        def __init__(self):
+            import random as _r
+            self.rng = _r.Random(0)
+            self.n = 0
+
+        def next_conv(self):
+            self.n += 1
+            L = 5 + (self.n % 3)
+            vm = torch.zeros(1, L); vm[0, 1] = 1.0
+            return {"segs": [{"input_ids": torch.arange(L).unsqueeze(0),
+                              "loss_mask": torch.ones(1, L), "val_mask": vm,
+                              "role": "assistant"}], "info": {}, "kind": "stub"}
+
+        def grade_conv(self, conv, texts):
+            return 0.0
+
+    cb = ChatBatchStream(None, batch=3, slots=2, _inner=_VmStub())
+    for sg in cb.next_conv_batch():
+        assert "val_mask" in sg, "_ZERO_PAD_KEYS doit propager le val_mask"
+        assert sg["val_mask"].shape == sg["input_ids"].shape
+        assert float(sg["val_mask"][~sg["pad_mask"]].abs().sum()) == 0.0, \
+            "val_mask non nul sur un pad"
+        assert bool((sg["val_mask"][:, 1] == 1.0).all())
+
+    # ── éval : les kinds ingagnables sont EXCLUS du grade ────────────────────
+    ev_a = _eval_stub_run(skip=())
+    ev_b = _eval_stub_run(skip=("requote",))
+    assert ev_a["requote"]["n_dec"] == 2 and ev_a["requote"]["n_ans"] == 2, ev_a
+    assert ev_b["requote"]["n_dec"] == 0 and ev_b["requote"]["n_ans"] == 0, ev_b
+    assert ev_b["_skipped"]["n"] == 2
+    # le kind RECALL, lui, est gradé exactement pareil dans les deux cas : le
+    # skip ne doit pas décaler le flux (les convs traversent toujours)
+    for k in ("n", "n_dec", "n_ans"):
+        assert ev_a["recall"][k] == ev_b["recall"][k], (k, ev_a, ev_b)
+    assert ev_b["requote"]["n"] == 2, "la conv requote doit TRAVERSER quand même"
+
     # ── helpers de remplissage ──────────────────────────────────────────────
     ref = torch.zeros(B, 3, dtype=torch.long)
     assert _fill(ref, 7, 4).shape == (B, 4) and (_fill(ref, 7, 4) == 7).all()
@@ -2203,7 +2680,14 @@ def _selftest() -> None:
     print("code_defer_native self-test: OK (alignement des cibles épinglé sur "
           "_ic_loss ET _chat_loss — position fautive localisée au bon index, "
           "masque tout-zéro sans CE, m_any sans effet sur la CE, batch chat : "
-          "CE globale != CE par lane, poids de balance, helpers, strates d'âge)")
+          "CE globale != CE par lane, poids de balance, helpers, strates d'âge "
+          "| rti : copy_head OFF sans prefix_ids ni télémétrie et CE == la "
+          "référence, décomposition valeur/template = PARTITION au bit, "
+          "copy_head ON sur vrai modèle (loss finie, gradient sur W_c ET la "
+          "porte ET le backbone, p_copy ventilé, porte à 0.018 à l'init), "
+          "chaîne parts(with_ids)→loss alignée lane à lane | val_mask "
+          "assistant : span contigu, propagé par _collate, nul sur les pads | "
+          "éval : kinds ingagnables non gradés mais TRAVERSÉS, recall intact)")
 
 
 if __name__ == "__main__":

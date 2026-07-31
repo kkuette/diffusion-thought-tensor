@@ -646,10 +646,25 @@ class PersonaChatStream:
         de la banque, donc la surpondérer concentre le gradient sur le chemin
         read→réponse, et ça SURVIT au retrait du teacher, contrairement au blend
         β qui n'est qu'un échafaudage). Tokenisation identique à _assistant
-        (texte entier en un bloc) ; seul le masque change sur le span valeur."""
+        (texte entier en un bloc) ; seul le masque change sur le span valeur.
+
+        Porte AUSSI un `val_mask` [1,T] binaire sur ce même span, en symétrie
+        exacte du `val_mask` de `_user_valued` (2026-07-31, bras copy-head).
+        Pourquoi il manquait : côté ÉNONCIATION le span valeur sert de cible au
+        teacher ; côté RÉPONSE il n'existait que comme SURPONDÉRATION du
+        loss_mask — donc la nll de la valeur n'était nulle part séparable de
+        celle du template. C'est exactement ce qui a coûté 800 steps de run :
+        le Δnll affiché était dominé par le template (3.0 → 1.7) pendant que la
+        nll VALEUR restait plate, et rien ne le montrait. Le canal existe
+        maintenant, `chat_batch._ZERO_PAD_KEYS` le propage déjà.
+
+        NB : le teacher `value`/`value_sif` poolait le val_mask des seuls segs
+        d'énonciation (les réponses n'en avaient pas). Le trainer neutralise
+        donc explicitement le val_mask des lanes ASSISTANT dans ce chemin — sa
+        cible reste bit-identique."""
         w = self.value_weight
         if w == 1.0:
-            return self._assistant(text)
+            return self._val_mask(self._assistant(text), v)
         body = self._ids(text)
         m = torch.ones(body.numel())
         span = self._val_span(body.tolist(), v)
@@ -666,6 +681,20 @@ class PersonaChatStream:
             keep = torch.cat([torch.zeros(pre.numel()), torch.ones(body.numel()),
                               torch.zeros(suf.numel() + cl.numel())])
             seg["surp_w"] = (self._surp_weights(ids) * keep).unsqueeze(0)
+        return self._val_mask(seg, v)
+
+    def _val_mask(self, seg: dict, v: str) -> dict:
+        """Pose `val_mask` [1,T] sur le span de la valeur `v` dans un seg DÉJÀ
+        construit (recherche sur les ids complets : l'échafaudage ChatML ne
+        contient jamais une valeur). Aucun span trouvé ⇒ masque nul, jamais
+        d'exception : la télémétrie perd une réponse, elle ne casse pas un run.
+        """
+        ids = seg["input_ids"][0].tolist()
+        vm = torch.zeros(len(ids))
+        span = self._val_span(ids, v)
+        if span is not None:
+            vm[span[0]:span[1]] = 1.0
+        seg["val_mask"] = vm.unsqueeze(0)
         return seg
 
     # ── pieces ───────────────────────────────────────────────────────────────
@@ -799,6 +828,7 @@ def _self_test() -> None:
     from collections import Counter
     kinds, ages = Counter(), Counter()
     n_updated = n_beyond = n_q = 0
+    n_amask = [0]                       # réponses portant un val_mask (copy-head)
 
     for _ in range(600):
         c = ps.next_conv()
@@ -837,8 +867,15 @@ def _self_test() -> None:
             assert len(vals) == len(set(vals))
             # canaux d'identité du fait : présents (constants, 1-based) sur
             # chaque seg d'énonciation/update, absents partout ailleurs
+            # (le val_mask, lui, est posé des DEUX côtés depuis 2026-07-31 :
+            #  sur l'énonciation il est la cible du teacher, sur la RÉPONSE il
+            #  sépare la nll-valeur de la nll-template — cf. _assistant_valued)
             for s in c["segs"]:
                 if "val_mask" in s:
+                    vm = s["val_mask"]
+                    assert vm.shape == s["input_ids"].shape, vm.shape
+                    assert float(vm.sum()) > 0, "val_mask vide = span introuvable"
+                if s["role"] == "user" and "val_mask" in s:
                     for k in ("fact_slot", "fact_val", "fact_attr"):
                         ch = s[k]
                         assert ch.shape == s["input_ids"].shape
@@ -848,6 +885,10 @@ def _self_test() -> None:
                     assert int(s["fact_val"][0, 0]) >= 1
                 else:
                     assert "fact_slot" not in s
+                # la RÉPONSE gradée porte un val_mask et AUCUN canal d'identité
+                if s["role"] == "assistant" and "val_mask" in s:
+                    assert "fact_slot" not in s and "q_slot" not in s
+                    n_amask[0] += 1
             # q_slot : la CIBLE du retriever (rti). Un seg de QUESTION par
             # requête, DANS L'ORDRE de info["q_slots"], portant l'entier qui
             # nomme le slot interrogé — le MÊME que le fact_slot du seg qui
@@ -870,6 +911,7 @@ def _self_test() -> None:
 
     assert kinds["smalltalk"] > 60 and kinds["recall"] > 300, kinds
     assert n_q > 300, n_q
+    assert n_amask[0] >= n_q, (n_amask[0], n_q)   # une réponse valuée par requête
     assert n_updated > 20 and n_beyond > 30
     assert max(ages) >= 16, f"no beyond-FIFO stratum sampled: {dict(ages)}"
     # ids de faits STABLES entre instances, splits et seeds (tables du teacher)
@@ -880,7 +922,7 @@ def _self_test() -> None:
     print(f"persona_chat self-test: OK ({dict(kinds)}, "
           f"age octaves {dict(sorted(ages.items()))}, "
           f"updated {n_updated}, beyond {n_beyond}, q_slot posé sur {n_q} "
-          f"segs de question)")
+          f"segs de question, val_mask posé sur {n_amask[0]} réponses)")
 
 
 # ── real-tokenizer smoke ─────────────────────────────────────────────────────

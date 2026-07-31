@@ -1,0 +1,516 @@
+# sft_recall_350m_copy — RTI + TÊTE DE COPIE. La SUITE de sft_recall_350m_rti,
+# et sa correction : même bras, même data, mais (1) le chemin de citation
+# existe enfin dans la classe de fonctions, (2) l'éval mesure la bonne chose.
+#
+# CE QUE LE RUN rti A DIT, EN 800 STEPS (diagnostic offline 2026-07-31)
+#   • La chaîne RTI est CORRECTE de bout en bout : les tokens de la vérité sont
+#     dans le groupe injecté, DANS L'ORDRE, EN TÊTE du préfixe.
+#   • Et pourtant, TEACHER-FORCÉ, l'argmax lâche à la continuation de sous-mot
+#     (` Phil` → ` Pl`, ` mosaic` → ` mask`, `Cann`+`oli` → `Cann`+`stra`) — et
+#     le contrôle depuis un contexte PLAT natif sans banque rend LES MÊMES
+#     ERREURS. Ce backbone n'a pas de tête de copie littérale.
+#   • La preuve chiffrée : la nll des tokens VALEUR est restée PLATE de 200 à
+#     800 pendant que celle du TEMPLATE passait 3.0 → 1.7. Ce n'est pas un
+#     problème d'optimisation, c'est une CLASSE DE FONCTIONS absente — et le
+#     Δnll affiché, qui mélangeait les deux, le cachait.
+#
+# CE QUE CE RUN-CI DOIT TRANCHER (le verdict, en trois signaux SIMULTANÉS)
+#   1. la nll-VALEUR DÉCROCHE (elle, pas la globale) : `[math] VALEUR nll … Δ`
+#      doit monter palier après palier pendant que Δ TEMPLATE stagne ;
+#   2. le grade recall > 0 sur les strates LINGUISTIQUES (name/city), tenu sur
+#      ≥ 30 requêtes par palier, valeurs HELD-OUT ;
+#   3. p_copy s'OUVRE sur les positions valeur et RESTE BAS sur le template
+#      (`p_copy val/tpl`). Une porte qui s'ouvre partout serait un lissage, pas
+#      une citation.
+#   Les trois ensemble = la chaîne de citation est fermée. Si (3) s'ouvre mais
+#   (1) ne bouge pas, la copie pointe au mauvais endroit (regarder α, donc le
+#   layout du préfixe). Si (1) décroche mais (2) reste à 0, le mur est en aval
+#   de la nll — décodage libre vs teacher-forcing, c'est-à-dire l'exposure
+#   bias, et c'est alors un problème de GRPO, pas de SFT.
+#
+# CE QUI CHANGE PAR RAPPORT À sft_recall_350m_rti.yaml — ET RIEN D'AUTRE
+#   • rti.copy_head.enabled: true   (+590 594 params, b_g = −4 ⇒ p_copy ≈ 0.018
+#     au step 0 : le run ne subit aucun choc de distribution au démarrage) ;
+#   • init_from = le ckpt FINAL du run rti (le retriever arrive ENTRAÎNÉ) ;
+#   • escalier LR raccourci (voir training.wsd_decay_start) ;
+#   • éval : ≥ 30 requêtes/palier, graine variée, kind `requote` non gradé.
+#
+# CE QUI EST REPRIS DU JOUET, ET POURQUOI
+#   • Le write SÉLECTIONNE, il ne TRANSFORME pas : un groupe = k embeddings
+#     NATIFS du segment (top-k SIF, ordre du segment) + une ligne-clé. La ligne
+#     `pack` (concat de projections) avait effondré le canal contenu ; les
+#     lignes natives le rendent.
+#   • La citation passe par des PSEUDO-TOKENS INJECTÉS, pas par un readout
+#     appris : au jouet, TOUS les readouts appris sont morts (MoS compris),
+#     l'injection est le seul chemin qui cite.
+#   • Le retriever est appris (W_q d×d zéro-init) et supervisé par une CE
+#     AUXILIAIRE MULTI-POSITIVE — jamais par le canal LM.
+#   • TRAIN ET ÉVAL SONT ISOMORPHES (rti.train_groups == rti.eval_groups,
+#     ordre oracle_first). Leçon la plus chère de la série : r5 v1 entraînait
+#     sur 1 groupe et évaluait sur top-2, le circuit de copie s'est câblé sur
+#     un préfixe mono-groupe et le grade est tombé à 0.067 MALGRÉ un retriever
+#     parfait (recall@1 1.000 sur 267).
+#
+# LE DOWNGRADE ASSUMÉ DU PORT : la clé n'est plus un privilège d'oracle (un
+# vecteur dédié par paire (slot, attr), |cos| ≤ 0.281) mais PROCÉDURALE — le
+# pooling SIF des embeddings du segment, une fonction du seul texte. MESURÉ sur
+# les embeddings RÉELS de la base (300 segments porteurs held-out) :
+#   cos entre clés de segments différents : moy +0.345, médiane +0.372,
+#                                           p99 +0.901, max +1.000
+#   retrieval rang-1 à clé exacte, banques de 8 : 99.7 % (hasard 12.5 %)
+#   cos MÊME slot +0.627 vs slots DIFFÉRENTS +0.315 ⇒ marge +0.312
+# Verdict du diagnostic : les clés SE SÉPARENT (99.7 % rang-1), mais dans un
+# cône bien plus étroit qu'au jouet — c'est cette marge de +0.312 que W_q doit
+# amplifier, et le max à +1.000 (deux énonciations du même fait) est exactement
+# le cas que la CE multi-positive et le tie-break de récence traitent.
+#
+# ÉTAT : câblage COMPLET (rti_copy.py, forward prefix_ids/h_prefix, trainer,
+# décodage d'éval, télémétrie valeur/template, corrections d'éval, schéma).
+# Self-tests CPU verts. Jamais lancé.
+#
+# ATTENTION AU init_from : le trainer nomme son dernier checkpoint `final.pt`
+# (code_defer_native, `_save_ck(... "final.pt" if step == steps ...)`). Le run
+# rti finit vers le step 2000 ; tant qu'il tourne, ce fichier N'EXISTE PAS —
+# c'est NORMAL, et `--check` ne le lit pas. Vérifier sa présence avant de
+# lancer. (Le ckpt de phase 1 s'appelle `final_step2500.pt` parce qu'il a été
+# renommé à la main ; ne pas se fier au motif.)
+#
+# LANCEMENT (--check d'abord) :
+#   TB_ROOT=/mnt/tb python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_recall_350m_copy.yaml --check
+#   ls -l /mnt/tb/checkpoints/v350_sft_recall_rti/final.pt
+#   PYTHONUNBUFFERED=1 TB_ROOT=/mnt/tb nohup python -m \
+#     deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_recall_350m_copy.yaml \
+#     > /mnt/tb/checkpoints/v350_sft_recall_copy/train.log 2>&1 &
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 8                        # = max_mem (décision user 2026-07-28) :
+                                           # banque à TAILLE FIXE dès le tour 1 —
+                                           # pas de phase de croissance 4→8, chaque
+                                           # write évince dès le départ (les seeds
+                                           # d'abord). Seeds = random [0,1], pas de
+                                           # paramètres : l'init base est intacte.
+                                           # Bonus : UNE seule signature de forme
+                                           # pour les graphs d'éval (armement 1x).
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+  sinkhorn_closed_form: true
+  decode_fuse: true                        # les 3 flags decode_* ne touchent
+  decode_dense_moe: true                   # QUE le chemin de décodage (memo
+  decode_static_cache: true                # sous no_grad, MoE dense à BT=1,
+                                           # cache statique) — le forward
+                                           # d'entraînement est bit-identique ;
+                                           # précédent : rl_disagg_350m les a.
+                                           # Requis par training.decode_graphs.
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.2
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.1
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 1200
+  grad_accum: 1
+  amp: true
+  # Base = le ckpt FINAL du run rti, pas la phase 1. Ce run ne rejoue pas le
+  # rti : il en repart. Ce qui arrive déjà entraîné et qu'on ne veut pas
+  # ré-apprendre : le retriever W_q (la sélection est le seul étage que le run
+  # rti ait ouvert), le vecteur de type, et le format ChatML du bras préfixe.
+  # Ce qui démarre à zéro : la tête de copie (clés rti_copy.* absentes du ckpt,
+  # tolérées par le `want` du strict=False).
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_recall_rti/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  no_reset_files: 0
+  cascade_depth: 0                         # SANS cascade (décision user) : la
+                                           # banque vive 8 slots est TOUTE la
+                                           # mémoire, comme en phase 1. Un
+                                           # confound de moins pour la démo.
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_decay_start: 600                     # RACCOURCI (1200 → 600 sur 1200 au
+  wsd_decay_shape: stair                   # lieu de 2000). Justification : le
+  wsd_stair_n: 4                           # plateau plein-LR de 1200 steps de
+  wsd_stair_end: 0.05                      # valsif_stair/rti payait l'ouverture
+                                           # de la SÉLECTION depuis zéro (W_q
+                                           # zéro-init). Ici le retriever arrive
+                                           # entraîné : le seul apprenant neuf
+                                           # est la tête de copie, 590 k params
+                                           # sur un chemin de gradient court et
+                                           # bien conditionné (W_c zéro-init,
+                                           # porte quasi fermée). Le micro-train
+                                           # la fait converger en ~200 steps.
+                                           # 600 de plateau puis 4 paliers de
+                                           # 150 (x0.473/0.224/0.106/0.050) : on
+                                           # garde la lecture « à quel LR le
+                                           # canal s'ouvre » — c'est elle qui a
+                                           # tranché valsif_stair — pour ~40 %
+                                           # du coût. Si la nll-valeur bouge
+                                           # encore franchement à 600, c'est le
+                                           # signal pour relancer plus long, pas
+                                           # pour prolonger celui-ci.
+  decode_cache: true
+  decode_graphs: false                     # INCOMPATIBLE avec rti : les runners
+                                           # CUDA graphs sont capturés à FORME
+                                           # FIXE, et le préfixe injecté change
+                                           # la longueur de séquence du premier
+                                           # forward (bras live) alors que le
+                                           # bras ablaté n'en a pas. Le trainer
+                                           # le force OFF de toute façon, avec
+                                           # un message ; on l'écrit ici pour
+                                           # que --check dise la vérité.
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 100
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths:
+  - 2
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 100
+  save_dir: ${TB_ROOT}/checkpoints/v350_sft_recall_copy
+  metrics_file: ${TB_ROOT}/runs/v350_sft_recall_copy/metrics.jsonl
+chat:
+  p_chat: 1.0
+  weight: 1.0
+  # ── ÉVAL : sous-dimensionnée au run rti, corrigée ici ─────────────────────
+  # 12 convs donnaient ~5 REQUÊTES gradées par palier (persona pèse 0.5 du mix,
+  # 15 % de smalltalk, 1-2 requêtes par conv recall → ~0.64 requête/conv). Un
+  # grade sur n=5 ne distingue rien : 1 réponse juste = +0.20, et l'écart-type
+  # binomial à p=0.2 vaut 0.18. 56 convs → ~36 requêtes, écart-type ~0.07 :
+  # c'est le minimum pour lire un grade qui décolle de 0. Le surcoût est en
+  # partie repris par eval_skip_kinds (les convs requote, longues, ne sont plus
+  # décodées du tout).
+  eval_convs: 56
+  max_new: 240
+  decode_every: 2
+  # `requote` (sota_session) : sa vérité est le message assistant ENTIER d'un
+  # échange antérieur, et ses tours n'ont pas de q_slot — donc jamais de préfixe
+  # injecté. Un tour gradé structurellement ingagnable, qui mangeait la moitié
+  # du budget de décodage. Les convs TRAVERSENT toujours (leurs writes sont les
+  # distracteurs de la banque, les retirer rendrait l'éval plus facile que
+  # l'entraînement) ; elles ne sont simplement plus gradées ni décodées.
+  eval_skip_kinds: [requote]
+  # Graine d'éval VARIÉE par palier (1234 + 1·step) au lieu de figée. Au run rti
+  # les MÊMES 4 sondes revenaient à chaque palier : on ne pouvait pas distinguer
+  # « le canal s'ouvre » de « ces 4 questions-là sont apprises », et le pool de
+  # valeurs held-out ne servait qu'à moitié. L'échantillon apparié qu'on perd
+  # valait de toute façon peu à n=5 ; à n≈36 l'estimateur non-biaisé domine
+  # (variance d'échantillonnage ~0.07 contre un biais de sélection non borné).
+  # La COMPARABILITÉ inter-paliers reste assurée par : même générateur, même
+  # split held-out, même n, même mix — seul le tirage change.
+  eval_seed_stride: 1
+  stream: chat_batch
+  gen:
+    batch: 4
+    slots: 24
+    tile: true
+    pool: 16
+    max_seg_tok: 512
+    stream: chat_mix
+    gen:
+      streams:
+      - stream: persona
+        weight: 0.5
+        gen:
+          p_smalltalk: 0.15
+          n_facts:
+          - 1
+          - 3
+          n_queries:
+          - 1
+          - 2
+          p_ack: 0.5
+          p_update: 0.15
+          p_beyond: 0.15
+          value_weight: 4.0
+          real_filler: HuggingFaceTB/smol-smoltalk
+          real_cap: 20000
+          real_max_tok: 96
+          p_real: 0.8
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+          pool_split: train
+      - stream: sota_session
+        weight: 0.5
+        gen:
+          real_cache_dir: ${TB_ROOT}/data_cache
+          conv_cap: 8000
+          max_turn_tok: 192
+          max_conv_msgs: 10
+          convs_per_session:
+          - 2
+          - 6
+          p_requote: 0.5
+          n_requote:
+          - 1
+          - 2
+          requote_weight: 4.0
+          surprisal_mode: sif
+          sif_a: 0.0001
+  # ── éval des paliers = valeurs HELD-OUT (remplacement COMPLET du gen) ──────
+  # Même structure que gen, seule différence : pool_split 'eval' côté persona.
+  # Le grade recall des paliers porte donc sur des valeurs jamais vues au
+  # train — c'est LE chiffre de la démo.
+  eval_gen:
+    batch: 4
+    slots: 24
+    tile: true
+    pool: 16
+    max_seg_tok: 512
+    stream: chat_mix
+    gen:
+      streams:
+      - stream: persona
+        weight: 0.5
+        gen:
+          p_smalltalk: 0.15
+          n_facts:
+          - 1
+          - 3
+          n_queries:
+          - 1
+          - 2
+          p_ack: 0.5
+          p_update: 0.15
+          p_beyond: 0.15
+          value_weight: 4.0
+          real_filler: HuggingFaceTB/smol-smoltalk
+          real_cap: 20000
+          real_max_tok: 96
+          p_real: 0.8
+          real_cache_dir: ${TB_ROOT}/data_cache
+          surprisal_mode: sif
+          sif_a: 0.0001
+          pool_split: eval
+      - stream: sota_session
+        weight: 0.5
+        gen:
+          real_cache_dir: ${TB_ROOT}/data_cache
+          conv_cap: 8000
+          max_turn_tok: 192
+          max_conv_msgs: 10
+          convs_per_session:
+          - 2
+          - 6
+          p_requote: 0.5
+          n_requote:
+          - 1
+          - 2
+          requote_weight: 4.0
+          surprisal_mode: sif
+          sif_a: 0.0001
+teacher:
+  enabled: false                           # OBLIGATOIRE sous rti : le teacher
+                                           # distille la banque FAST-WEIGHT, que
+                                           # ce bras contourne entièrement
+                                           # (write=False, layer_banks tout à
+                                           # None). Sa cible n'aurait aucun
+                                           # gradient — le trainer refuse de
+                                           # partir si les deux sont ON.
+                                           # Les clés ci-dessous restent pour
+                                           # documenter le réglage de stair.
+  distill_weight: 2.0
+  target: value_sif                        # val_mask = span de LA VALEUR du
+                                           # fait planté (persona) — le slot
+                                           # écrit au tour d'énonciation est
+                                           # tiré vers la projection de
+                                           # l'embedding de ces tokens-là ;
+                                           # repli pooling SIF partout ailleurs
+                                           # (sota + filler).
+  anneal:
+  - 300
+  - 600
+
+# ── RTI : retrieve-then-inject (le bras) ─────────────────────────────────────
+# La banque fast-weight du modèle est ENTIÈREMENT contournée : aucun write
+# appris, aucun read appris (layer_banks tout à None, write=False). Les seuls
+# paramètres nouveaux sont W_q (768×768) et le vecteur de type (768).
+rti:
+  enabled: true
+  top_k: 13                # lignes NATIVES par groupe. 13 = verdict du jouet :
+                           # plus petit k dont la strate `code` dépasse 95 % de
+                           # couverture (97.0 % ; k=8 → 53.1 %, k=6 → 31.2 %).
+                           # Le biais SIF classe BAS les digrammes des codes,
+                           # d'où un k bien plus grand qu'attendu.
+  sif_a: 0.01              # a de w = a/(a+p). 1e-2 et NON le 1e-4 du teacher :
+                           # mesuré, 1e-4 écrase la strate `code` (round-trip
+                           # 28.8 % → 15.1 % au jouet).
+  max_groups: 8            # FIFO de groupes résidents = max_mem. Éviction par
+                           # groupe ENTIER, âges comptés en writes.
+  train_groups: 2          # ISOMORPHIE : autant de groupes au train qu'à l'éval
+  eval_groups: 2           # (vrai + 1 distracteur résident / top-2 du retriever)
+  train_order: oracle_first  # le vrai groupe EN TÊTE — c'est ce que produit
+                           # l'éval quand le retriever a raison (tri par score
+                           # décroissant). `random` ne se justifierait que si la
+                           # question était dans le contexte de décodage ; elle
+                           # n'y est pas (le décodage gradé part du préfixe
+                           # assistant nu), donc l'ordre aléatoire rendrait la
+                           # cible non identifiable à l'inférence.
+  retr_ce: 1.0             # coefficient de la CE auxiliaire, MULTI-POSITIVE :
+                           # deux énonciations du même fait ont des clés quasi
+                           # identiques (mesuré : cos jusqu'à 1.000) et une
+                           # cible unique y aurait un gradient nul.
+  retr_detach: true        # la CE du retriever ne remonte pas dans le trunk :
+                           # W_q est le seul apprenant de la sélection, ce qui
+                           # rend le verdict lisible et protège le circuit de
+                           # copie.
+  write_every_turn: false  # seuls les segments PORTEURS écrivent (privilège
+                           # assumé, comme le `--write fact` du jouet). Le
+                           # régime réel (tous les tours) est la marche d'après.
+  sep_token: "<blank>"     # séparateur après chaque groupe injecté (token
+                           # réservé, jamais présent dans les données).
+  # ── LA TÊTE DE COPIE : le chemin que le backbone n'a pas ─────────────────
+  # P(v) = (1−p)·softmax(logits_lm)[v] + p·P_copy(v), α = softmax des scores
+  # (W_c h_t)·h_préfixe/√d sur les positions du préfixe, p = σ(w_g·h_t + b_g).
+  # Le mélange est DANS LE LOG (vraisemblance marginale) ; les h du préfixe sont
+  # ceux de la dernière couche, DÉJÀ calculés — zéro recalcul, +590 594 params.
+  # Micro-train de contrôle (rti_copy._selftest, littéraux rares, 400 steps) :
+  # CE valeur ON 3.539 → 0.201 (p_copy 0.992) contre OFF 3.929 → 2.212, chance
+  # 3.689. Le bras OFF plafonne à 6× la CE du bras ON : la classe de fonctions
+  # ne se compense pas par plus d'optimisation.
+  copy_head:
+    enabled: true
+    gate_bias_init: -4.0   # σ(−4) = 0.018 : quasi neutre au step 0. On repart
+                           # d'un ckpt entraîné — sa distribution ne doit pas
+                           # basculer au step 1. La porte s'ouvre si et
+                           # seulement si la copie paie.
+    wc_init: zero          # scores nuls ⇒ α uniforme sur le préfixe, gradient
+                           # NON nul (∂s/∂W_c = h_t ⊗ h_pre). `identity`
+                           # partirait d'un prior de MATCH, pas de SUCCESSEUR —
+                           # ce n'est pas ce que fait une tête d'induction.
+    temp_init: 0.0         # log-température de α (0 ⇒ ×1)
+    sentinel_id: -1        # marque les positions NON copiables (séparateurs) ;
+                           # négatif, donc jamais collisionnable avec un vrai id

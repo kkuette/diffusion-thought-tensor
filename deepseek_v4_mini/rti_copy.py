@@ -143,8 +143,19 @@ class CopyHead(nn.Module):
         self.log_temp = nn.Parameter(torch.full((1,), float(self.cfg.temp_init)))
         # télémétrie de la dernière passe (hors gradient) — le trainer la lit
         # pour savoir si la porte S'OUVRE, seule preuve que la copie sert.
+        #
+        # Ce sont des TENSEURS 0-d détachés et non des floats : matérialiser
+        # ici coûtait une SYNCHRO DE DEVICE par forward, et le bras rti fait un
+        # forward par part et par seg (~40/step) dans un régime déjà
+        # launch-bound. `float(x)` et `f"{x:.3f}"` marchent tels quels sur un
+        # tenseur 0-d, donc aucun lecteur ne change.
         self.last_p_copy = None
         self.last_alpha_max = None
+        # `last_gate` [B,T] : p_copy POSITION PAR POSITION. C'est elle qui
+        # permet de séparer « la porte s'ouvre sur la VALEUR » de « la porte
+        # s'ouvre partout » — la moyenne globale ne distingue pas les deux, et
+        # c'est précisément la distinction que le run doit trancher.
+        self.last_gate = None
 
     # ── α : l'attention de copie sur les positions du préfixe ───────────────
 
@@ -177,8 +188,9 @@ class CopyHead(nn.Module):
                                  device=h.device).expand(h.shape[:2])
             log_pc = pc.clamp_min(1e-30).log()
             log_1mpc = (1.0 - pc).clamp_min(1e-30).log()
-        self.last_p_copy = float(log_pc.exp().mean().detach())
-        self.last_alpha_max = float(loga.exp().max(-1).values.mean().detach())
+        self.last_gate = log_pc.exp().detach()                    # [B,T]
+        self.last_p_copy = self.last_gate.mean()
+        self.last_alpha_max = loga.exp().max(-1).values.mean().detach()
         return mix_logprobs(lm_logits, loga, log_pc, log_1mpc, prefix_ids)
 
 
