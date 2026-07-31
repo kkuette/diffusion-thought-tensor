@@ -76,8 +76,8 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
                   "p_chat", "stream", "weight"}),
         "teacher": (set(), {"anneal", "distill_weight", "enabled", "target",
                             "table_lr"}),
-        "rti": (set(), {"enabled", "eval_groups", "max_groups", "retr_ce",
-                        "retr_detach", "sep_token", "sif_a", "top_k",
+        "rti": (set(), {"copy_head", "enabled", "eval_groups", "max_groups",
+                        "retr_ce", "retr_detach", "sep_token", "sif_a", "top_k",
                         "train_groups", "train_order", "write_every_turn"}),
     },
     "rl_disagg": {
@@ -168,6 +168,8 @@ DELEGATED: dict[str, str] = {
     "data.envs":        "liste d'envs RL, chacune consommée par rl_lives.build_envs",
     "data.var_chunk":   "bloc passé tel quel à CodeChunkStream",
     "training.delta_channel": "bloc passé tel quel à DeltaChannel",
+    "rti.copy_head":    "CopyHeadConfig(**raw['rti']['copy_head']) — dataclass, "
+                        "lève sur clé inconnue (rti_copy.py)",
     "recall_env.strata": "mix {strate: poids} — RecallEnvConfig lève sur un nom "
                          "absent du registre recall_env.STRATA",
 }

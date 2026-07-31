@@ -481,6 +481,8 @@ class ThoughtBankLM(nn.Module):
         write: bool = True,
         cache: Optional[list] = None,
         inject: Optional[torch.Tensor] = None,
+        prefix_ids: Optional[torch.Tensor] = None,
+        h_prefix: Optional[torch.Tensor] = None,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -536,6 +538,15 @@ class ThoughtBankLM(nn.Module):
         A = torch.softmax(self.A_out_net(X_mean), dim=-1)               # [B,T,n_hc]
         H_text = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B,T,d]
         H_text = self.norm_out(H_text)
+        # ── Step 4bis: les h du PRÉFIXE, pour la tête de copie ────────────────
+        # On les prend AVANT la tranche : le préfixe a traversé tout le stack,
+        # ses états de dernière couche sont déjà là. La tête de copie ne
+        # recalcule rien — c'est ce qui rend son coût nul en activation.
+        # Ils ne sont matérialisés QUE si quelqu'un les demande (`prefix_ids`) :
+        # sans ça, pas une ligne de ce chemin ne s'exécute.
+        _want_copy = (prefix_ids is not None
+                      and getattr(self, "rti_copy", None) is not None)
+        H_pre = H_text[:, :npre] if (_want_copy and npre) else h_prefix
         if npre:
             # seul le TOUR RÉEL sort (cf. Step 1bis) — et le write, s'il tourne,
             # ne poole donc pas le préfixe injecté.
@@ -566,8 +577,24 @@ class ThoughtBankLM(nn.Module):
             "write_alpha_mean": ts.last_write_alpha_mean if write else None,  # diff E[α]
             "write_redundancy": ts.last_write_redundancy if write else None,  # diff E[max cos]
         }
+        if _want_copy and H_pre is not None:
+            # `h_prefix` ressort pour le DÉCODAGE AVEC CACHE : le préfixe injecté
+            # n'entre qu'au pas 0 (sa KV est ensuite dans le cache), donc les
+            # pas suivants n'ont plus npre>0 et doivent RECEVOIR ces états au
+            # lieu de les recalculer. Sans ça la copie s'éteindrait dès le 2e
+            # token généré — exactement là où elle sert.
+            out["h_prefix"] = H_pre
         if compute_logits:
-            out["logits"] = self.lm_head(H_text)                           # [B,T,V]
+            lg = self.lm_head(H_text)                                      # [B,T,V]
+            if _want_copy and H_pre is not None:
+                # rti_copy rend des LOG-PROBS normalisées, pas des logits : le
+                # mélange pointer-generator se fait dans l'espace des
+                # probabilités. C'est exact pour la CE (log_softmax(log P) =
+                # log P) comme pour l'argmax/la température du décodage — voir
+                # l'entête de rti_copy.
+                lg = self.rti_copy(H_text, H_pre, prefix_ids, lg)
+                out["logits_are_logprobs"] = True
+            out["logits"] = lg
         else:
             out["hidden"]         = H_text
             out["lm_head_weight"] = self.lm_head.weight
@@ -672,6 +699,40 @@ def _selftest() -> None:
     pg = pre.clone().requires_grad_(True)
     m(ids, inject=pg)["logits"].sum().backward()
     assert pg.grad is not None and float(pg.grad.abs().max()) > 0
+
+    # ── rti_copy : la TÊTE DE COPIE aux logits ──────────────────────────────
+    # L'invariant qui protège le run en cours : tant que `prefix_ids` n'est pas
+    # passé, accrocher la tête au modèle est STRICTEMENT invisible — au bit.
+    from .rti_copy import CopyHead, CopyHeadConfig
+    m.eval()
+    with torch.no_grad():
+        ref_i = m(ids, init_mem=bk_i, inject=pre)["logits"].clone()
+        ref_n = m(ids, init_mem=bk_i)["logits"].clone()
+    m.rti_copy = CopyHead(32, CopyHeadConfig(enabled=True))
+    pids = torch.randint(0, V, (B, 5))
+    pids[:, 4] = -1                                   # séparateur = sentinelle
+    with torch.no_grad():
+        assert torch.equal(m(ids, init_mem=bk_i, inject=pre)["logits"], ref_i), \
+            "tête accrochée mais prefix_ids=None : le forward doit être BIT-identique"
+        assert torch.equal(m(ids, init_mem=bk_i)["logits"], ref_n), \
+            "sans injection, la tête de copie doit rester invisible AU BIT"
+        oc = m(ids, init_mem=bk_i, inject=pre, prefix_ids=pids)
+        assert oc.get("logits_are_logprobs") is True
+        assert oc["h_prefix"].shape == (B, 5, 32), oc["h_prefix"].shape
+        # log-probs NORMALISÉES : c'est le contrat que la CE et le décodage lisent
+        assert float(oc["logits"].exp().sum(-1).sub(1).abs().max()) < 1e-4
+        # h_prefix RÉINJECTÉ (décodage avec cache) : même mélange sans préfixe
+        oh = m(ids, init_mem=bk_i, inject=pre, prefix_ids=pids,
+               h_prefix=oc["h_prefix"])
+        assert torch.allclose(oh["logits"], oc["logits"], atol=1e-5)
+    m.train()
+    # le gradient atteint W_c ET la porte à travers le forward complet
+    m.zero_grad()
+    m(ids, init_mem=bk_i, inject=pre, prefix_ids=pids)["logits"].sum().backward()
+    assert float(m.rti_copy.wc.weight.grad.abs().max()) > 0
+    assert float(m.rti_copy.b_g.grad.abs().max()) > 0
+    del m.rti_copy
+    m.zero_grad()
 
     # ── la banque INFLUENCE la sortie (sinon tout le programme est vide) ────
     torch.manual_seed(7)

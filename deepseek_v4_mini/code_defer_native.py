@@ -709,18 +709,31 @@ def main(cfg_path: str, resume: bool = False) -> None:
             sep_token=str(rt.get("sep_token", "<blank>")))
         model.rti_retriever = Retriever(cfg.d_model).to(device)
         model.rti_type = InjectType(cfg.d_model).to(device)
+        # ── la TÊTE DE COPIE (rti.copy_head) ────────────────────────────────
+        # Le diagnostic offline @800 a montré que la chaîne RTI est correcte et
+        # que le backbone ne sait PAS copier un littéral rare — même
+        # teacher-forcé, même depuis un contexte plat sans banque. W_c + une
+        # porte donnent le chemin manquant ; b_g très négatif le rend quasi
+        # neutre au step 0. Détail et preuves : deepseek_v4_mini/rti_copy.py.
+        from .rti_copy import CopyHead, CopyHeadConfig
+        copy_cfg = CopyHeadConfig.from_raw(rt.get("copy_head"))
+        if copy_cfg.enabled:
+            model.rti_copy = CopyHead(cfg.d_model, copy_cfg).to(device)
         rti_sep_id = tok.convert_tokens_to_ids(rti_cfg.sep_token)
         assert rti_sep_id is not None and rti_sep_id >= 0, \
             f"rti.sep_token {rti_cfg.sep_token!r} absent du vocabulaire"
         _rti_np = sum(p.numel() for p in list(model.rti_retriever.parameters())
-                      + list(model.rti_type.parameters()))
+                      + list(model.rti_type.parameters())
+                      + list(getattr(model, "rti_copy", nn.Module()).parameters()))
         print(f"rti ON: top_k {rti_cfg.top_k} groups {rti_cfg.train_groups}/"
               f"{rti_cfg.eval_groups} (train/éval, ordre {rti_cfg.train_order}) "
               f"préfixe {rti_cfg.train_groups * rti_cfg.group_prefix} pseudo-tokens "
               f"| FIFO {rti_cfg.max_groups} groupes/lane, sif_a {rti_cfg.sif_a:g}, "
               f"sép {rti_cfg.sep_token}={rti_sep_id} | retr_ce {rti_cfg.retr_ce} "
               f"detach {rti_cfg.retr_detach} | +{_rti_np:,} params | banque "
-              f"fast-weight CONTOURNÉE (layer_banks=None, write=False)",
+              f"fast-weight CONTOURNÉE (layer_banks=None, write=False)"
+              + (f" | copy-head ON (b_g {copy_cfg.gate_bias_init:g}, W_c "
+                 f"{copy_cfg.wc_init})" if copy_cfg.enabled else ""),
               flush=True)
 
     # init_from: CONTINUED pretraining — model weights from a finished run's
@@ -737,6 +750,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
         miss, unexp = model.load_state_dict(ck0["model"], strict=False)
         want = ({"rti_retriever.wq.weight", "rti_retriever.log_temp",
                  "rti_type.vec"} if rti_on else set())
+        if getattr(model, "rti_copy", None) is not None:
+            want |= {"rti_copy.wc.weight", "rti_copy.w_g", "rti_copy.b_g",
+                     "rti_copy.log_temp"}
         assert set(miss) == want, \
             f"init_from: clés manquantes inattendues {sorted(set(miss) - want)}"
         assert not unexp, f"init_from: clés en trop {sorted(unexp)[:8]}"

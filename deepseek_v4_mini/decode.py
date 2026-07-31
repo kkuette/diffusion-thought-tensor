@@ -56,7 +56,8 @@ def _pick(logits, temp: float, top_p: float, generator=None):
 def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
              stop_id=None, amp: bool = False, temp: float = 0.0,
              top_p: float = 1.0, generator=None, write: bool = False,
-             use_cache: bool = False, inject=None, return_logp: bool = False):
+             use_cache: bool = False, inject=None, prefix_ids=None,
+             return_logp: bool = False):
     """Génère au plus `max_new` tokens après `prefix`, depuis la banque COURANTE.
 
     `return_logp` (chemin RL) : rend en plus `logp` [B, n], la log-probabilité
@@ -109,8 +110,14 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
     # un checkpoint ENTRAÎNÉ (routage décisif ⇒ bascules rares) avant de
     # basculer le défaut ; le RL, lui, peut l'activer tout de suite : ses
     # rollouts sont des échantillons, et c'est là que le gain est.
+    # `prefix_ids` [B,P] (rti + tête de copie) : ce que DIT chaque position du
+    # préfixe injecté. La tête de copie a besoin des états cachés du préfixe ;
+    # sans cache ils sont recalculés à chaque pas, AVEC cache le préfixe n'entre
+    # qu'au pas 0 — on garde donc `h_pre` du premier forward et on le réinjecte,
+    # sinon la copie s'éteindrait dès le 2e token, exactement là où elle sert.
     cache = model.make_cache() if (use_cache and hasattr(model, "make_cache")) else None
     fed = prefix
+    h_pre = None
 
     n = 0
     for i in range(max_new):
@@ -125,7 +132,12 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
                       **({"cache": cache} if cache is not None else {}),
                       **({"inject": inject}
                          if inject is not None and (cache is None or i == 0)
-                         else {}))
+                         else {}),
+                      **({"prefix_ids": prefix_ids} if prefix_ids is not None
+                         else {}),
+                      **({"h_prefix": h_pre} if h_pre is not None else {}))
+        if prefix_ids is not None and cache is not None and "h_prefix" in o:
+            h_pre = o["h_prefix"]
         nt = _pick(o["logits"][:, -1], temp, top_p, generator)   # [B,1]
         if return_logp:
             lps.append(_logp(o["logits"][:, -1], nt, temp))
@@ -282,6 +294,52 @@ def _selftest() -> None:
 
     generate(Spy().eval(), prefixes[0], max_new=2, stop_id=None)
     assert seen["write"] is False, "le décodage paie un write qu'il jette"
+
+    # ── rti + tête de copie : prefix_ids traverse, et h_prefix est PORTÉ ─────
+    # Sous cache, le préfixe injecté n'entre qu'au pas 0 : si `generate` ne
+    # reportait pas `h_prefix`, la tête de copie serait aveugle dès le 2e token
+    # — une extinction silencieuse, invisible aux formes.
+    calls = []
+
+    class Copier(nn.Module):
+        """Rend h_prefix au pas où il voit le préfixe, et l'exige ensuite."""
+
+        def forward(self, x, init_mem=None, layer_banks=None, write=True,
+                    inject=None, prefix_ids=None, h_prefix=None, cache=None,
+                    **kw):
+            calls.append((inject is not None, prefix_ids is not None,
+                          h_prefix is not None))
+            B, T = x.shape
+            assert prefix_ids is not None
+            assert inject is not None or h_prefix is not None, \
+                "la tête de copie a perdu les états du préfixe"
+            hp = h_prefix if inject is None else torch.randn(B, inject.size(1), 4)
+            lg = torch.zeros(B, T, V)
+            lg[:, -1, int(prefix_ids[0, 0])] = 5.0        # « copie la position 0 »
+            return {"logits": lg, "mem_bank": init_mem, "h_prefix": hp,
+                    "logits_are_logprobs": False, "balance_loss": torch.zeros(())}
+
+    pid = torch.tensor([[9, 3, -1]])
+    gcp, _ = generate(Copier(), torch.zeros(1, 2, dtype=torch.long), max_new=3,
+                      stop_id=None, inject=torch.randn(1, 3, 4), prefix_ids=pid,
+                      use_cache=False)
+    assert gcp.tolist() == [[9, 9, 9]], gcp
+    calls.clear()
+
+    class CacheCopier(Copier):
+        def make_cache(self):
+            return [None]
+
+    gcc, _ = generate(CacheCopier(), torch.zeros(1, 2, dtype=torch.long),
+                      max_new=3, stop_id=None, inject=torch.randn(1, 3, 4),
+                      prefix_ids=pid, use_cache=True)
+    assert gcc.tolist() == [[9, 9, 9]], gcc
+    assert calls[0] == (True, True, False), calls[0]
+    assert all(c == (False, True, True) for c in calls[1:]), calls
+    # sans prefix_ids, rien n'est passé : le chemin historique est intact
+    seen.clear()
+    generate(Spy().eval(), prefixes[0], max_new=2, stop_id=None)
+    assert "h_prefix" not in seen
 
     # ── CPU : l'autocast cuda ne doit pas être armé (le piège des 2 copies) ──
     g, _ = generate(m, prefixes[0], max_new=3, stop_id=None, amp=True)

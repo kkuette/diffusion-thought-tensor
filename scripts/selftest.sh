@@ -44,6 +44,7 @@ MODULES=(
   chat_mix            # mix pondéré de streams derrière le contrat mono-stream
   chat_batch          # B lanes chat en lockstep par tour (padding, pas de ligne vide)
   rti                 # retrieve-then-inject : groupe, FIFO, retriever, préfixe, pilote
+  rti_copy            # tête de copie aux logits : mélange, oracle, micro-train ON/OFF
   recall_env          # vies de rappel scriptées/appariées + reward vérifiable
   rti_policy          # les 3 ACTIONS RL du bras rti : write, Plackett-Luce, décodage
   rti_learner         # passe 2 rti : ratios on-policy, CISPO, GiGPO, leave-one-slot

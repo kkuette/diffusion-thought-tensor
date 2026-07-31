@@ -286,6 +286,35 @@ def build_prefix(embed_w, type_vec, sep_id: int, groups: list, cfg: RtiConfig):
     return torch.cat([pre, sep], dim=2).reshape(B, G * cfg.group_prefix, -1)
 
 
+def build_prefix_ids(sep_id: int, groups: list, cfg: RtiConfig,
+                     sentinel: int = -1, device=None) -> torch.Tensor:
+    """[B, P] long : le TOKEN ID porté par chaque position du préfixe injecté.
+
+    Exactement le pendant discret de `build_prefix` — MÊME layout, MÊME ordre,
+    MÊME longueur P = G·(top_k+1). C'est ce que la tête de copie (`rti_copy`)
+    scatter sur le vocabulaire : sans lui, le préfixe est un banc de vecteurs
+    dont on ignore ce qu'ils DISENT.
+
+    Les positions de SÉPARATEUR reçoivent `sentinel` (< 0 par défaut) et non
+    l'id de `<blank>` : le séparateur est une ponctuation de layout, jamais une
+    cible de citation. `rti_copy` masque ces positions à −inf dans α, donc leur
+    masse ne dilue même pas le softmax de copie.
+
+    Le write ne perd rien à les exposer : le groupe EST une liste de token ids
+    (`LaneBank.toks`), c'est déjà ce que `build_prefix` va chercher dans la
+    table d'embedding. Le rollout RL les expose déjà sous `cand_toks`.
+    """
+    B = len(groups)
+    G = len(groups[0]) if B else 0
+    assert all(len(g) == G for g in groups), "préfixe de longueur variable"
+    if G == 0:
+        return None
+    ids = torch.stack([torch.stack(g) for g in groups]).to(device)   # [B,G,k]
+    sep = torch.full((B, G, 1), int(sentinel), dtype=torch.long,
+                     device=ids.device)
+    return torch.cat([ids, sep], dim=2).reshape(B, G * cfg.group_prefix)
+
+
 def pick_train_groups(bank: LaneBank, tag, cfg: RtiConfig, gen=None) -> list:
     """Index des groupes injectés devant UNE réponse à l'ENTRAÎNEMENT : le VRAI
     (le plus récent portant ce fait) + des distracteurs tirés parmi les autres
@@ -469,9 +498,17 @@ class RtiRunner:
 
     # ── 3. PARTS : le préfixe dû à CE seg, partitionné par longueur ─────────
 
-    def parts(self, embed_w, type_vec, B: int, roles=None, train: bool = True):
+    def parts(self, embed_w, type_vec, B: int, roles=None, train: bool = True,
+              with_ids: bool = False, sentinel: int = -1):
         """[(rows LongTensor, inject [n,P,d] | None)] — une PARTITION des B
         lanes du seg par longueur de préfixe.
+
+        `with_ids=True` rend des TRIPLETS (rows, inject, prefix_ids [n,P]) au
+        lieu de paires : c'est ce que réclame la tête de copie
+        (`rti_copy.CopyHead`), qui a besoin de savoir quel token DIT chaque
+        position du préfixe. Le défaut reste la paire — tous les appelants
+        historiques (trainer, éval, rti_policy) déballent `for rows, inj in
+        parts` et ne doivent rien voir de ce chantier.
 
         Une tranche de séquence ne peut pas varier à l'intérieur d'un batch
         (crash payé au job 58) : les lanes injectées et les autres ne peuvent
@@ -515,11 +552,17 @@ class RtiRunner:
             items = buckets[g]
             rows = torch.tensor([b for b, _ in items], dtype=torch.long)
             if g == 0:
-                out.append((rows, None))
+                out.append((rows, None, None) if with_ids else (rows, None))
                 continue
             self.tel["inject"] += len(items)
-            out.append((rows, build_prefix(embed_w, type_vec, self.sep_id,
-                                           [t for _, t in items], cfg)))
+            toks = [t for _, t in items]
+            inj = build_prefix(embed_w, type_vec, self.sep_id, toks, cfg)
+            if with_ids:
+                out.append((rows, inj,
+                            build_prefix_ids(self.sep_id, toks, cfg, sentinel,
+                                             device=embed_w.device)))
+            else:
+                out.append((rows, inj))
         return out
 
     def telemetry(self) -> dict:
@@ -602,6 +645,14 @@ def _selftest() -> None:
     assert torch.allclose(P[0, 5:9], E[torch.arange(4) + 10])
     # NON normalisé : la norme d'un embedding brut n'est pas 1
     assert abs(float(P[0, 0].norm()) - 1.0) > 1e-3
+    # les IDS du préfixe : même layout, séparateur = sentinelle NON copiable
+    Pid = build_prefix_ids(sep_id=5, groups=g, cfg=cfg, sentinel=-1)
+    assert Pid.shape == (2, 2 * cfg.group_prefix), Pid.shape
+    assert Pid[0].tolist() == [0, 1, 2, 3, -1, 10, 11, 12, 13, -1], Pid[0]
+    # chaque position NON sentinelle porte l'embedding de son id (type zéro-init)
+    ok = [j for j in range(Pid.size(1)) if int(Pid[0, j]) >= 0]
+    assert torch.allclose(P[0, ok], E[Pid[0, ok]]), \
+        "ids du préfixe désalignés des vecteurs injectés"
     # longueurs hétérogènes = refus explicite (l'appelant doit regrouper)
     try:
         build_prefix(E, ty.vec, 5, [[torch.arange(4)], []], cfg)
@@ -696,6 +747,12 @@ def _selftest() -> None:
     assert inj.shape == (2, 2 * cfgR.group_prefix, d), inj.shape
     assert torch.allclose(inj[0, :4], E[run.banks[0].toks[0]]), \
         "oracle_first : le groupe du fait interrogé doit ouvrir le préfixe"
+    # with_ids : TRIPLETS alignés au préfixe, et le défaut reste la PAIRE
+    run.query(retr, sq["q_slot"], torch.randn(2, 4, d))
+    pid = run.parts(E, ty2.vec, 2, sa["roles"], with_ids=True)
+    assert len(pid[0]) == 3 and pid[0][2].shape == (2, 2 * cfgR.group_prefix)
+    assert torch.equal(pid[0][2][0, :4], run.banks[0].toks[0])
+    assert int(pid[0][2][0, 4]) == -1, "le séparateur doit être la sentinelle"
     # la requête est CONSOMMÉE : le seg d'après ne reçoit plus rien
     assert all(p is None for _, p in run.parts(E, ty2.vec, 2, sa["roles"]))
     # un rôle non-assistant ne reçoit jamais le préfixe (garde de désalignement)
