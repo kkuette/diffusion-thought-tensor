@@ -1,0 +1,177 @@
+# rl_recall_env_smoke — l'ENV DE RAPPEL GÉNÉRAL, en configuration de fumée.
+#
+# CE QUE CE FICHIER EST. Le curriculum de `deepseek_v4_mini/recall_env.py` (vies
+# de rappel scriptées et APPARIÉES + reward vérifiable), posé dans la forme que
+# `rl_disagg` consomme pour que `--check` le valide AVANT de réserver le GPU.
+# Le reste du fichier (model/rl) est repris de rl_recall_350m.yaml pour que la
+# config ait une FORME complète et vérifiable ; ce n'est PAS un run prêt à
+# partir : le câblage rollout (agent 2) et l'algo (agent 3) n'existent pas
+# encore, et `init_from` pointe le ckpt SFT rti qui n'est pas fini.
+#
+#   python -m deepseek_v4_mini.cfg_schema        # valide toutes les configs
+#
+# CE QUI SE RÈGLE ICI, ET POURQUOI
+#   • `write_policy: facts` — la politique de RÉFÉRENCE qui décide de la
+#     résidence en FIFO. C'est la borne OPTIMISTE (« aucune politique
+#     d'écriture ne pouvait garder ce fait »), et c'est ce qu'il faut : sous la
+#     borne pessimiste `all`, on neutraliserait des sondes qu'une politique qui
+#     écrit à propos aurait réussies — c'est-à-dire exactement le signal que le
+#     cliquet doit apprendre. Coïncide avec le bras rti déployé
+#     (`rti.write_every_turn: false`).
+#   • `inject_groups: 2` — le LAYOUT du préfixe injecté, qui voyage DANS le
+#     script. Le rollout DOIT construire son `RtiConfig` avec cette valeur, en
+#     train comme en éval : r5 v1 a entraîné sur 1 groupe, évalué sur top-2, et
+#     le grade est tombé à 0.067 MALGRÉ un retriever parfait.
+#   • `filler_per_fact: [1, 3]` — les distracteurs ne sont pas du décor : une
+#     vie sans distracteur résident donne un retriever qui ne discrimine rien.
+#     Le remplissage est du texte RÉEL (smol-smoltalk, même cache que le SFT) ;
+#     sans `real_filler`, repli sur les gabarits persona (chemin hermétique).
+#   • `p_beyond: 0.15` sur des vies à 2-4 faits ne produit AUCUNE sonde
+#     impossible (4 faits tiennent dans 8 slots) — c'est correct. Les sondes
+#     impossibles se fabriquent en SATURANT la banque : voir le bloc
+#     `recall_env` commenté « saturé » plus bas.
+#
+# STATS MESURÉES avec ces réglages (self-test, 300 vies, repli gabarits) :
+#   âge atteint moyen 10.8 segs, médiane 9, p10 5 / p90 18 ; ~21 segs par vie ;
+#   0 % de sondes impossibles sous `facts`, ~60 % sous `all`.
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = rl_recall_350m.yaml verbatim
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 8                        # banque FIXE dès le tour 1
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+  decode_fuse: true
+  decode_dense_moe: true
+  decode_static_cache: true
+
+data:
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  cache_dir: ${TB_ROOT}/data_cache
+  envs:
+  - name: recall_env                       # l'env de CE fichier. `kind` doit
+    kind: recall_env                       # être branché dans rl_disagg.build_envs
+    weight: 0.7                            # par l'agent 2 (registre streams).
+    lambda_write: 0.0
+    max_new: 96                            # réponse courte OU un bloc python
+    gen: {}                                # le curriculum vit dans recall_env:
+  - name: sota                             # pression dense de fond : le chat
+    kind: sota                             # général ne doit pas s'éroder
+    weight: 0.3
+    lambda_write: 0.03
+    gen:
+      real_cache_dir: ${TB_ROOT}/data_cache
+      conv_cap: 8000
+      max_turn_tok: 192
+      max_conv_msgs: 10
+      convs_per_session: [2, 6]
+      p_requote: 0.5
+      n_requote: [1, 2]
+      surprisal_mode: sif
+      sif_a: 1.0e-04
+
+# ── LE CURRICULUM ────────────────────────────────────────────────────────────
+recall_env:
+  life_seed: 0                             # seed → script. Deux workers avec le
+                                           # même (life_seed, life) produisent le
+                                           # MÊME script, bit à bit : c'est ce
+                                           # qui rend l'avantage de groupe
+                                           # contrefactuel et l'ancrage par
+                                           # index de tour (GiGPO) bien défini.
+  strata:                                  # « rappel général » = mix de strates
+    persona: 0.35                          #   entité/nom rare
+    numeric: 0.25                          #   valeur numérique
+    code: 0.20                             #   constante+nom réutilisés dans un
+                                           #   code EXÉCUTÉ (juge = interpréteur)
+    preference: 0.20                       #   consigne en langue naturelle
+  n_facts: [2, 4]
+  n_probes: [1, 3]
+  filler_per_fact: [1, 3]                  # densité de distracteurs
+  p_ack: 0.5
+  age_bins: [[2, 6], [7, 12]]              # distribution des âges de sonde
+  age_weights: [0.6, 0.4]
+  p_beyond: 0.15
+  max_groups: 8                            # = model.max_mem
+  write_policy: facts                      # borne optimiste (voir en-tête)
+  inject_groups: 2                         # = rti.train_groups == eval_groups
+  value_weight: 4.0
+  exec_timeout: 6.0
+  real_filler: HuggingFaceTB/smol-smoltalk # distracteurs RÉELS
+  real_cap: 20000
+  real_max_tok: 96
+  real_cache_dir: ${TB_ROOT}/data_cache
+  p_real: 0.8
+  surprisal_mode: sif
+  sif_a: 1.0e-04
+# Variante « saturée » (à copier par-dessus le bloc ci-dessus pour muscler la
+# strate des sondes IMPOSSIBLES — mesuré : ~50 % de sondes neutres) :
+#   n_facts: [12, 16]
+#   n_probes: [3, 4]
+#   p_beyond: 0.5
+
+rl:
+  seed: 0
+  train_scope: think_row
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_recall_rti/final.pt
+  n_lives_per_worker: 2
+  max_episodes_per_life: 0
+  cascade_depth: 0
+  steps: 20                                # FUMÉE
+  group_size: 8                            # les G rollouts d'un groupe partagent
+                                           # UN script (recall_env.script(life))
+  groups_per_step: 2
+  lr: 3.0e-04
+  temp: 3.0
+  lambda_write: 0.0
+  clip_low: 0.2
+  clip_high: 0.28
+  kl_coef: 1.0e-2
+  min_reward_std: 1.0e-4
+  max_resample: 4
+  explore_floor: 0.5
+  grad_clip: 1.0
+  save_every: 50
+  think_nmax: 16                           # économie de think NEUTRALISÉE
+  think_floor: 1.0                         # (floor 1.0 ⇒ eff ≡ 1) : le FIFO
+                                           # price déjà les writes.
+  max_new: 96
+  amp: true
+  decode_cache: true
+  decode_graphs: false                     # INCOMPATIBLE rti : le préfixe
+                                           # injecté change la longueur du 1er
+                                           # forward, les graphs sont capturés à
+                                           # forme FIXE.
+  disagg:
+    root: ${TB_ROOT}/rl/recall_env_smoke
+    publish_every: 1
+    max_lag: 2
+    keep_weights: 3
+    poll_s: 2.0
+    max_pending: 8
+    lives_save_every: 20
+    xdom_every: 50
+    max_groups: 0

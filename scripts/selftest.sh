@@ -44,6 +44,7 @@ MODULES=(
   chat_mix            # mix pondéré de streams derrière le contrat mono-stream
   chat_batch          # B lanes chat en lockstep par tour (padding, pas de ligne vide)
   rti                 # retrieve-then-inject : groupe, FIFO, retriever, préfixe, pilote
+  recall_env          # vies de rappel scriptées/appariées + reward vérifiable
 )
 
 [ $# -gt 0 ] && MODULES=("$@")

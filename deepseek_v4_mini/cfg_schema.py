@@ -81,7 +81,12 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
                         "train_groups", "train_order", "write_every_turn"}),
     },
     "rl_disagg": {
-        "": ({"tokenizer", "model", "data", "rl"}, set()),
+        # `recall_env` : le CURRICULUM de l'env de rappel général
+        # (deepseek_v4_mini/recall_env.py). Déclaré ici et non sous
+        # `code_defer_native` parce que c'est un env RL — et parce que la racine
+        # de code_defer_native est vérifiée à l'IDENTIQUE contre l'extraction
+        # ast, qui n'y verrait jamais cette section.
+        "": ({"tokenizer", "model", "data", "rl"}, {"recall_env"}),
         "data": ({"chunks_per_conv", "envs", "seq_len"},
                  {"cache_dir", "defer_len", "var_chunk"}),
         "rl": (
@@ -100,6 +105,17 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
             {"keep_weights", "lives_save_every", "max_groups", "max_lag",
              "max_pending", "poll_s", "publish_every", "xdom_every"},
         ),
+        # Gardien réel : RecallEnvConfig.from_raw(raw["recall_env"]) — dataclass,
+        # donc une clé inconnue lève déjà ; la déclarer ici la fait tomber au
+        # --check, AVANT de réserver le GPU.
+        "recall_env": (set(),
+                       {"age_bins", "age_weights", "exec_timeout",
+                        "filler_per_fact", "inject_groups", "life_seed",
+                        "max_groups", "n_facts", "n_probes", "p_ack",
+                        "p_beyond", "p_real", "real_cache_dir", "real_cap",
+                        "real_filler", "real_max_tok", "real_split", "sif_a",
+                        "strata", "surprisal_mode", "value_weight",
+                        "write_policy"}),
     },
     "rl_defer_grpo_lives": {
         "": ({"tokenizer", "model", "data", "rl"}, set()),
@@ -134,6 +150,8 @@ DELEGATED: dict[str, str] = {
     "data.envs":        "liste d'envs RL, chacune consommée par rl_lives.build_envs",
     "data.var_chunk":   "bloc passé tel quel à CodeChunkStream",
     "training.delta_channel": "bloc passé tel quel à DeltaChannel",
+    "recall_env.strata": "mix {strate: poids} — RecallEnvConfig lève sur un nom "
+                         "absent du registre recall_env.STRATA",
 }
 
 
