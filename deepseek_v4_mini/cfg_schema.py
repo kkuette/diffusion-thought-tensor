@@ -86,9 +86,18 @@ SCHEMAS: dict[str, dict[str, tuple[set[str], set[str]]]] = {
         # `code_defer_native` parce que c'est un env RL — et parce que la racine
         # de code_defer_native est vérifiée à l'IDENTIQUE contre l'extraction
         # ast, qui n'y verrait jamais cette section.
-        "": ({"tokenizer", "model", "data", "rl"}, {"recall_env"}),
+        "": ({"tokenizer", "model", "data", "rl"}, {"recall_env", "rti"}),
         "data": ({"chunks_per_conv", "envs", "seq_len"},
                  {"cache_dir", "defer_len", "var_chunk"}),
+        # `rti:` = le MÉCANISME (RtiConfig, mêmes clés que sous
+        # code_defer_native) + les knobs des ACTIONS (RtiPolicyConfig). Les deux
+        # dataclasses lèvent déjà sur une clé inconnue ; les déclarer ici les
+        # fait tomber au --check. Gardien réel : rti_policy.rti_from_raw.
+        "rti": (set(), {"enabled", "top_k", "max_groups", "sif_a", "sep_token",
+                        "train_groups", "eval_groups", "train_order",
+                        "retr_ce", "retr_detach", "write_every_turn",
+                        "write_mode", "write_temp", "write_floor", "write_on",
+                        "retr_temp", "decode_temp", "decode_top_p", "greedy"}),
         "rl": (
             {"disagg", "init_from", "steps"},
             {"amp", "cascade_depth", "cascade_map", "clip_high", "clip_low",

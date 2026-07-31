@@ -25,6 +25,8 @@ CHAT_STREAMS: dict[str, tuple[str, str]] = {
     "tool_session": ("tool_env_data",     "ToolSessionStream"),
     "code_exec":    ("code_exec_data",    "CodeExecStream"),
     "persona":      ("persona_chat_data", "PersonaChatStream"),
+    # vies de rappel SCRIPTÉES et appariées (l'env du cliquet GRPO rti)
+    "recall_env":   ("recall_env",        "RecallEnvStream"),
     "math_school":  ("math_school_data",  "MathSchoolStream"),
     "chat_mix":     ("chat_mix",          "ChatMixStream"),
     # enveloppe : B lanes du stream qu'il enveloppe, en lockstep par tour
@@ -40,6 +42,7 @@ RL_ENV_KIND_TO_STREAM: dict[str, str] = {
     "exec": "code_exec",
     "sota": "sota_session",
     "recall": "persona",
+    "recall_env": "recall_env",
 }
 
 

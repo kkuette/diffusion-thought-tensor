@@ -73,26 +73,21 @@ data:
   defer_len: 16
   cache_dir: ${TB_ROOT}/data_cache
   envs:
-  - name: recall_env                       # l'env de CE fichier. `kind` doit
-    kind: recall_env                       # être branché dans rl_disagg.build_envs
-    weight: 0.7                            # par l'agent 2 (registre streams).
+  - name: recall_env                       # l'env de CE fichier (kind branché
+    kind: recall_env                       # dans streams.py + rl_disagg).
+    weight: 1.0
     lambda_write: 0.0
     max_new: 96                            # réponse courte OU un bloc python
     gen: {}                                # le curriculum vit dans recall_env:
-  - name: sota                             # pression dense de fond : le chat
-    kind: sota                             # général ne doit pas s'éroder
-    weight: 0.3
-    lambda_write: 0.03
-    gen:
-      real_cache_dir: ${TB_ROOT}/data_cache
-      conv_cap: 8000
-      max_turn_tok: 192
-      max_conv_msgs: 10
-      convs_per_session: [2, 6]
-      p_requote: 0.5
-      n_requote: [1, 2]
-      surprisal_mode: sif
-      sif_a: 1.0e-04
+# L'env `sota` (pression dense de fond) A ÉTÉ RETIRÉ, et ce n'est pas un oubli.
+# Sous rti la banque fast-weight est intégralement CONTOURNÉE (layer_banks tout
+# à None, write=False) : le rollout dense de rl_defer_grpo_lives lit cette
+# banque et écrit ses gists dedans, c'est-à-dire qu'il optimiserait un canal
+# INERTE pour ce checkpoint — un gradient sur du bruit. Le worker le refuse à
+# l'assert (rl_disagg.Worker._rti_setup). La pression « ne pas éroder le chat
+# général » passe par la KL à la ref (rl.kl_coef), pas par un env mélangé ;
+# rouvrir le mix demandera d'abord un rollout dense qui passe, lui aussi, par
+# le préfixe injecté.
 
 # ── LE CURRICULUM ────────────────────────────────────────────────────────────
 recall_env:
@@ -164,7 +159,8 @@ rl:
   decode_graphs: false                     # INCOMPATIBLE rti : le préfixe
                                            # injecté change la longueur du 1er
                                            # forward, les graphs sont capturés à
-                                           # forme FIXE.
+                                           # forme FIXE. Refus à l'assert côté
+                                           # worker (jamais un désarmement muet).
   disagg:
     root: ${TB_ROOT}/rl/recall_env_smoke
     publish_every: 1
@@ -175,3 +171,52 @@ rl:
     lives_save_every: 20
     xdom_every: 50
     max_groups: 0
+
+# ── LE BRAS RTI : mécanisme (RtiConfig) + ACTIONS (RtiPolicyConfig) ──────────
+# Les trois actions créditées par le même reward vivent ici. `rti_policy.py` en
+# porte les log-probs ; `rl_disagg.Worker.one_group_rti` déroule la vie.
+rti:
+  enabled: true
+  top_k: 13                                # lignes natives par groupe (verdict
+                                           # du jouet : plus petit k dont la
+                                           # strate code dépasse 95 % de
+                                           # couverture)
+  max_groups: 8                            # = model.max_mem = recall_env.max_groups
+  sif_a: 1.0e-02                           # 1e-2 et NON 1e-4 : mesuré au jouet,
+                                           # 1e-4 écrase la strate code
+  sep_token: <blank>
+  train_groups: 2                          # ISOMORPHIE : train == eval ==
+  eval_groups: 2                           # recall_env.inject_groups. Le
+                                           # rollout ASSERTE l'égalité contre le
+                                           # layout qui voyage dans le script
+                                           # (r5 v1 : grade 0.067 malgré un
+                                           # retriever parfait).
+  train_order: oracle_first
+  write_every_turn: false                  # = write_policy `facts` du générateur
+  # ── les ACTIONS ────────────────────────────────────────────────────────────
+  write_mode: head                         # Bernoulli apprise (tête d→1,
+                                           # zéro-init ⇒ p=0.5 au step 0).
+                                           # `facts` = la baseline procédurale
+                                           # du SFT, bit à bit.
+  write_temp: 1.0
+  write_floor: 0.5                         # plancher d'EXPLORATION sur la
+                                           # probabilité de COMPORTEMENT. Même
+                                           # rôle que rl.explore_floor : sans
+                                           # lui la banque des rollouts reste
+                                           # vide et tout le groupe rend 0
+                                           # (pré-vol 07-27). La log-prob
+                                           # enregistrée est celle du
+                                           # comportement ⇒ off-policy propre.
+  write_on: all                            # tout seg est candidat au write —
+                                           # y compris la réponse DÉCODÉE, dont
+                                           # le groupe est construit sur le
+                                           # texte réellement produit (on-policy)
+  retr_temp: 1.0                           # température du Plackett-Luce
+  decode_temp: 1.0                         # échantillonnage obligatoire : à
+                                           # temp 0 la log-prob du token est
+                                           # dégénérée, il n'y a rien à créditer
+  decode_top_p: 1.0                        # le noyau renormalise la loi et
+                                           # casserait la log-prob d'action
+                                           # (refus à l'assert dans generate)
+  greedy: false                            # true = chemin d'ÉVAL (argmax
+                                           # séquentiel == top-k du SFT)

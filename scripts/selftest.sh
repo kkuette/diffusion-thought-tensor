@@ -45,6 +45,7 @@ MODULES=(
   chat_batch          # B lanes chat en lockstep par tour (padding, pas de ligne vide)
   rti                 # retrieve-then-inject : groupe, FIFO, retriever, préfixe, pilote
   recall_env          # vies de rappel scriptées/appariées + reward vérifiable
+  rti_policy          # les 3 ACTIONS RL du bras rti : write, Plackett-Luce, décodage
 )
 
 [ $# -gt 0 ] && MODULES=("$@")

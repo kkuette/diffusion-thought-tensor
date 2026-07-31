@@ -23,6 +23,19 @@ from __future__ import annotations
 import torch
 
 
+def _logp(logits, nt, temp: float):
+    """log-prob du token CHOISI sous la loi d'échantillonnage réelle.
+
+    C'est la log-prob de l'ACTION au sens du RL : le ratio de la passe 2 la
+    recalcule à la même température, donc greedy (temp == 0) rend 0.0 —
+    l'action est déterministe, il n'y a rien à créditer.
+    """
+    if temp <= 0:
+        return torch.zeros(logits.size(0), device=logits.device)
+    return torch.log_softmax(logits.float() / temp, dim=-1) \
+                .gather(-1, nt).squeeze(-1)
+
+
 def _pick(logits, temp: float, top_p: float, generator=None):
     """Token suivant depuis les logits de dernière position : greedy si
     temp == 0, sinon température + noyau (top-p)."""
@@ -43,8 +56,17 @@ def _pick(logits, temp: float, top_p: float, generator=None):
 def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
              stop_id=None, amp: bool = False, temp: float = 0.0,
              top_p: float = 1.0, generator=None, write: bool = False,
-             use_cache: bool = False, inject=None):
+             use_cache: bool = False, inject=None, return_logp: bool = False):
     """Génère au plus `max_new` tokens après `prefix`, depuis la banque COURANTE.
+
+    `return_logp` (chemin RL) : rend en plus `logp` [B, n], la log-probabilité
+    du token TIRÉ à chaque pas, sous la loi d'échantillonnage réelle. C'est la
+    log-prob d'action du décodage — la seule chose que le learner ne peut pas
+    reconstituer sans refaire le forward. Les positions du PRÉFIXE INJECTÉ n'y
+    figurent pas : `generate` ne rend que ce qui suit `prefix`, et `inject` est
+    retranché des sorties par `model.forward` (Step 1bis). Refusé sous top-p :
+    le noyau tronque et renormalise la loi, la log-prob du softmax plein ne
+    serait plus celle de l'action (cf. rti_policy, où le ratio doit tenir).
 
     prefix : [B, T]. Renvoie (gen, lens) :
       * `gen`  [B, n] les tokens générés, n ≤ max_new ;
@@ -63,6 +85,9 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
     out = prefix
     done = torch.zeros(B, dtype=torch.bool, device=dev)
     lens = torch.full((B,), max_new, dtype=torch.long, device=dev)
+    assert not (return_logp and top_p < 1.0), \
+        "return_logp exige top_p == 1.0 (le noyau renormalise la loi)"
+    lps = []
 
     # Avec cache : le préfixe passe une fois, puis chaque token ne traverse le
     # stack qu'UNE fois au lieu de refaire tout le préfixe (l'attention relit
@@ -102,6 +127,8 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
                          if inject is not None and (cache is None or i == 0)
                          else {}))
         nt = _pick(o["logits"][:, -1], temp, top_p, generator)   # [B,1]
+        if return_logp:
+            lps.append(_logp(o["logits"][:, -1], nt, temp))
         out = torch.cat([out, nt], dim=1)
         fed = nt if cache is not None else out
         n = i + 1
@@ -112,6 +139,10 @@ def generate(model, prefix, *, bank=None, layer_banks=None, max_new: int = 48,
             if bool(done.all()):
                 break
 
+    if return_logp:
+        return (out[:, prefix.size(1):], lens.clamp(max=n),
+                torch.stack(lps, dim=1) if lps
+                else out.new_zeros(B, 0, dtype=torch.float32))
     return out[:, prefix.size(1):], lens.clamp(max=n)
 
 
@@ -216,6 +247,31 @@ def _selftest() -> None:
                      top_p=0.95, generator=g2)
     assert torch.equal(s1, s2), "même graine ⇒ même échantillon"
 
+    # ── return_logp : la log-prob de l'ACTION, alignée sur les tokens ───────
+    # Chemin RL (rti_policy) : sans elle, le ratio GRPO du décodage n'existe
+    # pas. Elle doit valoir EXACTEMENT log softmax(logits/temp)[token tiré],
+    # sinon le crédit du token est faux d'un facteur température.
+    gl = torch.Generator().manual_seed(7)
+    gg, ll, lp = generate(m, prefixes[0], max_new=8, stop_id=None, temp=0.9,
+                          generator=gl, return_logp=True)
+    assert lp.shape == gg.shape and bool((lp <= 0).all())
+    with torch.no_grad():
+        lg_all = m(torch.cat([prefixes[0], gg], 1))["logits"].float()
+    for t in range(gg.size(1)):
+        ref = torch.log_softmax(lg_all[0, prefixes[0].size(1) + t - 1] / 0.9,
+                                -1)[int(gg[0, t])]
+        assert abs(float(ref) - float(lp[0, t])) < 1e-5, (t, ref, lp[0, t])
+    assert float(generate(m, prefixes[0], max_new=3, stop_id=None, temp=0.0,
+                          return_logp=True)[2].abs().sum()) == 0.0, \
+        "greedy : action déterministe, log-prob nulle par convention"
+    try:
+        generate(m, prefixes[0], max_new=2, temp=1.0, top_p=0.9,
+                 return_logp=True)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("return_logp sous top-p aurait dû lever")
+
     # ── le décodage n'écrit PAS dans la banque par défaut ───────────────────
     seen = {}
 
@@ -286,7 +342,8 @@ def _selftest() -> None:
     print("decode self-test: OK (batch B=4 IDENTIQUE au ligne-à-ligne, arrêt "
           "par ligne + lens incluant le stop, plafond sans stop, greedy "
           "déterministe et échantillonnage reproductible, write=False par "
-          "défaut, amp inerte sur CPU, cache KV = recompute complet en float64 "
+          "défaut, amp inerte sur CPU, log-probs d'action alignées "
+          "(return_logp, top-p refusé), cache KV = recompute complet en float64 "
           "sur le vrai stack pour 6 longueurs de préfixe, flags perf "
           "decode_fuse+dense_moe+static_cache == OFF au token près — top-k "
           "neutralisés ET durs, B∈{1,2}, cache on/off)")

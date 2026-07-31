@@ -224,18 +224,38 @@ def group_to_device(g: dict, device, dtype):
 
 # ── env construction (worker side) ───────────────────────────────────────────
 
-def build_envs(d: dict, r: dict, tok, seed: int):
+def build_envs(d: dict, r: dict, tok, seed: int, raw: dict = None):
     """EnvSpecs from the config's data.envs. kind: code (CodeChunkStream,
     dense -ce), tool (ToolSessionStream + verifiable rubric), exec
     (CodeExecStream + sandboxed unit tests), sota (SotaSessionStream, dense),
-    recall (PersonaChatStream + grade_recall sur la dernière vérité plantée).
+    recall (PersonaChatStream + grade_recall sur la dernière vérité plantée),
+    recall_env (RecallEnvStream : vies SCRIPTÉES et appariées + reward
+    vérifiable par sonde — le chemin rti, cf. Worker.one_group_rti).
     Chat-kind streams return conv DICTS — sample_episode below normalizes
-    both shapes."""
+    both shapes.
+
+    `raw` : la config ENTIÈRE, pour la section `recall_env:` (le curriculum ne
+    vit pas dans `data.envs[].gen` — c'est un bloc de premier rang, partagé par
+    tous les workers, et c'est lui qui porte le `layout` du préfixe)."""
     from .code_data import CodeChunkStream
     envs = []
     for i, e in enumerate(d["envs"]):
         kind = e.get("kind", "code")
         w = float(e.get("weight", 1.0))
+        if kind == "recall_env":
+            from .recall_env import RecallEnvConfig, make_recall_env_reward
+            from .streams import chat_stream_class
+            rc = RecallEnvConfig.from_raw((raw or {}).get("recall_env") or {})
+            stream = chat_stream_class("recall_env")(
+                tok, seed=seed + 31 * i, cfg=rc, **(e.get("gen") or {}))
+            spec = EnvSpec(e["name"], stream, weight=w,
+                           reward_fn=make_recall_env_reward(
+                               int(r.get("think_nmax", 8)),
+                               float(r.get("think_floor", 0.4)),
+                               float(rc.exec_timeout)))
+            spec.kind = kind
+            envs.append(spec)
+            continue
         if kind == "code":
             sd_e = dict(seq_len=int(d["seq_len"]),
                         chunks_per_conv=int(d["chunks_per_conv"]), batch=1,
@@ -249,7 +269,9 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                         min_chunks=int(e.get("min_chunks", 2)),
                         seed=seed + 31 * i)
             stream = CodeChunkStream(tok, split="train", **sd_e)
-            envs.append(EnvSpec(e["name"], stream, weight=w))
+            spec = EnvSpec(e["name"], stream, weight=w)
+            spec.kind = kind
+            envs.append(spec)
         else:
             # tool / exec / sota : même contrat de construction (registre
             # streams.py), seul le reward diffère.
@@ -268,16 +290,26 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                                         float(r.get("think_floor", 0.4)))
             else:
                 fn = None                      # sota : reward par défaut
-            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
+            spec = EnvSpec(e["name"], stream, weight=w, reward_fn=fn)
+            spec.kind = kind
+            envs.append(spec)
     return envs
 
 
-def sample_episode(mixer: EnvMixer, defer_len: int, device, rng=None):
+def pick_env(mixer: EnvMixer):
+    """Le TIRAGE PONDÉRÉ d'env, isolé de l'extraction d'épisode : le chemin rti
+    déroule une VIE entière (script apparié) et ne passe pas par
+    `sample_episode`, mais les deux doivent consommer le MÊME rng — sinon le
+    mix observé cesse de suivre les poids déclarés."""
+    return mixer.envs[mixer.rng.choices(mixer._names, weights=mixer._weights,
+                                        k=1)[0]]
+
+
+def sample_episode(mixer: EnvMixer, defer_len: int, device, rng=None, env=None):
     """Weighted env choice + episode extraction for BOTH stream shapes.
     Returns (env, chunks, tgt, info). Uses mixer.rng so mixer.state_dict()
     keeps full sampling determinism."""
-    name = mixer.rng.choices(mixer._names, weights=mixer._weights, k=1)[0]
-    env = mixer.envs[name]
+    env = env if env is not None else pick_env(mixer)
     while True:
         got = env.stream.next_conv()
         segs, info = (got["segs"], dict(got.get("info", {}))) \
@@ -349,7 +381,8 @@ class Worker:
             p.requires_grad_(False)
         self.mcfg = raw["model"]
 
-        self.envs = envs if envs is not None else build_envs(d, r, self.tok, seed)
+        self.envs = envs if envs is not None else build_envs(d, r, self.tok,
+                                                             seed, raw)
         self.mixer = EnvMixer(self.envs, seed=seed + 977)
         self.defer_len = int(d.get("defer_len", 16))
 
@@ -396,6 +429,9 @@ class Worker:
         self.a_open = torch.tensor(a_ids, dtype=torch.long,
                                    device=self.device).unsqueeze(0)
 
+        # ── bras rti : les trois actions de rti_policy ───────────────────────
+        self._rti_setup(raw)
+
         n_lives = int(r.get("n_lives_per_worker", 2))
         p0 = next(self.model.parameters())
         self._p0 = p0
@@ -408,6 +444,9 @@ class Worker:
             self.lives.load_state_dict(lk, device=p0.device, dtype=p0.dtype)
             for lf, s in zip(self.lives.lives, lk["lives"]):
                 lf.n_evict = s.get("n_evict", 0)
+            # compteur de vies rti : sans lui, un worker redémarré rejouerait
+            # exactement les mêmes scripts (les vies sont fonction de l'index).
+            self._rti_n = int(lk.get("rti_n", 0))
             print(f"worker {self.wid}: lives resumed "
                   f"({[lf.n_episodes for lf in self.lives.lives]} episodes)",
                   flush=True)
@@ -415,6 +454,123 @@ class Worker:
         self.li = 0
         self.n_groups = 0
         self.mfile = os.path.join(self.root, f"worker{self.wid:02d}_metrics.jsonl")
+
+    # ── bras rti ─────────────────────────────────────────────────────────────
+    def _rti_setup(self, raw: dict) -> None:
+        """Arme le bras retrieve-then-inject, ou ne fait rien (chemin
+        historique BIT À BIT inchangé sans la section `rti:`)."""
+        from .rti_policy import attach_rti_modules, rti_from_raw
+        self.rti_cfg, self.rti_pol, self.rti_on = rti_from_raw(raw or {})
+        self._sif: dict = {}
+        self._rti_n = 0
+        self._gen = torch.Generator(device="cpu").manual_seed(
+            int(self.r.get("seed", 0)) + 7919 * (self.wid + 1))
+        if not self.rti_on:
+            return
+        # decode_graphs est capturé à forme FIXE ; le préfixe injecté change la
+        # longueur du premier forward, et une banque en croissance change la
+        # signature. Même refus que côté trainer, et à l'assert : un désarmement
+        # silencieux ferait tourner un run entier sur un chemin non voulu.
+        assert not self.decode_graphs, \
+            "rti + rl.decode_graphs : INCOMPATIBLE (préfixe de longueur " \
+            "variable vs runners à forme fixe) — mettre decode_graphs: false"
+        kinds = {getattr(e, "kind", "code") for e in self.envs}
+        assert kinds == {"recall_env"}, (
+            f"sous rti, tout env doit être de kind recall_env (vu {sorted(kinds)}). "
+            "La banque fast-weight est CONTOURNÉE par ce bras (layer_banks tout "
+            "à None, write=False) : un env dense qui la lit optimiserait un "
+            "canal inerte. La pression 'ne pas éroder le chat général' passe "
+            "par la KL à la ref, pas par un env mélangé.")
+        d_model = int(self.model.embed.weight.size(1))
+        attach_rti_modules(self.model, d_model)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.rti_sep = int(self.tok.convert_tokens_to_ids(
+            self.rti_cfg.sep_token))
+        assert self.rti_sep >= 0, \
+            f"rti.sep_token {self.rti_cfg.sep_token!r} absent du vocabulaire"
+        print(f"worker {self.wid}: rti ON — top_k {self.rti_cfg.top_k}, "
+              f"{self.rti_cfg.eval_groups} groupes injectés "
+              f"(P={self.rti_cfg.eval_groups * self.rti_cfg.group_prefix} "
+              f"pseudo-tokens), FIFO {self.rti_cfg.max_groups}, write "
+              f"{self.rti_pol.write_mode} (temp {self.rti_pol.write_temp}, "
+              f"floor {self.rti_pol.write_floor}), retrieve PL temp "
+              f"{self.rti_pol.retr_temp}, decode temp "
+              f"{self.rti_pol.decode_temp}", flush=True)
+
+    def _sif_w(self, env):
+        """Table SIF du stream (une par env, calculée une fois)."""
+        from .rti import sif_table
+        w = self._sif.get(env.name)
+        if w is None:
+            w = self._sif[env.name] = sif_table(
+                env.stream, int(self.model.embed.weight.size(0)),
+                self.rti_cfg.sif_a).to(self.device)
+        return w
+
+    def _next_life(self) -> int:
+        """Vie SUIVANTE de la partition de ce worker. Les vies ne migrent
+        jamais d'un worker à l'autre (même invariant que les lives du chemin
+        historique), et l'index est stable au resume."""
+        self._rti_n += 1
+        return (self.wid + 1) * 1_000_003 + self._rti_n
+
+    def one_group_rti(self, env):
+        """UN groupe GRPO sur une vie rti : G rollouts APPARIÉS sur le MÊME
+        script (`conv_for_life`), donc l'avantage intra-groupe est
+        contrefactuel et l'ancrage par index de tour est exact (GiGPO).
+
+        On ne rappelle JAMAIS `next_conv()` par rollout : ce serait G scripts
+        différents, et le baseline de groupe mesurerait la difficulté du script
+        au lieu de la qualité de la politique.
+        """
+        from .rti_policy import RtiRollout
+        roll = RtiRollout(self.model, self.tok, self.rti_cfg, self.rti_pol,
+                          self._sif_w(env), self.rti_sep, a_open=self.a_open,
+                          stop_id=self.stop_id,
+                          max_new=self.max_new_env.get(env.name, self.max_new),
+                          amp=self.amp, decode_cache=self.decode_cache)
+        for _try in range(self.max_rs + 1):
+            life = self._next_life()
+            conv = env.stream.conv_for_life(life)
+            traces = roll.run(conv, self.G, self.rng, reward_fn=env.reward_fn,
+                              device=self.device, generator=self._gen)
+            assert len({t["digest"] for t in traces}) == 1, \
+                "les G rollouts d'un groupe ne partagent pas le même script"
+            rs = [t["reward"] for t in traces]
+            live = [x for x in rs if x is not None]
+            if not live or not all(math.isfinite(x) for x in live):
+                continue          # vie sans AUCUNE sonde possible : rien à noter
+            if st.pstdev(live) < self.min_std:
+                continue          # groupe plat (dynamic sampling, comme v1)
+            self.store.put({"format": "rti", "env": env.name,
+                            "weights_step": int(self.wstep),
+                            "worker": self.wid, "life": int(life),
+                            "digest": traces[0]["digest"],
+                            "layout": traces[0]["layout"],
+                            "rollouts": traces}, self.wstep, self.wid)
+            self.n_groups += 1
+            dec = [t for tr in traces for t in tr["turns"] if t["decode"]]
+            raw = [t["raw"] for t in dec if t.get("raw") is not None]
+            ret = [t["retrieve"] for tr in traces for t in tr["turns"]
+                   if t["retrieve"]]
+            ps = [t["write"]["p"] for tr in traces for t in tr["turns"]
+                  if t["write"]]
+            return {"env": env.name, "reward": st.mean(live),
+                    "ce": None,             # pas de CE dense sur ce bras
+                    "writes": sum(t["n_writes"] for t in traces),
+                    "turns": sum(len(t["turns"]) for t in traces),
+                    "tries": _try, "life": life,
+                    "grade": st.mean(raw) if raw else None,
+                    "p_write": st.mean(ps) if ps else None,
+                    # le retriever a-t-il ramené un positif ? Sans ça, un reward
+                    # bas ne dit pas si la SÉLECTION ou la COPIE a échoué —
+                    # les deux rendent 0.00 (leçon de l'éval rti).
+                    "hit": st.mean([float(x["hit"]) for x in ret]) if ret else None,
+                    "top1": st.mean([float(x["top1"]) for x in ret]) if ret else None,
+                    "n_dec": len(dec), "pending": self.store.pending()}
+        return None
 
     def _fresh_life(self, i):
         with torch.no_grad():
@@ -588,6 +744,11 @@ class Worker:
 
     # ── one group ────────────────────────────────────────────────────────────
     def one_group(self):
+        env0 = pick_env(self.mixer)
+        if getattr(env0, "kind", None) == "recall_env":
+            # chemin rti : une VIE scriptée, pas d'épisode ni de banque portée
+            # (cf. rti_policy — la FIFO naît et meurt avec le script).
+            return self.one_group_rti(env0)
         life = self.lives.lives[self.li % len(self.lives.lives)]
         self.li += 1
         max_epi = int(self.r.get("max_episodes_per_life", 0))
@@ -595,7 +756,8 @@ class Worker:
             self.lives.lives[life.id] = life = self._fresh_life(life.id)
         for _try in range(self.max_rs + 1):
             env, chunks, tgt, info = sample_episode(self.mixer, self.defer_len,
-                                                    self.device)
+                                                    self.device, env=env0)
+            env0 = None
             lam = self.lam[env.name]
             forks = mem_fork(life.bank, life.casc, self.G)
             cand = [rollout(self.model, chunks, tgt, self.temp, lam, self.ids,
@@ -668,6 +830,7 @@ class Worker:
         sd = self.lives.state_dict()
         for ls_, lf in zip(sd["lives"], self.lives.lives):
             ls_["n_evict"] = getattr(lf, "n_evict", 0)
+        sd["rti_n"] = self._rti_n
         _atomic_save(sd, self.lives_path)
 
     # ── loop ─────────────────────────────────────────────────────────────────
@@ -706,7 +869,10 @@ class Worker:
                 fh.write(json.dumps(line) + "\n")
             if self.n_groups % lives_every == 0:
                 self.save_lives()
-            if xdom_every and self.n_groups % xdom_every == 0:
+            # sonde xdom : elle compare deux BANQUES fast-weight portées, qui
+            # n'existent pas sur le bras rti (la FIFO meurt avec le script).
+            if xdom_every and not self.rti_on \
+                    and self.n_groups % xdom_every == 0:
                 probe = self.xdom_probe()
                 probe["n"] = self.n_groups
                 probe["probe"] = "xdom"
@@ -751,8 +917,19 @@ class Learner:
             mcfg["vocab_size"] = tok_len
             model = ThoughtBankLM(ThoughtBankConfig(**mcfg)).to(self.device)
             ck = torch.load(r["init_from"], map_location="cpu")
-            model.load_state_dict(ck["model"])
+            if self._rti_attach(raw, model):
+                # le ckpt SFT rti porte retriever + vecteur de type, jamais la
+                # TÊTE DE WRITE (elle n'existe qu'au RL) : strict=False, mais
+                # BRUYANT — un `missing` inattendu voudrait dire qu'on part sur
+                # des poids partiellement aléatoires sans le dire.
+                miss, unex = model.load_state_dict(ck["model"], strict=False)
+                print(f"learner: rti ON | neuf (zéro-init) {sorted(miss)}"
+                      + (f" | ckpt ignoré {sorted(unex)}" if unex else ""),
+                      flush=True)
+            else:
+                model.load_state_dict(ck["model"])
         self.model = model
+        self._rti_attach(raw, self.model)      # idempotent (modèle injecté)
         if not hasattr(self, "_think_id"):
             self._think_id = int(r.get("think_id", 0)) or 0
         self.ids = (self._think_id, -1)        # blank unused in the update
@@ -806,6 +983,17 @@ class Learner:
                      for e in raw.get("data", {}).get("envs", [])},
         }, indent=1), os.path.join(self.root, "meta.json"))
 
+    @staticmethod
+    def _rti_attach(raw: dict, model) -> bool:
+        """Attache les modules rti au modèle du learner. IMPÉRATIF : le worker
+        recharge le `state_dict` PUBLIÉ tel quel — deux modèles de formes
+        différentes et le run s'arrête au premier fetch."""
+        from .rti_policy import attach_rti_modules, rti_from_raw
+        _, _, on = rti_from_raw(raw or {})
+        if on:
+            attach_rti_modules(model, int(model.embed.weight.size(1)))
+        return on
+
     def archive(self, groups) -> None:
         """Trajectoires → traces.jsonl, AVANT consommation. Matière première du
         cliquet (SFT sur trajectoires positives) : tokens + actions + rewards
@@ -814,6 +1002,16 @@ class Learner:
         contraste négatif + stats de touchabilité."""
         with open(self.trace_path, "a") as fh:
             for g in groups:
+                if g.get("format") == "rti":
+                    # la trace rti EST déjà du JSON pur (actions, log-probs,
+                    # FIFO, rewards par sonde) : on l'archive telle quelle.
+                    fh.write(json.dumps({
+                        "learner_step": self.step, "env": g["env"],
+                        "worker": g["worker"], "format": "rti",
+                        "weights_step": g["weights_step"], "life": g["life"],
+                        "digest": g["digest"], "layout": g["layout"],
+                        "rollouts": g["rollouts"]}) + "\n")
+                    continue
                 fh.write(json.dumps({
                     "learner_step": self.step, "env": g["env"],
                     "worker": g["worker"], "weights_step": g["weights_step"],
@@ -835,6 +1033,13 @@ class Learner:
              "kl": [], "env": {}, "p": [], "lag": []}
         rolls_flat = []
         for g in groups:
+            assert g.get("format") != "rti", (
+                "groupe rti reçu par le learner v1 : la passe 2 de ce bras "
+                "(ratio Plackett-Luce + Bernoulli du write + tokens décodés, "
+                "crédit leave-one-slot) est le chantier de l'agent 3 — voir "
+                "rti_policy.pl_logp / write_logp / replay_logp / "
+                "forward_probe_with_masked_slot. Les groupes sont archivés "
+                "dans traces.jsonl, rien n'est perdu.")
             m["lag"].append(self.step - g["weights_step"])
             rolls = group_to_device(g, self.device, p0.dtype)
             rs = [ro["reward"] for ro in rolls]
@@ -1130,11 +1335,110 @@ def _self_test():
     assert got is not None and wg._graph_runner is None, \
         "decode_graphs ON sur CPU : les groupes doivent sortir via generate"
 
+    # 9. BRAS RTI : un worker de bout en bout sur l'env de rappel scripté.
+    #    Ce qui est prouvé ici et nulle part ailleurs : le kind `recall_env`
+    #    est atteignable depuis la config, les G rollouts d'un groupe partagent
+    #    UN script (appariement), le groupe expédié porte les trois actions
+    #    avec leurs log-probs, et le learner v1 REFUSE bruyamment de le
+    #    consommer (l'algo est le chantier de l'agent 3).
+    from . import persona_chat_data as _P
+    from .rti_policy import probe_pairs
+
+    class _RtiTok(_P._StubTok):               # ids = ord(c) : vocab 512 suffit
+        def get_vocab(self):
+            return {"<think>": 1, "<blank>": 2, "<|im_end|>": 3}
+
+        def convert_tokens_to_ids(self, t):
+            return self.get_vocab().get(t, 0)
+
+    Vr = 512
+    cfg_r = ThoughtBankConfig(vocab_size=Vr, d_model=32, n_layers=2, n_heads=2,
+                              d_head=8, max_seq_len=512, n_hc=2,
+                              sinkhorn_iters=5, csa_m=4, hca_m=8, top_k_csa=2,
+                              n_win=4, d_latent_q=16, n_groups=1, n_experts=2,
+                              n_shared=1, top_k_experts=1, d_ff=64, mem_dim=16,
+                              max_mem=4, mem_seed_slots=4, use_dual_stream=True)
+    raw_r = copy.deepcopy(raw)
+    raw_r["model"] = {"n_layers": 2, "max_mem": 4, "mem_seed_slots": 4}
+    raw_r["data"]["envs"] = [{"name": "recall_env", "kind": "recall_env",
+                              "weight": 1.0, "max_new": 4, "gen": {}}]
+    # min_reward_std 0 : un modèle ALÉATOIRE ne tombe jamais sur la vérité,
+    # tous les rewards valent 0 et le dynamic sampling rejetterait chaque
+    # groupe. Ce bloc prouve le CÂBLAGE, pas la variance de la politique.
+    raw_r["rl"].update(group_size=4, max_new=4, decode_graphs=False,
+                       min_reward_std=0.0)
+    raw_r["recall_env"] = {"life_seed": 0, "n_facts": [3, 3], "n_probes": [2, 2],
+                           "filler_per_fact": [1, 1], "p_beyond": 0.0,
+                           "inject_groups": 2, "max_groups": 4,
+                           "age_bins": [[2, 4]], "age_weights": [1.0],
+                           "strata": {"persona": 0.5, "numeric": 0.5},
+                           "surprisal_mode": "nll"}
+    root_r = tempfile.mkdtemp(prefix="rl_disagg_rti_")
+    raw_r["rl"]["disagg"] = dict(raw["rl"]["disagg"], root=root_r)
+    raw_r["rti"] = {"enabled": True, "top_k": 4, "max_groups": 4,
+                    "train_groups": 2, "eval_groups": 2, "sep_token": "<blank>",
+                    "write_mode": "head", "write_floor": 0.5,
+                    "retr_temp": 1.0, "decode_temp": 1.0}
+    tok_r = _RtiTok()
+    # le learner d'abord : c'est lui qui PUBLIE le state_dict (modules rti
+    # compris) que le worker recharge en strict.
+    lr = Learner(raw_r, model=ThoughtBankLM(cfg_r), device=torch.device("cpu"))
+    assert hasattr(lr.model, "rti_write"), "modules rti absents du learner"
+    wr = Worker(raw_r, 2, tok=tok_r, model=ThoughtBankLM(cfg_r),
+                envs=build_envs(raw_r["data"], raw_r["rl"], tok_r, 0, raw_r),
+                device=torch.device("cpu"))
+    assert wr.rti_on and wr.envs[0].kind == "recall_env"
+    wr.stop_id, wr.max_new = -1, 4
+    wr.a_open = torch.tensor([[65, 58]], dtype=torch.long)
+    wr.wait_weights()
+    got = None
+    for _ in range(6):
+        got = wr.one_group()
+        if got:
+            break
+    assert got is not None and got["env"] == "recall_env", got
+    assert got["n_dec"] > 0 and 0.0 <= got["p_write"] <= 1.0
+    assert got["hit"] is not None and 0.0 <= got["hit"] <= 1.0
+    names = [p for p in os.listdir(wr.store.inc) if p.startswith("w02_")]
+    grp = torch.load(os.path.join(wr.store.inc, names[0]), map_location="cpu",
+                     weights_only=False)
+    assert grp["format"] == "rti" and len(grp["rollouts"]) == wr.G
+    assert len({t["digest"] for t in grp["rollouts"]}) == 1, \
+        "les G rollouts d'un groupe doivent partager UN script"
+    anch = [[(t["seg"], t["turn"]) for t in tr["turns"]]
+            for tr in grp["rollouts"]]
+    assert all(a == anch[0] for a in anch), "ancres de tour désalignées"
+    n_ret = n_tokdec = 0
+    for tr in grp["rollouts"]:
+        assert all(t["write"] is None or "logp" in t["write"] for t in tr["turns"])
+        for q, dcd in probe_pairs(tr):
+            if q is not None:
+                n_ret += 1
+                assert "logp" in q["retrieve"] and q["retrieve"]["order"]
+            n_tokdec += len(dcd["decode"]["logp"])
+            assert len(dcd["decode"]["logp"]) == len(dcd["decode"]["tokens"])
+    assert n_ret and n_tokdec, (n_ret, n_tokdec)
+    # le learner v1 refuse le groupe rti — mais l'archive, elle, passe
+    gr, _ = lr.store.take(1, -5)
+    lr.archive(gr)
+    assert any(json.loads(l).get("format") == "rti"
+               for l in open(lr.trace_path))
+    try:
+        lr.step_once(gr)
+    except AssertionError as e:
+        assert "agent 3" in str(e)
+    else:
+        raise AssertionError("le learner v1 a consommé un groupe rti")
+
     shutil.rmtree(root)
+    shutil.rmtree(root_r)
     print(f"rl_disagg self-test: OK (hub, store+staleness, worker groups "
           f"[{', '.join(sorted(envs_seen))}], learner step+republish, "
           f"refresh, lives, xdom probe, decode_graphs OFF défaut / ON-CPU "
-          f"dégrade en generate)")
+          f"dégrade en generate, bras RTI de bout en bout : env recall_env "
+          f"branché, {wr.G} rollouts appariés (1 script, ancres alignées), "
+          f"groupe rti expédié avec les 3 log-probs ({n_ret} tirages "
+          f"Plackett-Luce, {n_tokdec} tokens), learner v1 refuse et archive)")
 
 
 if __name__ == "__main__":
