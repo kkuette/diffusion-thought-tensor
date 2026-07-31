@@ -29,6 +29,35 @@ CE QUI CHANGE EN PASSANT AU 350M
      + le finetune du trunk.
 
 Ce module est autonome (aucun import du trainer) et testé par `_selftest`.
+
+⚠️ BLOQUANT IDENTIFIÉ POUR LE CÂBLAGE TRAINER (à traiter EN PREMIER)
+────────────────────────────────────────────────────────────────────
+La CE du retriever a besoin, devant chaque RÉPONSE, de savoir QUEL FAIT est
+interrogé (la cible multi-positive). Cette information n'existe pas côté segs :
+
+  • `_user_valued` (le segment qui ÉNONCE un fait) porte bien `fact_slot`,
+    `fact_val`, `fact_attr` — c'est le déclencheur du WRITE, tout va bien ;
+  • le segment de QUESTION et le segment de RÉPONSE (`_assistant_valued`) ne
+    portent AUCUN identifiant de fait. Le lien question→slot ne vit que dans
+    `conv["info"]["q_slots"]`, au niveau de la CONVERSATION ;
+  • et `chat_batch` collate des segs LANE PAR LANE : `conv["info"]` ne survit
+    pas au batch (seul `roles` est propagé, cf. `_collate`).
+
+Donc, en l'état, l'entraînement ne peut pas savoir devant quelle réponse
+injecter quoi. Deux issues, la première est la bonne :
+
+  (a) TAGUER LE SEG DE QUESTION côté générateur : ajouter `q_slot` (long
+      [1,T] constant, 0 = pas une question) dans PersonaChatStream au moment où
+      la question est construite — le stream connaît déjà le slot. C'est la
+      symétrie exacte du `fact_slot` déjà posé sur le seg d'énonciation, ça
+      traverse `_collate` sans rien changer (clé long, zéro-paddée comme
+      `fact_slot`), et l'éval y gagne de ne plus dépendre de `info`.
+  (b) rejouer le lien côté trainer en reconstruisant les convs — non : ça
+      duplique la logique du générateur et casse au premier changement.
+
+Tant que (a) n'est pas fait, le bras ne peut pas s'entraîner : la sélection
+n'a pas de cible. C'est un travail de ~20 lignes dans persona_chat_data.py,
+plus le self-test correspondant.
 """
 from __future__ import annotations
 
