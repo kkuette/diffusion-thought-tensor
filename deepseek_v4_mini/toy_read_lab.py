@@ -2743,8 +2743,17 @@ def main(argv=None):
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         opt.step()
         if step % int(t.get("log_every", 20)) == 0:
+            # `hid_scale` (phase 9) : le facteur que le bras tophid met sur la
+            # ligne post-norm à l'injection. Il absorbe le confondant d'échelle
+            # contre `embed` (×17 au 350M) et sa valeur EST une mesure — s'il
+            # s'écarte franchement de 1, c'est que la ligne n'entrait pas dans
+            # le stack à la bonne amplitude. Récupérable a posteriori dans le
+            # state_dict, mais le voir bouger pendant le run vaut mieux.
+            hs = getattr(model, "hid_scale", None)
             print(f"step {step:5d} | loss {loss:.4f} | gnorm {float(gn):.2f} "
-                  f"| lr {base_lr*lr_at(step):.2e} | {time.time()-t0:.0f}s",
+                  f"| lr {base_lr*lr_at(step):.2e}"
+                  + (f" | hid_scale {float(hs):.3f}" if hs is not None else "")
+                  + f" | {time.time()-t0:.0f}s",
                   flush=True)
         last = step == steps - 1
         if (step + 1) % eval_every == 0 or last:
