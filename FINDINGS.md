@@ -107,19 +107,28 @@ PYTHONPATH=. python deepseek_v4_mini/analysis/native_row_channel.py
 
 ---
 
-## 2026-08-02 — E0 : la métrique est SATURÉE (write held = 1.000), et la cible auto-supervisée de E5a est réfutée à 0,018
+## 2026-08-02 — E0 : hors famille, le READ exprime 0,477 là où le WRITE est au hasard — §7 du papier attribue le mur au mauvais étage
 
-**TL;DR.** Sur `dsv4w s43`, règles **held** (jamais vues), le write entraîné rend
-**1.000** contre 0.000 pour le bras ablaté (hasard 0.008). Il n'y a donc **aucune
-marge à mesurer au-dessus** : E0 ne peut pas trancher « le write laisse-t-il de la
-place ? » sur cette tâche. Ce qui reste mesurable est le bras `init=noise`, et il
-tranche autre chose — optimiser un code libre sur la **CE de la présentation**
-(l'objectif auto-supervisé, calculable au write) atteint **0,018** held, à peine
-au-dessus du hasard 0,008 ; optimiser sur la **CE des requêtes** (oracle non
-calculable au write) atteint **0,578**. Écart **+0,560**. La présentation
-*contient* les paires en contexte, donc la banque y est quasi libre : cet
-objectif ne porte presque pas de signal. **E5a — qui proposait exactement cette
-cible pour remplacer le teacher Fourier — est réfuté par ce chiffre.**
+**TL;DR.** Deux conditions sur `dsv4w s43`, et c'est leur **contraste** qui porte.
+(1) Règles **held** (in-family) : le write entraîné rend **1.000** — métrique
+saturée, aucune marge à mesurer, E0 ne peut pas y trancher « le write laisse-t-il
+de la place ». (2) **Soustraction** `y=(s−x)%128`, famille jamais entraînée : le
+write entraîné tombe à **0,012**, c'est-à-dire le **hasard** (0,008) — l'échec de
+transfert de famille du papier, reproduit. Mais un code de banque **choisi
+librement** y atteint **0,477**, soit **60× le hasard** et **40× le write**. Il
+existe donc, dans la banque telle qu'elle est, un vecteur qui pilote le read sur
+une famille de fonctions hors de celle qu'il a méta-apprise : **la classe de
+fonctions du read n'est pas la frontière — le write est**. C'est le cas prévu par
+le plan (« oracle soustraction au-dessus du hasard ⇒ l'enveloppe était
+l'amortisation du write ⇒ §7 est à réécrire »).
+
+**Et dans les deux conditions, la cible auto-supervisée est vide.** Optimiser un
+code sur la **CE de la présentation** (le seul objectif calculable au moment du
+write) donne **0,018** held et **0,018** hors famille — le hasard est à 0,008.
+Optimiser sur la **CE des requêtes** (oracle, non calculable au write) donne
+0,578 et 0,477. La présentation *contient* les paires en contexte, la banque y est
+donc quasi libre. **E5a proposait exactement cette cible pour remplacer le teacher
+Fourier : réfuté, deux fois.**
 
 ### Setup
 
@@ -137,29 +146,45 @@ plafond il vaut le plafond. `init=noise` est la **mesure**.
 
 ### Verdict
 
-| cible optimisée | calculable au write ? | acc held (init=noise) |
-|---|---|---|
-| bras ablaté (plancher) | — | 0.000 (hasard 0.008) |
-| write entraîné | — | **1.000** ← plafond |
-| CE **présentation** (auto-supervisé) | oui | **0.018** |
-| CE **requêtes** (oracle) | non | **0.578** |
+| cible optimisée | calculable au write ? | HELD (in-family) | SOUSTRACTION (hors famille) |
+|---|---|---|---|
+| bras ablaté (plancher) | — | 0.000 | 0.008 |
+| hasard | — | 0.008 | 0.008 |
+| **write entraîné** | — | **1.000** ← plafond | **0.012** ← au hasard |
+| CE **présentation** (auto-supervisé) | oui | 0.018 | 0.018 |
+| **CE requêtes** (oracle) | non | 0.578 | **0.477** |
+| écart oracle − write | | +0.000 (saturé) | **+0.465** |
 
-### Attribution honnête
+### Attribution honnête, et ce qui casse
 
-Le 0,578 n'est **pas** une borne de capacité : 200 pas d'Adam sur un seul vecteur
-`mem_dim` depuis du bruit peuvent s'arrêter dans un minimum local. Il donne une
-borne *inférieure* sur ce que la classe de fonctions du read exprime, pas une
-supérieure. Le chiffre qui porte est l'**écart** 0,578 − 0,018, et il est robuste
-au sens où les deux bras partagent init, optimiseur, pas et protocole d'éval.
+**Le 0,477 n'est pas une borne de capacité.** 200 pas d'Adam sur un seul vecteur
+`mem_dim` depuis du bruit peuvent s'arrêter dans un minimum local : c'est une
+borne **inférieure** sur ce que le read exprime, pas une supérieure. Pour le
+claim que ça porte, c'est le bon sens de l'inégalité — « un tel code existe »
+suffit à déplacer l'attribution.
 
-Ce que la saturation implique par ailleurs : sur le régime « appliquer une
-règle », la banque compressée `[M, mem_dim]` **n'est pas le facteur limitant** —
-elle est au plafond. Tout gain d'un slot `[mem_dim, d_model]` doit donc venir de
-l'aile **citation**, que cette tâche jouet ne teste pas.
+**Ce que la mesure n'autorise PAS à dire** : que le write *pourrait* trouver ce
+code. La cible optimisée est la CE des **requêtes**, qui suppose connues les
+réponses aux questions non vues — un oracle au sens fort, jamais disponible au
+moment de l'écriture. La conclusion est donc précisément : *la classe de fonctions
+du read n'est pas le mur* ; elle n'est pas *le write pourrait faire mieux avec un
+meilleur objectif*, et la ligne « présentation » dit même le contraire pour
+l'objectif auto-supervisé le plus évident.
+
+L'écart 0,477 − 0,018 = **0,459** est le chiffre robuste : les deux bras partagent
+init, optimiseur, nombre de pas, lr balayé et protocole d'éval — seule la cible
+change.
+
+**Sur la condition held, la saturation implique autre chose** : dans le régime
+« appliquer une règle », la banque compressée `[M, mem_dim]` n'est pas le facteur
+limitant, elle est au plafond. Tout gain d'un slot `[mem_dim, d_model]`
+([voir l'entrée « ligne native »](#)) doit donc venir de l'aile **citation**, que
+cette tâche jouet ne teste pas.
 
 *Réserve de provenance* : le « held 0,79–1,00 » du papier vient de `dsv4m`, qui
 n'existe plus ; ce 1.000 est recalculé sur `s43` avec le même script, il ne se
-compare pas au texte du papier.
+compare pas au texte du papier. *Une seule graine* (43) : l'écart est grand
+(60× le hasard) mais n'a pas de barre d'erreur inter-graines.
 
 ### Reproduire
 
@@ -167,6 +192,12 @@ compare pas au texte du papier.
 PYTHONPATH=. python deepseek_v4_mini/analysis/oracle_code.py \
   /mnt/tb/checkpoints/archive/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt \
   --cfg deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml
+```
+
+```bash
+PYTHONPATH=. python deepseek_v4_mini/analysis/oracle_code.py \
+  /mnt/tb/checkpoints/archive/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt \
+  --cfg deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml --sub
 ```
 
 ---
