@@ -40,6 +40,34 @@ replacement* is basin-dependent, and a re-run of either seed may land in
 either attractor. Checkpoints are saved every 100 steps; the paper's
 probes read `dsv4m/final.pt`, `dsv4w/step_3000.pt`, `dsv4w_s43/final.pt`.
 
+## Checkpoint integrity
+
+**This is an integrity check on our artifacts, not a validation of your re-run.** Training
+is not bit-reproducible across machines (cuDNN/atomics noise, and the seed-level
+bifurcation of §9), so a re-run legitimately produces a *different* SHA. What this table
+catches is our own copies going missing or getting corrupted — which is exactly what
+happened: as of 2026-08-02 the `dsv4m` and `dsv4w` (seed 42) checkpoints and their
+`runs/*/metrics.jsonl` had been lost, making Figure 3 unreproducible from stored artifacts
+until they were regenerated.
+
+| artifact | step | keys | params | sha256 (first 16) |
+|---|---|---|---|---|
+| `dsv4w_s43/step_4000.pt` | 4000 | 221 | 3 076 385 | `0b18b1c84aacf029` |
+| `dsv4m/final.pt` | — | — | — | *(regenerating)* |
+| `dsv4w/step_3000.pt` | — | — | — | *(regenerating)* |
+
+`params` is the *model's* parameter count, the number the training banner prints. Note that
+naively summing `numel()` over the state_dict keys overcounts it by 17 408 here: `embed` and
+`lm_head` are tied (`lm_head.weight = embed.weight`), so the same tensor is stored under two
+keys. Deduplicate by storage:
+
+```bash
+sha256sum <ckpt>.pt | cut -c1-16
+python -c "import torch,sys; c=torch.load(sys.argv[1],map_location='cpu',weights_only=False); \
+s=c['model']; u={v.data_ptr(): v.numel() for v in s.values()}; \
+print(c.get('step'), len(s), sum(u.values()))" <ckpt>.pt
+```
+
 ## Environment
 
 `setup_environment.sh` creates the conda env (python 3.10, torch, yaml,

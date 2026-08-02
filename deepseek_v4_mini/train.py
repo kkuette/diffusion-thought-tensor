@@ -1884,8 +1884,26 @@ def main() -> None:
         writer = SummaryWriter(log_dir=str(tb_dir))
 
     # ── Metrics JSONL ─────────────────────────────────────────────────────────
+    # Ce module n'a ni --resume ni --check : un run de 5 h qui meurt est perdu,
+    # et une relance ouvrait le jsonl en "w" — donc écrasait les métriques du
+    # run précédent, seule trace qui restait de lui. C'est comme ça que les
+    # runs/dsv4mini_multiturn_rule_* du papier ont disparu.
+    # Le mode "a" n'est PAS la parade : il mélangerait deux runs dans un fichier
+    # que toute l'analyse (make_fig3, les sondes) suppose mono-run. On archive
+    # donc l'ancien sous son propre horodatage — rien à décider, rien à perdre.
     metrics_path = Path(train_cfg.get("metrics_file", f"runs/{run_name}/metrics.jsonl"))
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    if metrics_path.exists() and metrics_path.stat().st_size:
+        stamp = time.strftime("%Y%m%d-%H%M%S",
+                              time.localtime(metrics_path.stat().st_mtime))
+        kept = metrics_path.with_suffix(metrics_path.suffix + f".{stamp}")
+        i = 1
+        while kept.exists():                      # deux relances dans la même
+            kept = metrics_path.with_suffix(       # seconde : jamais observé,
+                metrics_path.suffix + f".{stamp}-{i}")   # mais jamais silencieux
+            i += 1
+        metrics_path.rename(kept)
+        tqdm.write(f"metrics: {metrics_path.name} existait → archivé en {kept.name}")
     metrics_fh = metrics_path.open("w")
 
     # ── AMP scaler ────────────────────────────────────────────────────────────

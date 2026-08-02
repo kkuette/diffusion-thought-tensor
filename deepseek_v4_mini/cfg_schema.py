@@ -178,6 +178,15 @@ DELEGATED: dict[str, str] = {
 
 def entry_for(raw: dict) -> str:
     """Point d'entrée qui consomme cette config, déduit de sa forme."""
+    # toy_read_lab a son PROPRE format (section `code` à la racine, dataclass
+    # ToyCfg) et son propre point d'entrée. Sans cette branche il tombait dans
+    # le défaut `code_defer_native` et se faisait rejeter sur sa clé `code` —
+    # 2 configs rouges en permanence, donc un garde-fou qu'on apprend à ignorer.
+    # Il n'a pas de schéma : `sections_read` extrait les clés d'un idiome
+    # `raw["section"]["clé"]` que ce module n'utilise pas. La boucle du
+    # self-test SAUTE les entrées sans schéma, et annonce combien.
+    if isinstance(raw.get("code"), dict):
+        return "toy_read_lab"
     rl = raw.get("rl")
     if not isinstance(rl, dict):
         return "code_defer_native"
@@ -452,20 +461,26 @@ def _selftest() -> None:
 
     # 4. toutes les configs actives passent (le test que la CI rejoue).
     cfgs = sorted((_PKG / "configs").glob("*.yaml"))
-    bad = []
+    bad, skipped = [], []
     for p in cfgs:
         raw = yaml.safe_load(p.read_text()) or {}
+        entry = entry_for(raw)
+        if entry not in SCHEMAS:      # entrée connue mais sans schéma extractible
+            skipped.append(f"{p.name} [{entry}]")
+            continue
         try:
-            check(raw, entry_for(raw))
+            check(raw, entry)
         except ConfigError as e:
-            bad.append(f"{p.name} [{entry_for(raw)}] : {e}")
+            bad.append(f"{p.name} [{entry}] : {e}")
     if bad:
         print("\n".join("  ✗ " + b for b in bad), file=sys.stderr)
         raise AssertionError(f"{len(bad)}/{len(cfgs)} configs actives invalides")
 
     print(f"cfg_schema self-test: OK ({len(SCHEMAS)} entrées, "
           f"{sum(len(s) for s in SCHEMAS.values())} sections, "
-          f"{len(cfgs)} configs actives valides, anti-dérive ast vert)")
+          f"{len(cfgs) - len(skipped)} configs actives valides, "
+          f"{len(skipped)} sans schéma ({', '.join(skipped) or '—'}), "
+          f"anti-dérive ast vert)")
 
 
 if __name__ == "__main__":

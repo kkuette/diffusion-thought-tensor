@@ -18,7 +18,12 @@ PY=${PY:-python}
 OUT=repro/out
 mkdir -p "$OUT"
 
-CFG=deepseek_v4_mini/configs
+# Les 3 YAML du papier vivent sous archive/dsv4mini depuis que la racine de
+# configs/ ne garde que le programme courant (66e478f). Les sondes d'analysis/
+# ont suivi (leur constante CFG pointe déjà là) ; ce script était resté en
+# arrière, et les 3 entraînements comme les --cfg des sondes échouaient donc
+# depuis un clone frais — sur un dépôt dont le papier revendique la repro.
+CFG=deepseek_v4_mini/configs/archive/dsv4mini
 AN=deepseek_v4_mini/analysis
 CKPT_M=checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt
 CKPT_W=checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt
