@@ -78,12 +78,31 @@ Deux raisons indépendantes, et la seconde suffirait seule.
 2. **La classe de fonctions est déjà réfutée.** Un biais ADDITIF aux logits est
    exactement `PointerReadout` ([toy_read_lab.py:832](deepseek_v4_mini/toy_read_lab.py:832)),
    qui fait `logits = (x + g·scale·sel) @ Eᵀ` — et en `r3`, `mem_dim` étant forcé
-   à `d_model`, il n'y a même pas la projection : l'identité littérale de E2.
-   12 runs r3 à d=512 : grade held-out entre **0.000 et 0.100**, contre **0.281**
-   (strate `code` **0.708**) pour l'injection de pseudo-tokens natifs. La raison
-   est écrite dans le dépôt : un biais additif peut faire gagner un token
-   qu'**aucune ligne ne porte** (` HAB-719` → ` HQR-719`) ; le mélange normalisé
-   de `rti_copy` ne le peut pas, par construction.
+   à `d_model`, il n'y a même pas la projection : l'identité littérale de E2. La
+   raison de l'échec est écrite dans le dépôt : un biais additif peut faire
+   gagner un token qu'**aucune ligne ne porte** (` HAB-719` → ` HQR-719`) ; le
+   mélange normalisé de `rti_copy` ne le peut pas, par construction.
+
+   **À protocole apparié** (dernière ligne de `metrics.csv`, step 3000, n_eval=30,
+   n_code=10 — les `final_metrics.csv` à n=267 n'existent QUE pour r4/r5, les
+   comparer aux r3 mélangerait deux protocoles) :
+
+   | run | grade held | ablaté | strate `code` | grade **train** |
+   |---|---|---|---|---|
+   | `r3_toprows` (biais additif) | 0.0333 | 0.0000 | 0.100 | **0.3611** |
+   | `r3_toprows_mos` | 0.0667 | 0.0000 | 0.100 | 0.3889 |
+   | `r3_segsif` | 0.0333 | 0.0000 | 0.100 | 0.3611 |
+   | **`r4_toprows`** (injection native) | **0.2000** | 0.0000 | **0.600** | **0.8611** |
+   | `r5_toprows_tg2_oracle_first` | 0.2000 | 0.0000 | 0.600 | 0.8889 |
+
+   L'injection l'emporte d'un facteur ~6 en held (0.200 contre 0.033) et 6× sur
+   la strate `code` (0.600 contre 0.100). **Mais la colonne `train` dit quelque
+   chose que personne n'avait relevé** : `r3` atteint **0.36** sur les
+   conversations vues. Le readout additif *sait* citer — ce qui lui manque est la
+   généralisation, pas la capacité de décoder. Ça ne sauve pas E2 (l'écart en
+   held reste de 6×), mais ça déplace le diagnostic de « classe de fonctions
+   incapable » vers « classe de fonctions qui mémorise », et c'est ce que le
+   verrou E1.0 doit trancher.
 
 E2 échangerait donc 0,58 % du `lm_head` contre la normalisation du mélange —
 c'est-à-dire contre la seule propriété qui interdit de citer ce qui n'est pas là.
