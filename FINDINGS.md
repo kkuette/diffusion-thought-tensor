@@ -37,6 +37,115 @@ test this — before scale.
 
 ---
 
+## 2026-08-02 — Labo jouet phase 9 (`tophid`) : from-scratch, le canal post-norm MARCHE et coûte 39 % de la citation — et il est mort dès que le readout est appris
+
+**TL;DR.** Prédiction inscrite dans le `.job` **avant** le run : « `code` < 0,35
+⇒ mauvais support ; `code` ≥ 0,70 ⇒ le from-scratch renverse la sonde ; entre
+les deux ⇒ le canal marche mais coûte ». Résultat : **0,434** contre **0,708**
+pour la ligne native, à n=106 — la branche intermédiaire, et l'écart est net
+(z = 4,19). Entraîné depuis zéro avec ce canal, le modèle **façonne bien**
+`norm_f` pour que la ligne porte la surface : la sonde 350M (2,9 % de citation)
+n'était pas une limite architecturale, c'était un modèle entraîné sans ce
+canal. Mais le prix est réel et il n'est **pas** l'échelle : `hid_scale` finit à
+**1,123**, à 12 % de son init — le modèle ne rescale quasiment pas, donc les
+27 points perdus sont du **contenu**, pas de la norme.
+
+**Le prix est de la généralisation, pas de l'ajustement.** Sur le split TRAIN
+les deux bras finissent au même endroit (**0,833** `tophid` contre 0,861
+`toprows`) ; c'est en held-out que l'écart s'ouvre (0,172 contre 0,281). Une
+ligne native `E[id]` est un **lookup** : le même vecteur pour le même token
+partout. Une ligne post-norm est **contextuelle** : le circuit de copie doit
+apprendre une invariance sur une variété au lieu d'un dictionnaire fini. Il
+l'apprend sur les contextes vus, pas au-delà. Le canal démarre aussi **3× plus
+tard** (première citation train au pas ~1000 contre 400).
+
+**Et avec un readout appris, le canal est à zéro.** `r3_tophid` : grade
+**0,0000**, code **0,0000**, contre 0,097 / 0,245 pour `r3_toprows` au même
+n=267. Le Δnll le dit encore plus crûment — **0,287 contre 2,988**, un facteur
+10 : le modèle n'utilise presque pas la banque. `GroupReadout` projette la ligne
+sur `rms_unit(E)ᵀ` ; sur une ligne post-norm cette projection rend la
+distribution du token **suivant**. C'est la confirmation from-scratch de la
+sonde 350M, sur un modèle qui avait pourtant tout loisir de façonner l'espace
+autrement.
+
+### Setup
+
+`toy_read_lab.py` (44 M params), config `toy_read_lab_d512.yaml`, 3000 pas,
+1 graine, une 3070Ti par bras, 45 min à 67 min. Quatre runs, deux comparaisons
+appariées : `r4_toprows`/`r4_tophid` (injection-oracle, aucun read appris) et
+`r3_toprows`/`r3_tophid` (`GroupReadout` appris). Le n=267 final est le même
+pour les quatre — `r3_toprows` a été **re-tourné** pour cela (l'ancien run n'a
+que des paliers n≈30, l'ancien répertoire est conservé sous `r3_toprows_pre09`).
+
+**L'A/B est isolé à un point** : même sélection SIF aux mêmes positions, même
+clé oracle en ligne 0, même layout `1+top_k`, même `rms_unit` sur la ligne
+stockée. Seul le vecteur normé change — `E[id]` contre l'état après `norm_f`.
+Le `rms_unit` des deux côtés n'est pas cosmétique : au 350M `‖h‖/‖E‖ ≈ ×17`, et
+sans lui le bras aurait perdu sur l'échelle pendant qu'on aurait conclu sur le
+contenu. Côté injection, non normée, un scalaire appris `hid_scale` absorbe le
+même confondant ; `toprows` ne le gagne pas, sinon les bras cesseraient d'être
+appariés.
+
+*Variables qui bougent ensemble et ne sont donc pas ablatées* : **une seule
+graine** par bras — les écarts `r4` (z = 3,02 sur le grade, 4,19 sur `code`) et
+`r3` (z = 5,87 sur `code`) sont larges devant leur erreur d'échantillonnage
+d'éval, mais aucun des quatre n'a de barre d'erreur **inter-graines**. Et le
+jouet est aveugle aux strates `short`/`word` (0,000 partout, y compris dans tous
+les runs antérieurs) : tout ce tableau se lit sur la strate `code`.
+
+### Verdict
+
+| n=267, held-out | grade | `code` (n=106) | Δnll | ablaté |
+|---|---|---|---|---|
+| `r4_toprows` — natif, injection-oracle | **0,2809** ± 0,0275 | **0,7075** | 3,022 | 0,0000 |
+| `r4_tophid` — post-norm, injection-oracle | 0,1723 ± 0,0231 | 0,4340 | 2,599 | 0,0000 |
+| `r3_toprows` — natif, readout appris | 0,0974 ± 0,0181 | 0,2453 | 2,988 | 0,0000 |
+| `r3_tophid` — post-norm, readout appris | **0,0000** | **0,0000** | **0,287** | 0,0000 |
+
+| pas 3000, split TRAIN (n=36) | grade | premier grade > 0 |
+|---|---|---|
+| `r4_toprows` | 0,8611 | pas **400** |
+| `r4_tophid` | 0,8333 | pas **1000** |
+
+`hid_scale` final : **1,1228** (`r4_tophid`, best à 2400 : 1,1242) · **1,0000**
+inchangé dans `r3_tophid` — attendu et à dire : le paramètre ne multiplie que le
+chemin `inject`, que `r3` n'emprunte pas. Il n'y reçoit aucun gradient et n'y
+signifie rien.
+
+### Attribution honnête, et ce qui casse
+
+Ce que ce résultat **ne** dit **pas** : que le canal post-norm est inutilisable.
+0,434 contre 0,708 est une dégradation, pas un plancher — et le jouet ne teste
+qu'un régime, `top_k` lignes natives sélectionnées par SIF dans un segment de
+~18 tokens, avec une clé **oracle**. Ce qu'il dit, lui, tient en une phrase : à
+coût apparié et à sélection identique, **l'ID de token reste le meilleur support
+de citation**, et le surplus de contexte que porte la ligne post-norm ne paie
+pas le décodage qu'il exige.
+
+Le contraste `r4`/`r3` est le vrai livrable, et il est plus dur que le
+classement : le canal post-norm ne survit **que** sous injection-oracle, c'est-à-
+dire là où **rien n'est appris** au read. Dès qu'on interpose la classe de
+fonctions apprise, il passe de 0,434 à 0,000 pendant que la ligne native ne
+passe que de 0,708 à 0,245. Autrement dit le design `[M, mem_dim, d_model]`
+demande **plus** au readout que celui qu'il remplace, au moment précis où le
+readout est le maillon mesuré faible (r3, held-out ≤ 0,100 depuis 12 runs).
+
+Réserve de portée qui limite la conclusion vers le haut comme vers le bas : ces
+lignes sont sélectionnées dans un **segment de présentation**, où la valeur à
+citer est déjà en contexte. Rien ici ne mesure le cas qui motive le design —
+une ligne post-norm qui porterait un **résumé** que l'ID ne peut pas porter. Ce
+cas-là reste ouvert, et il ne se mesure pas dans ce jouet.
+
+### Reproduire
+
+```bash
+python -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512.yaml --variant r4 --code tophid --device cuda
+python -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512.yaml --variant r3 --code tophid --device cuda
+python -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512.yaml --variant r3 --code toprows --device cuda
+```
+
+---
+
 ## 2026-08-02 — Banque `[M, mem_dim, d_model]` : une ligne post-norm est une PRÉDICTION, pas une surface citable
 
 **TL;DR.** Le design passe le slot d'un code compressé `[mem_dim]` à une
