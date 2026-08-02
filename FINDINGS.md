@@ -37,6 +37,140 @@ test this — before scale.
 
 ---
 
+## 2026-08-02 — Banque `[M, mem_dim, d_model]` : une ligne post-norm est une PRÉDICTION, pas une surface citable
+
+**TL;DR.** Le design passe le slot d'un code compressé `[mem_dim]` à une
+**matrice** `[mem_dim, d_model]` de vecteurs sélectionnés après la dernière
+RMSNorm ([model.py:540](deepseek_v4_mini/model.py:540)). Mesuré sur le 350M
+(`v350_sft_recall_rti/step_1000.pt`, n=105 positions de texte réel) : `argmax(h_t
+@ Eᵀ) == x_t` seulement **2,9 %** du temps — la ligne pointe sur le token
+**suivant**, pas sur le sien (cos médian avec sa propre surface **0,030**, avec
+sa prédiction **0,164** ; rang médian de `x_t` dans sa propre ligne : **374**).
+Et le correctif évident — stocker `h_{t-1}`, celle qui prédit `x_t` — ne répare
+rien : elle cite au rang 1 dans **19 %** des cas, ce qui est la *précision du
+modèle*, pas une propriété de la banque ; restreint aux tokens **non prédits** —
+c'est-à-dire exactement les noms, codes et constantes qu'une banque de rappel
+existe pour porter — le rang médian remonte à **12**. Enfin l'échelle : `‖h‖`
+médian **41,4** contre `‖E[id]‖` médian **2,44**, un facteur **×17** qui rend
+l'injection côté entrée hors distribution par l'échelle seule.
+
+### Setup
+
+`analysis/native_row_channel.py`, CPU, ~4 min. Checkpoint 350M réel (SmolLM2,
+V = 49 154, tying asserté), 5 textes portant les quatre strates de l'env recall
+(nom/ville, code alphanumérique, identifiant + constante de code, nombres). Les
+lignes sont capturées par **hook sur `model.norm_out`**, pas recalculées : le
+tenseur mesuré est celui que le forward produit.
+*Variables qui bougent ensemble et ne sont donc pas ablatées* : le checkpoint est
+un SFT recall à step 1000, donc les **rangs** dépendent de la qualité du modèle.
+Les deux faits qualitatifs — la ligne pointe sur le suivant, l'échelle est ×17 —
+sont en revanche **architecturaux** (c'est ce que `lm_head` consomme, et le gain
+appris de `norm_out` fixe la norme), pas propres à ce run.
+
+### Verdict
+
+| mesure | ligne `h_t` | ligne `h_{t-1}` | ce qu'attend `inject` |
+|---|---|---|---|
+| cite `x_t` au rang 1 | 0,029 | 0,190 | 1,000 (`E[id]`, par construction) |
+| rang médian de `x_t` | 374 | 7 | 1 |
+| … tokens **non prédits** | — | **12** (n=85) | 1 |
+| norme médiane | 41,4 | 41,4 | 2,44 |
+
+### Attribution honnête, et ce qui casse
+
+Cette mesure lit la ligne **avec `lm_head`**. C'est le seul readout *gratuit*
+(tying) et c'est tout l'argument d'économie du canal post-norm — mais elle ne
+démontre pas que `x_t` est absent de `h_t`. Le residual stream porte le token
+courant ; `norm_out`+`lm_head` sont entraînés à le **supprimer** (ne pas
+répéter). Une sonde linéaire apprise le retrouverait probablement. Sauf qu'à ce
+moment-là on a re-payé un **readout appris** — précisément la classe de fonctions
+mesurée morte en held-out (r3 / `PointerReadout`, ≤ 0,100 contre 0,281 pour
+l'injection native ; et 0,361 en **train**, donc le mur est la généralisation).
+
+L'arbitrage réel, alors : le RTI actuel stocke des **ID de tokens** et injecte
+`E[id]` — lossless par construction, zéro readout, borné au vocabulaire. La ligne
+post-norm est plus **riche** (elle porte le contexte) mais exige un décodage que
+l'ID n'exige pas. Le design ne se justifie que si ce surplus de contexte paie
+plus cher que le readout ne coûte, et le seul précédent chiffré qu'on ait sur ce
+readout est négatif.
+
+Ce qui n'est **pas** tranché ici : le test **fonctionnel** côté entrée — injecter
+la ligne en préfixe (`inject`, [model.py:512](deepseek_v4_mini/model.py:512)) et
+comparer la distribution produite à celle de `E[x_t]`. Lui seul dit si le stack
+lit une ligne post-norm rescalée. C'est le pas suivant, et il est cheap.
+
+### Reproduire
+
+```bash
+PYTHONPATH=. python deepseek_v4_mini/analysis/native_row_channel.py
+```
+
+---
+
+## 2026-08-02 — E0 : la métrique est SATURÉE (write held = 1.000), et la cible auto-supervisée de E5a est réfutée à 0,018
+
+**TL;DR.** Sur `dsv4w s43`, règles **held** (jamais vues), le write entraîné rend
+**1.000** contre 0.000 pour le bras ablaté (hasard 0.008). Il n'y a donc **aucune
+marge à mesurer au-dessus** : E0 ne peut pas trancher « le write laisse-t-il de la
+place ? » sur cette tâche. Ce qui reste mesurable est le bras `init=noise`, et il
+tranche autre chose — optimiser un code libre sur la **CE de la présentation**
+(l'objectif auto-supervisé, calculable au write) atteint **0,018** held, à peine
+au-dessus du hasard 0,008 ; optimiser sur la **CE des requêtes** (oracle non
+calculable au write) atteint **0,578**. Écart **+0,560**. La présentation
+*contient* les paires en contexte, donc la banque y est quasi libre : cet
+objectif ne porte presque pas de signal. **E5a — qui proposait exactement cette
+cible pour remplacer le teacher Fourier — est réfuté par ce chiffre.**
+
+### Setup
+
+`analysis/oracle_code.py`, CPU, 1209 s. Tout gelé (`requires_grad_(False)`),
+seule la banque écrite est optimisée : `m = bank[:,-1].clone().requires_grad_()`,
+Adam 200 pas, lr ∈ {0.03, 0.1, 0.3}, λ = 0 (tout terme qui éloigne du minimum de
+la CE ne peut que rabaisser une **borne**). Best-of-trajectoire **incluant le pas
+0** — une borne doit contenir son point de départ. Protocole d'éval identique au
+bit à `ttt_demo.py` (mêmes `make_convs`, `query_batch`, RNG CPU, graine 0).
+
+*Deux inits qui ne répondent pas à la même question, et qu'un `max` rendait
+illisible* (corrigé) : `init=write` est une **sanité** — le pas 0 *est* le write
+entraîné, ce bras ne peut jamais passer sous lui, et quand le write est au
+plafond il vaut le plafond. `init=noise` est la **mesure**.
+
+### Verdict
+
+| cible optimisée | calculable au write ? | acc held (init=noise) |
+|---|---|---|
+| bras ablaté (plancher) | — | 0.000 (hasard 0.008) |
+| write entraîné | — | **1.000** ← plafond |
+| CE **présentation** (auto-supervisé) | oui | **0.018** |
+| CE **requêtes** (oracle) | non | **0.578** |
+
+### Attribution honnête
+
+Le 0,578 n'est **pas** une borne de capacité : 200 pas d'Adam sur un seul vecteur
+`mem_dim` depuis du bruit peuvent s'arrêter dans un minimum local. Il donne une
+borne *inférieure* sur ce que la classe de fonctions du read exprime, pas une
+supérieure. Le chiffre qui porte est l'**écart** 0,578 − 0,018, et il est robuste
+au sens où les deux bras partagent init, optimiseur, pas et protocole d'éval.
+
+Ce que la saturation implique par ailleurs : sur le régime « appliquer une
+règle », la banque compressée `[M, mem_dim]` **n'est pas le facteur limitant** —
+elle est au plafond. Tout gain d'un slot `[mem_dim, d_model]` doit donc venir de
+l'aile **citation**, que cette tâche jouet ne teste pas.
+
+*Réserve de provenance* : le « held 0,79–1,00 » du papier vient de `dsv4m`, qui
+n'existe plus ; ce 1.000 est recalculé sur `s43` avec le même script, il ne se
+compare pas au texte du papier.
+
+### Reproduire
+
+```bash
+PYTHONPATH=. python deepseek_v4_mini/analysis/oracle_code.py \
+  /mnt/tb/checkpoints/archive/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt \
+  --cfg deepseek_v4_mini/configs/archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml
+```
+
+---
+
 ## 2026-08-02 — E2 RETIRÉ : l'algèbre est juste, le gain est chiffré contre une tête qui n'existe pas, et la classe de fonctions est déjà mesurée morte
 
 **TL;DR.** L'identité `lm_head(norm_out(H) + g·proj(c)) == logits + g·(proj(c)·Eᵀ)`
