@@ -37,6 +37,87 @@ test this — before scale.
 
 ---
 
+## 2026-08-02 — C1 : le soupçon « le Δnll est gonflé par l'érosion de l'hôte » est RÉFUTÉ là où le comportement le teste, et CONFIRMÉ là où il ne le teste pas (recall : les DEUX bras régressent)
+
+**TL;DR.** Sur `codeexec` — le seul kind avec un écart de grade réel (0.275 contre
+**0.000** ablaté) — le Δnll est **plat** (+0.046 → +0.050) pendant que `ic_ppl`
+codeparrot est multiplié par 5.9 : l'érosion ne gonfle pas le Δ, sinon elle le
+gonflerait là aussi. Mais sur `recall` la même sonde attrape exactement le motif
+redouté : Δnll −0.101 → **+0.230** alors que les **deux** bras se dégradent en
+absolu (mémoire 4.035 → 4.553, ablaté 3.934 → **4.784**) et que le grade reste
+0.000/0.000 aux 20 paliers. Ce Δ-là n'est pas un gain de mémoire, c'est un
+**écart de vitesse de décroissance**.
+
+### Setup
+
+Aucun GPU : les deux runs qui portent `ic_ppl` **et** `math` aux mêmes steps
+étaient déjà sur disque. `v350_sft_valsif_stair` (celui dont FINDINGS 07-27
+décrit l'érosion) et `v350_sft_recall_stair` (réplication indépendante : autres
+kinds, même recette d'escalier). 20 paliers appariés chacun, step 100→2000.
+Script neuf : `analysis/dnll_vs_host.py`. Rien n'a été ré-entraîné, rien n'a été
+ré-évalué — c'est une relecture des métriques existantes.
+
+L'objection venait de la critique du 08-02, qui recollait deux entrées du
+journal : 07-27 « l'érosion hôte a doublé, ic_ppl 19,5 → 115,7 » et 07-26
+« Δnll est une différence, et un meilleur hôte tire les DEUX bras ». Mises bout
+à bout : plus l'hôte se dégrade, plus le Δnll a de la place pour croître.
+
+### Verdict
+
+| run / kind | n | Δnll début → fin | nll mémoire | nll ABLATÉ | grade m/abl | lecture |
+|---|---|---|---|---|---|---|
+| valsif / **codeexec** | 18 | +0.046 → +0.050 | 1.112 → 0.415 | 1.159 → 0.465 | **0.275 / 0.000** | Δ **plat** sous ic_ppl ×5.9 ⇒ pas de couplage mécanique |
+| valsif / toolcall | 7 | +0.076 → +0.191 | 1.895 → 0.878 | 1.971 → 1.069 | 0.000 / 0.000 | ablaté s'améliore ⇒ pas l'érosion, mais **rien de comportemental derrière** |
+| valsif / requote | **2** | −0.022 → +0.067 | 3.599 → 0.745 | 3.577 → 0.812 | 0.102 / 0.110 | n=2, et grade_abl ≥ grade : **sonde morte**, déjà su |
+| recall / **recall** | 5 | −0.101 → **+0.230** | 4.035 → **4.553** | 3.934 → **4.784** | 0.000 / 0.000 | ⚠ **LES DEUX bras régressent** |
+| recall / requote | 5 | +0.035 → +0.051 | 4.390 → 2.196 | 4.425 → 2.247 | 0.147 / 0.000 | petit, mais avec un écart de grade |
+
+Hôte hors domaine : `ic_ppl` codeparrot 19.5 → 115.7 (×5.9) et fineweb 141 → 663
+sur valsif ; 19.1 → 124.3 (×6.5) et 154 → 574 sur recall.
+
+![C1](assets/c1_dnll_vs_host.png)
+
+### Attribution honnête, et ce qui casse
+
+Le discriminant n'est pas « Δnll monte-t-il quand ic_ppl monte ? » — sur un run
+qui progresse, tout est corrélé au temps. Ce sont **le bras ablaté** et **le
+grade** qui tranchent :
+
+- Une érosion qui gonfle artificiellement l'écart fait **régresser** le bras sans
+  mémoire. Sur valsif il **progresse** partout (toolcall 1.971 → 1.069) : l'écart
+  qui se creuse y est de la mémoire, pas de l'hôte qui se dégrade. Et `ic_ppl`
+  est mesuré **hors** domaine quand les nll de `math` sont **en** domaine — un
+  SFT qui se spécialise fait exactement ça.
+- Sur `recall`, les deux bras montent. Le Δ se creuse parce que l'ablaté se
+  dégrade **plus vite**. Aucune des deux courbes ne va dans le bon sens, et le
+  grade est 0.000 des deux côtés aux 20 paliers. **C'est la première mesure
+  directe de l'artefact**, et elle tombe sur le run dont le verdict « mort »
+  avait été atteint par d'autres moyens ([mémoire : SFT recall 350M]).
+
+Ce qui n'est plus une sonde valide : **`requote` de valsif_stair est mesuré sur
+n=2**. Ce n'est pas un Δnll bruité, ce n'est pas une mesure. Le corollaire de la
+règle « un grade composite à 0 ne localise rien » est « un Δnll sur n=2 ne
+mesure rien » — et les n de cette campagne sont 2, 5, 7, 18.
+
+Ce qui n'est **pas** ablaté ici : rien n'a été relancé, donc les deux runs
+diffèrent par leurs kinds ET par leur recette (`valsif` a le teacher value_sif,
+`recall` non). La comparaison inter-runs n'attribue rien ; c'est la comparaison
+**intra-run entre kinds** qui porte le verdict.
+
+**Règle opératoire qui sort de là** — un Δnll n'est interprétable qu'accompagné
+(a) des **nll absolues des deux bras** : si les deux montent, le Δ est un écart
+de vitesse de décroissance ; (b) d'une **métrique de comportement** dont le bras
+ablaté est au plancher ; (c) de **son n**. `codeexec` a les trois. `recall` n'en
+a aucun.
+
+### Reproduire
+
+    PYTHONPATH=. python deepseek_v4_mini/analysis/dnll_vs_host.py
+    PYTHONPATH=. python deepseek_v4_mini/analysis/dnll_vs_host.py \
+        --plot assets/c1_dnll_vs_host.png
+
+---
+
 ## 2026-08-01 — Kill-test 3 (SPEC_MEMOIRE_V2 §4) : la prédiction « biais chiffres » est RENVERSÉE — le vrai bug est k fixe vs longueur de tour (code : inclusion pleine 0.000)
 
 Contexte : la critique adversariale du 07-31 prédisait que le biais SIF
