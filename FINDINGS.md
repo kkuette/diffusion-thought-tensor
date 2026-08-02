@@ -37,6 +37,68 @@ test this — before scale.
 
 ---
 
+## 2026-08-02 — E2 RETIRÉ : l'algèbre est juste, le gain est chiffré contre une tête qui n'existe pas, et la classe de fonctions est déjà mesurée morte
+
+**TL;DR.** L'identité `lm_head(norm_out(H) + g·proj(c)) == logits + g·(proj(c)·Eᵀ)`
+tient au bit près (float64 : max|Δ| = 3.3e-16 ; float32 : 3.6e-07), et la
+condition « APRÈS `norm_out` » est réelle — en pré-norm l'écart monte à 3.3e-02,
+de l'ordre des logits eux-mêmes. Mais le « facteur 42 » compare à une tête
+pointeur `d_m × V` **qui n'existe nulle part dans le dépôt**, et avec un
+`V = 32 000` alors que le vocabulaire réel est **49 154**. Ce qui est
+réellement implémenté, `rti_copy.CopyHead`, coûte **0,61 M MACs/token** — moins
+que l'homme de paille (25,17 M) et 1,6× seulement l'injection proposée.
+
+### Setup
+
+`analysis/postnorm_equiv.py`, CPU, secondes. L'équivalence est testée sur les
+modules RÉELS du dépôt (`norm_out`, `lm_head`, weight tying asserté), pas sur
+une reconstitution. La table de MACs utilise les dimensions du 350M :
+`d_model` 768, `mem_dim` 512, `V` = len(SmolLM2-135M) 49 152 **+2**
+(`<think>`, `<blank>`, ajoutés par `code_defer_native.py:717`), `P = G·(top_k+1)
+= 2×14 = 28`.
+
+### Verdict
+
+| chemin | MACs/token | % du `lm_head` | statut |
+|---|---|---|---|
+| `lm_head` (référence) | 37,75 M | 100 % | — |
+| tête pointeur `d_m × V` | 25,17 M | 66,7 % | **n'existe pas dans le dépôt** |
+| injection post-norm (E2) | **0,39 M** | 1,04 % | la proposition |
+| `rti_copy.CopyHead` | **0,61 M** | 1,62 % | ce qui est implémenté |
+
+### Attribution honnête, et ce qui casse
+
+Deux raisons indépendantes, et la seconde suffirait seule.
+
+1. **Le gain est mesuré contre un homme de paille.** `rti_copy` ne matérialise
+   jamais un `[B,T,V]` : c'est un pointer-generator sur les ≤ 28 colonnes du
+   préfixe (`W_c` d×d + scores P·d + porte d + agrégation P²). Il coûte déjà
+   0,61 M contre les 25,17 M de la tête imaginée. L'économie réelle de E2 est
+   0,22 M MACs/token, soit **0,58 % du `lm_head`**.
+2. **La classe de fonctions est déjà réfutée.** Un biais ADDITIF aux logits est
+   exactement `PointerReadout` ([toy_read_lab.py:832](deepseek_v4_mini/toy_read_lab.py:832)),
+   qui fait `logits = (x + g·scale·sel) @ Eᵀ` — et en `r3`, `mem_dim` étant forcé
+   à `d_model`, il n'y a même pas la projection : l'identité littérale de E2.
+   12 runs r3 à d=512 : grade held-out entre **0.000 et 0.100**, contre **0.281**
+   (strate `code` **0.708**) pour l'injection de pseudo-tokens natifs. La raison
+   est écrite dans le dépôt : un biais additif peut faire gagner un token
+   qu'**aucune ligne ne porte** (` HAB-719` → ` HQR-719`) ; le mélange normalisé
+   de `rti_copy` ne le peut pas, par construction.
+
+E2 échangerait donc 0,58 % du `lm_head` contre la normalisation du mélange —
+c'est-à-dire contre la seule propriété qui interdit de citer ce qui n'est pas là.
+
+Ce qui n'est **pas** montré ici : que l'injection post-norm soit inutile en
+général. Elle reste une optimisation réelle **de `r3`/`GroupReadout`** (37,75 M →
+0,39 M, facteur 97, puisque ces readouts font `sel @ Eᵀ` en pleine largeur) —
+mais sur un bras dont le grade `code` plafonne à 0,300 contre 0,708.
+
+### Reproduire
+
+    PYTHONPATH=. python deepseek_v4_mini/analysis/postnorm_equiv.py
+
+---
+
 ## 2026-08-02 — C1 : le soupçon « le Δnll est gonflé par l'érosion de l'hôte » est RÉFUTÉ là où le comportement le teste, et CONFIRMÉ là où il ne le teste pas (recall : les DEUX bras régressent)
 
 **TL;DR.** Sur `codeexec` — le seul kind avec un écart de grade réel (0.275 contre
