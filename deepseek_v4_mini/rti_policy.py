@@ -404,6 +404,9 @@ class RtiRollout:
             # 2. décodage (sondes) ou forward nu (tout le reste)
             hid = None
             wid = [x] * G                      # ids servant au write de ce seg
+            wcm = [s.get("copy_mask")] * G     # atomes garantis (segs script
+                                               # seulement — un texte décodé
+                                               # n'a pas d'oracle de span)
             if s.get("decode"):
                 pid = int(s["probe_id"])
                 texts, toks, lps, npre = self._decode(rolls, sel, G, dev)
@@ -423,6 +426,7 @@ class RtiRollout:
                 # (on-policy), pas sur le gold du script.
                 wid = [torch.tensor([toks[g] or [self.sep_id]], dtype=torch.long,
                                     device=dev) for g in range(G)]
+                wcm = [None] * G
                 if pcfg.write_on == "all":
                     hid = self._hidden_batch(wid)
             else:
@@ -455,7 +459,7 @@ class RtiRollout:
                     row = wid[g].reshape(-1)
                     if row.numel():
                         key, tk = build_group(self.model.embed.weight,
-                                              self.sif_w, row, cfg)
+                                              self.sif_w, row, cfg, wcm[g])
                         gid = r.push(key, tk, tag, cfg.max_groups)
                 rec[g]["write"] = {"a": int(a), "logp": float(lp),
                                    "p": float(p), "p_b": float(p_b),

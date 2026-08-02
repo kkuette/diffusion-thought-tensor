@@ -284,6 +284,10 @@ def _sample_code(rng: random.Random, taken: set) -> dict:
     sol = body.format(f=f, k=k)
     return {
         "slot": f"code:{op}", "value": f,
+        # atomes CITABLES du fait : les tests exec exigent le nom ET la
+        # constante — le copy_mask doit couvrir les deux (kill-test 3 :
+        # la constante perdait la sélection SIF, et n'était pas dans val_mask)
+        "atoms": [f, str(k)],
         "statement": (f"For this project we agreed on a convention: the helper "
                       f"is called `{f}` and the constant is {k}."),
         "question": (f"Now write the helper we agreed on: a function that "
@@ -489,6 +493,7 @@ def build_script(cfg: RecallEnvConfig, life: int, filler_pool: list = None) -> d
         t = emit("fact", f["statement"], None, fid=fid)
         facts.append({"fid": fid, "stratum": name, "slot": f["slot"],
                       "slot_id": ids[f["slot"]], "value": f["value"],
+                      "atoms": f.get("atoms", [f["value"]]),
                       "seg": t["user_seg"], "write_idx": w0,
                       "question": f["question"],
                       "answer": f["answer"], "check": f["check"]})
@@ -715,7 +720,8 @@ class RecallEnvStream(P.PersonaChatStream):
         for t in script["turns"]:
             if t["kind"] == "fact":
                 f = by_fid[t["fid"]]
-                out.append(self._user_fact(t["user"], f["value"], f["slot_id"]))
+                out.append(self._user_fact(t["user"], f["value"], f["slot_id"],
+                                           f.get("atoms")))
             elif t["kind"] == "probe":
                 p = script["probes"][t["pid"]]
                 out.append(self._user_probe(t["user"], p["slot_id"], p["pid"]))
@@ -730,7 +736,8 @@ class RecallEnvStream(P.PersonaChatStream):
         assert len(out) == script["n_segs"], (len(out), script["n_segs"])
         return out
 
-    def _user_fact(self, text: str, value: str, slot_id: int) -> dict:
+    def _user_fact(self, text: str, value: str, slot_id: int,
+                   atoms: list = None) -> dict:
         seg = self._user(text)
         ids = seg["input_ids"][0].tolist()
         T = len(ids)
@@ -740,6 +747,15 @@ class RecallEnvStream(P.PersonaChatStream):
             vm[span[0]:span[1]] = 1.0
         seg["val_mask"] = vm.unsqueeze(0)
         seg["fact_slot"] = torch.full((1, T), int(slot_id), dtype=torch.long)
+        # copy_mask = TOUS les atomes citables (kill-test 3 : pour `code`, la
+        # constante est exigée par les tests exec mais absente de val_mask —
+        # qui, lui, reste la cible du teacher value_sif et ne bouge pas)
+        cm = vm.clone()
+        for a in (atoms or [value]):
+            sp = self._val_span(ids, str(a))
+            if sp is not None:
+                cm[sp[0]:sp[1]] = 1.0
+        seg["copy_mask"] = cm.unsqueeze(0)
         return seg
 
     def _user_probe(self, text: str, slot_id: int, pid: int) -> dict:

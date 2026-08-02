@@ -107,7 +107,14 @@ _ZERO_PAD_KEYS = ("loss_mask", "attention_mask", "val_mask", "surp_w",
                   "fact_slot", "fact_val", "fact_attr",
                   # rti : slot INTERROGÉ par un seg de question (cible de la CE
                   # du retriever). Même convention 1-based, même pad 0.
-                  "q_slot")
+                  "q_slot",
+                  # rti : atomes de valeur GARANTIS dans la sélection de
+                  # surface du write (kill-test 3, FINDINGS 2026-08-01).
+                  # Distinct de val_mask : val_mask cible le teacher value_sif
+                  # (la valeur seule), copy_mask couvre TOUS les atomes citables
+                  # (nom ET constante pour la strate code). Pad 0 = rien à
+                  # garantir sur ces positions.
+                  "copy_mask")
 
 
 class ChatBatchStream:

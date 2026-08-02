@@ -532,7 +532,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
                 # write PROCÉDURAL (sélection d'embeddings natifs, zéro
                 # gradient) puis, si ce seg pose une question, la requête qui
                 # servira le seg SUIVANT — même ordre qu'à l'entraînement.
-                rti.write(model.embed.weight, x, s.get("fact_slot"))
+                rti.write(model.embed.weight, x, s.get("fact_slot"),
+                          copy_mask=s.get("copy_mask"))
                 if s.get("q_slot") is not None and int(s["q_slot"].max()):
                     with torch.autocast("cuda", dtype=torch.bfloat16,
                                         enabled=amp):
@@ -1689,7 +1690,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     # longueurs réelles côté CPU (le collate right-pade) : les
                     # lire sur le device coûterait une synchro par seg
                     _lens = (None if _pm is None else _pm.sum(1))
-                    rti_run.write(_emb, x, s.get("fact_slot"), _lens)
+                    rti_run.write(_emb, x, s.get("fact_slot"), _lens,
+                                  copy_mask=s.get("copy_mask"))
                     if s.get("q_slot") is not None and int(s["q_slot"].max()):
                         # forward DÉDIÉ du seg user : on veut l'état caché du
                         # dernier token, pas des logits. Sous no_grad quand

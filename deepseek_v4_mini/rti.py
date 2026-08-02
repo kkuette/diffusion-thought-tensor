@@ -123,7 +123,7 @@ def sif_table(stream, vocab_size: int, a: float) -> torch.Tensor:
 
 @torch.no_grad()
 def build_group(embed_w: torch.Tensor, sif_w: torch.Tensor, seg_ids: torch.Tensor,
-                cfg: RtiConfig) -> tuple:
+                cfg: RtiConfig, copy_mask: torch.Tensor = None) -> tuple:
     """(clé [d], tokens [top_k]) du groupe écrit pour ce segment.
 
     Les TOKENS sont les top_k du segment au poids SIF le plus fort, rendus DANS
@@ -131,6 +131,14 @@ def build_group(embed_w: torch.Tensor, sif_w: torch.Tensor, seg_ids: torch.Tenso
     le format achète), complétés à taille fixe en RÉPÉTANT LE DERNIER — un
     candidat en double est inerte, une taille variable casse l'empilement d'un
     batch (crash payé au job 58).
+
+    `copy_mask` [T] (>0 = atome de valeur) borne le kill-test 3 (FINDINGS
+    2026-08-01) : le top-k est un classement INTRA-TOUR et, dans un tour long,
+    les digits d'un nom et une constante perdent contre les mots de template
+    rares — inclusion pleine 0.000 sur la strate code. Les positions marquées
+    sont GARANTIES dans la sélection (dans la limite du budget), le reste du
+    budget va au top-SIF. Même statut épistémique que l'oracle `fact_slot`
+    (`write_every_turn: false`) ; None = sélection SIF pure, inchangée.
 
     La CLÉ est le pooling SIF des embeddings du segment ENTIER, normalisé. Elle
     est PROCÉDURALE : aucune table secrète, rien que le texte — c'est ce qui la
@@ -152,7 +160,18 @@ def build_group(embed_w: torch.Tensor, sif_w: torch.Tensor, seg_ids: torch.Tenso
     key = key / key.norm().clamp_min(1e-6)
     # ── contenu : les top_k tokens, ordre du segment, taille fixe ───────────
     k = min(cfg.top_k, ids.numel())
-    sel = torch.topk(w, k).indices.sort().values
+    if copy_mask is not None:
+        cm = copy_mask.reshape(-1)[:ids.numel()].to(ids.device)
+        keep = torch.nonzero(cm > 0).reshape(-1)[:k]
+        if keep.numel() < k:
+            wf = w.clone()
+            wf[keep] = float("-inf")
+            fill = torch.topk(wf, k - keep.numel()).indices
+            sel = torch.cat([keep, fill]).sort().values
+        else:
+            sel = keep.sort().values
+    else:
+        sel = torch.topk(w, k).indices.sort().values
     toks = ids[sel]
     if k < cfg.top_k:
         toks = torch.cat([toks, toks[-1].repeat(cfg.top_k - k)])
@@ -410,7 +429,8 @@ class RtiRunner:
     # ── 1. WRITE : sélection procédurale, zéro gradient ─────────────────────
 
     @torch.no_grad()
-    def write(self, embed_w, ids, fact_slot=None, lens=None) -> int:
+    def write(self, embed_w, ids, fact_slot=None, lens=None,
+              copy_mask=None) -> int:
         """Pousse un groupe pour chaque lane PORTEUSE de ce seg. Rend le nombre
         de writes. Le tag est le SLOT : deux énonciations du même slot (une
         supersession) sont deux positifs, et le tie-break de récence de
@@ -434,7 +454,8 @@ class RtiRunner:
             row = ids[b, :L]
             if row.numel() == 0:
                 continue
-            key, toks = build_group(embed_w, self.sif_w, row, self.cfg)
+            cm = None if copy_mask is None else copy_mask[b, :L]
+            key, toks = build_group(embed_w, self.sif_w, row, self.cfg, cm)
             self.banks[b].push(key, toks, tag, self.cfg.max_groups)
             done += 1
         return done
@@ -590,6 +611,22 @@ def _selftest() -> None:
     # segment plus COURT que top_k ⇒ complété en répétant le dernier
     _, short = build_group(E, w, torch.tensor([101, 202]), cfg)
     assert short.tolist() == [101, 202, 202, 202], short
+    # copy_mask : un token FRÉQUENT (7, poids 5e-4, jamais élu au SIF pur) est
+    # GARANTI quand il est marqué atome de valeur ; le reste du budget reste
+    # au top-SIF, l'ordre du segment est préservé, la clé ne bouge pas.
+    # Poids DISTINCTS sur les rares : pas d'assertion sur un tie-break de topk.
+    w2 = w.clone()
+    w2[torch.tensor([101, 202, 303, 404])] = torch.tensor([0.9, 0.8, 0.7, 0.6])
+    kw2, tw2 = build_group(E, w2, seg, cfg)
+    assert tw2.tolist() == [101, 202, 303, 404], tw2
+    cm = torch.zeros(seg.numel())
+    cm[0] = 1.0                                # le « 7 » de tête
+    kcm, tcm = build_group(E, w2, seg, cfg, cm)
+    assert tcm.tolist() == [7, 101, 202, 303], tcm   # 404 (0.6) cède au 7 forcé
+    assert torch.equal(kcm, kw2), "copy_mask ne doit toucher QUE la sélection"
+    # mask vide ou None : bit à bit la sélection SIF pure
+    assert torch.equal(build_group(E, w2, seg, cfg, torch.zeros(seg.numel()))[1],
+                       tw2)
     # la clé est PROCÉDURALE : fonction du seul texte, reproductible
     assert torch.equal(build_group(E, w, seg, cfg)[0], key)
     # … et elle dépend du segment

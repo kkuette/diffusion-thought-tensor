@@ -37,6 +37,77 @@ test this — before scale.
 
 ---
 
+## 2026-08-01 — Kill-test 3 (SPEC_MEMOIRE_V2 §4) : la prédiction « biais chiffres » est RENVERSÉE — le vrai bug est k fixe vs longueur de tour (code : inclusion pleine 0.000)
+
+Contexte : la critique adversariale du 07-31 prédisait que le biais SIF
+(w̄ chiffres ≈ 0.02 au teacher a=1e-4) ferait s'effondrer la strate `numeric`
+de l'env recall dans la clé ET la sélection de surface de `build_group`.
+Probe : `analysis/rti_key_surface_bias.py` (nouveau), 1171 énonciations sur
+400 vies appariées, chemin de tokenisation exact du train
+(`RecallEnvStream.segs`, val_mask compris), embed du ckpt rti step_1000.
+
+**Verdict surface — la prédiction est fausse, et le contrôle explique
+pourquoi.** Inclusion pleine du span valeur dans le top-k(13) : numeric
+**1.000** (persona 0.973, pref 0.645, code **0.000**). Contrôle au a teacher
+(1e-4) : numeric reste à 1.000 avec w̄(val) = 0.027 — exactement le 0.02 de la
+mémoire — parce que le top-k est un CLASSEMENT INTRA-TOUR : la médiane du tour
+est encore plus basse (0.014). Le poids absolu des chiffres ne décide de rien ;
+leur rang dans le tour décide de tout. Le diagnostic w̄ du teacher (write) et
+la sélection (surface) sont deux mécanismes différents — la critique a
+transposé l'un sur l'autre.
+
+**Le vrai bug est ailleurs : budget k fixe contre longueur de tour.** SmolLM2
+tokenise chiffre par chiffre → chaque digit est un type fréquent du corpus SIF
+(300 convs, 894 types) → poids ~0.72-0.78, sous les mots de template rares
+(` convention` 0.864, ` project` 0.864). Dans un tour court (numeric, T~18,
+budget 13) tout passe ; dans un tour long (code, T=35) les digits du nom
+(`widgetize_836` → `_`, `8`, `3`, `6` évincés) et LA CONSTANTE (jamais dans le
+val_mask) perdent la compétition. La copie du nom complet est donc impossible
+par construction — le sous-mot dérive du mur recall (` mosaic`→` mask`) était
+garanti dès la sélection. k minimal pour ≥95 % d'inclusion pleine : code 22,
+pref 17, numeric/persona 13.
+
+**Verdict clés — pas de correctif immédiat.** rank-1 (banques m=8, chance
+0.125) : global 0.993, même-slot numeric 0.997 (les clés procédurales séparent
+cinq locker codes qui ne diffèrent que par leurs chiffres). Faible : pref
+(même-slot 0.569-0.650, paires quasi identiques cos_p99=1.0) — mais relecture
+du design : l'indistinction même-slot est le territoire du tie-break de
+RÉCENCE de `pick_eval_groups` (supersession by design), pas du retrieval par
+clé. Le centrage global des clés (retrait de la clé moyenne) ne change RIEN
+(0.569 → 0.569, testé) — la composante commune est par-slot, pas globale.
+
+**Décisions (spec §3.1 révisée)** :
+1. Sélection à PRIORITÉ DE SPAN au write : val_mask garanti dans le groupe,
+   reste du budget en top-SIF. Même statut épistémique que l'oracle
+   `fact_slot` déjà assumé (`write_every_turn: false`) ; remplacé à terme par
+   le write `<think>` (le modèle formule le fait → tour court → sélection
+   triviale).
+2. L'env doit marquer TOUS les atomes de valeur : pour `code`, le val_mask ne
+   couvre que le nom du helper — la constante (exigée par les tests exec) perd
+   la sélection même avec le span garanti. Correctif dans `_sample_code` /
+   `_user_fact`.
+3. k reste 13 (k=22 = +64 % de préfixe injecté, rejeté tant que 1+2 suffisent).
+4. Clés : rien à corriger maintenant ; surveiller la confusion intra-pref via
+   la CE du retriever W_q (appris, pas procédural).
+
+**Correctifs LIVRÉS le jour même (self-tests verts : rti, recall_env,
+rti_policy, rti_copy, rti_learner)** : `build_group(…, copy_mask)` garantit
+les positions marquées dans la sélection (la clé ne bouge pas — asserté au
+self-test), `copy_mask` ajouté à `_ZERO_PAD_KEYS`, l'env pose `copy_mask` =
+union des spans d'ATOMES (nouveau champ `atoms` de `_sample_code` : nom ET
+constante ; val_mask inchangé, il reste la cible du teacher value_sif), les
+trois call sites du write le passent (SFT ×2, policy — un texte DÉCODÉ n'a
+pas d'oracle de span, fallback SIF pur). Passe 2 du learner vérifiée saine :
+elle ne reconstruit que les CLÉS (mask-indépendantes), les tokens rejoués
+viennent de la trace (`cand_toks`). Re-mesure : inclusion pleine des atomes
+**1.000 sur les quatre strates** (SIF pur : code 0.000, pref 0.645) ; max
+11 atomes ≤ budget 13.
+
+Repro :
+    PYTHONPATH=. python deepseek_v4_mini/analysis/rti_key_surface_bias.py \
+        --ckpt /mnt/tb/checkpoints/v350_sft_recall_rti/step_1000.pt --lives 400
+    # contrôle teacher : ajouter --sif-a 0.0001
+
 ## 2026-07-28 (soir) — REBIND prouvé au bit sur GPU (jobs 35-36) : 3,3 ms/rebind vs ~6 s d'armement frais ; intégration rl_disagg opt-in livrée ; 4e et 5e bugs fermés
 
 Le rebind (`runner.rebind(bank, layer_banks)` — commits 50b856b..4b94c69)
