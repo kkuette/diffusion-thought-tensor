@@ -234,7 +234,7 @@ BANK_VARIANTS = ("r0", "r1", "r2", "r3")
 #   mos    = une distribution PAR LIGNE, puis mixture des DISTRIBUTIONS
 READOUT_MIXES = ("linear", "mos")
 CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif",
-         "pack", "segpack", "toprows")
+         "pack", "segpack", "toprows", "tophid")
 # formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
 # d'oracle sur le span valeur). Ils indexent la position DANS LE SEGMENT, donc
 # ils utilisent `seg_n_pos` et non `n_pos`.
@@ -252,9 +252,28 @@ PACK_CODES = ("pack", "segpack")
 # formats à BANQUE DE GROUPES (phase 6) : un write dépose 1+top_k LIGNES
 # NATIVES — ligne 0 = clé dédiée, lignes 1.. = les embeddings BRUTS des tokens
 # sélectionnés. Principe : NE JAMAIS TRANSFORMER. Le FIFO compte les GROUPES.
-GROUP_CODES = ("toprows",)
+GROUP_CODES = ("toprows", "tophid")
+# ── phase 9 : la ligne stockée n'est plus un EMBEDDING D'ENTRÉE ─────────────
+# `tophid` est `toprows` avec UNE différence, et une seule : la ligne de contenu
+# est l'état caché APRÈS `norm_f` (l'espace que consomme `lm_head`, tying
+# oblige) au lieu de l'embedding d'entrée du token. C'est le design
+# `Banque(max_mem, mem_dim, d_model)` — on sélectionne des vecteurs après la
+# dernière RMSNorm et on empile la matrice.
+#
+# POURQUOI L'A/B EST ISOLÉ À CE POINT : même clé oracle ligne 0, même sélection
+# SIF, même `group_rows`, même `GroupReadout`, même layout d'injection, même
+# `rms_unit` appliqué à la ligne. Ne bouge QUE le vecteur normé.
+#
+# CE QUE LE FROM-SCRATCH APPORTE, et que la sonde sur ckpt ne pouvait pas dire :
+# `analysis/native_row_channel.py` a mesuré, sur un 350M entraîné SANS ce canal,
+# qu'une ligne post-norm ne cite pas son propre token (rang médian 374). Mais
+# `norm_f` et `lm_head` y ont été façonnés par un objectif qui ignore la banque.
+# Entraîné DEPUIS ZÉRO, le modèle peut au contraire façonner cet espace pour
+# qu'il porte la surface. C'est cette question-là, et elle seule, que la paire
+# toprows/tophid tranche.
+HID_CODES = ("tophid",)
 # codes qui exigent la table SIF (pondération/sélection des tokens du segment).
-SIF_CODES = ("segsif", "segpack", "toprows")
+SIF_CODES = ("segsif", "segpack", "toprows", "tophid")
 # seed des tables ORACLE du pack (frames R_j ET clés par paire). FIGÉ : il est
 # celui de la campagne de mesure oracle (scratchpad/oracle_pack.py), garder la
 # continuité des chiffres.
@@ -429,9 +448,10 @@ class ToyCfg:
             # r4 n'a AUCUN read appris : ce qu'il lit, c'est le préfixe injecté,
             # et ce préfixe EST le groupe toprows (mêmes tokens, même sélection
             # SIF). Sans ce code il n'y aurait rien à injecter.
-            assert self.code == "toprows", (
-                f"--variant {self.variant} injecte le GROUPE toprows : il "
-                f"exige --code toprows (reçu --code {self.code})")
+            assert self.code in GROUP_CODES, (
+                f"--variant {self.variant} injecte un GROUPE de lignes "
+                f"natives : il exige --code ∈ {GROUP_CODES} (reçu --code "
+                f"{self.code})")
             assert self.write_mode == "fact", (
                 f"--variant {self.variant} est un bras fact-only (le régime "
                 f"`every` n'a pas de sens ici : la banque n'est lue que par "
@@ -1109,6 +1129,13 @@ class ToyReadLM(nn.Module):
         # est EXACTEMENT l'embedding brut du token).
         if cfg.variant in INJECT_VARIANTS:
             self.inject_type = nn.Parameter(torch.zeros(cfg.d_model))
+        # `tophid` injecte une ligne post-norm là où `toprows` injecte un
+        # embedding : deux distributions d'échelle différentes (mesuré au 350M :
+        # ‖h‖/‖E[id]‖ ≈ ×17). Un SCALAIRE appris, init 1.0, retire le confondant
+        # sans qu'on ait à deviner le bon facteur — et sa valeur finale est
+        # elle-même une mesure, donc elle est loggée.
+        if cfg.code in HID_CODES:
+            self.hid_scale = nn.Parameter(torch.ones(()))
         self.retr = (Retriever(cfg) if cfg.variant in RETRIEVER_VARIANTS
                      else None)
         if cfg.uses_ptr:
@@ -1392,18 +1419,53 @@ class ToyReadLM(nn.Module):
 
     # ── write ORACLE du format TOPROWS (groupes de lignes natives) ──────────
     @torch.no_grad()
+    def toprows_sel_idx(self, seg_tok: torch.Tensor) -> torch.Tensor:
+        """Les POSITIONS des top_k tokens SIF, dans l'ordre du segment.
+
+        Extrait de `toprows_sel` sans en changer une opération : `toprows`
+        n'avait besoin que des tokens, `tophid` a besoin de savoir OÙ ils sont
+        pour aller chercher l'état caché correspondant.
+        """
+        c = self.cfg
+        st = seg_tok.to(self.embed.weight.device).reshape(-1)
+        if st.numel() == 0:
+            return st.new_empty(0, dtype=torch.long)
+        w = self.sif_w[st].float()
+        return torch.topk(w, min(c.top_k, st.numel())).indices.sort().values
+
+    @torch.no_grad()
     def toprows_sel(self, seg_tok: torch.Tensor) -> torch.Tensor:
         """Les top_k tokens du segment au poids SIF le plus fort, DANS L'ORDRE
         DU SEGMENT (le tri par poids détruirait l'ordre). Aucun privilège : le
         write ne sait pas où est la valeur, il ne connaît que la table unigram.
         """
-        c = self.cfg
         st = seg_tok.to(self.embed.weight.device).reshape(-1)
         if st.numel() == 0:
             return st
-        w = self.sif_w[st].float()
-        sel = torch.topk(w, min(c.top_k, st.numel())).indices.sort().values
-        return st[sel]
+        return st[self.toprows_sel_idx(seg_tok)]
+
+    @torch.no_grad()
+    def seg_hidden(self, seg_tok: torch.Tensor) -> torch.Tensor:
+        """[T, d] — les états du segment APRÈS `norm_f`, banque DÉBRANCHÉE.
+
+        C'est la ligne que le design `[max_mem, mem_dim, d_model]` stocke :
+        exactement le tenseur que `lm_head` consomme (le forward rend `x`
+        post-`norm_f` via `return_hidden`), donc exactement l'espace où le
+        tying fait de `ligne @ Eᵀ` un biais pointeur.
+
+        `bank=None` : le write ne lit pas la banque pour l'écrire. Sans ça le
+        contenu d'un slot dépendrait des slots déjà présents et l'ordre
+        d'écriture deviendrait un facteur caché du contenu.
+
+        COÛT ASSUMÉ : un forward de plus par write. `toprows` lisait
+        `embed.weight`, une table — ici il faut faire tourner le modèle. C'est
+        un coût du HARNAIS jouet (l'env construit les banques hors du forward
+        d'entraînement), pas du design : au 350M le write poole les états du
+        tour que le forward vient déjà de calculer.
+        """
+        st = seg_tok.to(self.embed.weight.device).reshape(1, -1)
+        _, h = self.forward(st, bank=None, bank_mask=None, return_hidden=True)
+        return h[0].float().detach()
 
     @torch.no_grad()
     def toprows_sel_fixed(self, seg_tok: torch.Tensor) -> torch.Tensor:
@@ -1464,16 +1526,45 @@ class ToyReadLM(nn.Module):
                           device=dev)
         if not bare:
             out[0] = self.pack_key[slot_id, attr_id].float()
-        toks = self.toprows_sel(seg_tok)
-        n = int(toks.numel())
+        idx = self.toprows_sel_idx(seg_tok)
+        n = int(idx.numel())
         if n:
-            e = rms_unit(self.embed.weight[toks].float())      # [n, d], RMS 1
+            if c.code in HID_CODES:
+                # LA SEULE DIFFÉRENCE DE L'A/B : l'état post-`norm_f` de la
+                # position, au lieu de l'embedding d'entrée du token qui s'y
+                # trouve. `rms_unit` est appliqué des DEUX côtés — sans quoi on
+                # comparerait aussi deux échelles (‖h‖/‖E‖ ≈ ×17 au 350M) et le
+                # bras perdrait pour une raison qui n'est pas la sienne.
+                e = rms_unit(self.seg_hidden(seg_tok)[idx])    # [n, d], RMS 1
+            else:
+                st = seg_tok.to(dev).reshape(-1)
+                e = rms_unit(self.embed.weight[st[idx]].float())  # [n, d], RMS 1
             if c.row_pos_tag:
                 e = rms_unit(e + self.row_pos[:n].float() * c.oracle_ka_scale)
             out[1:1 + n] = e
             if n < c.top_k:            # complète le groupe (cf. docstring)
                 out[1 + n:] = e[-1]
         return out.detach()
+
+    @torch.no_grad()
+    def tophid_rows_fixed(self, seg_tok: torch.Tensor) -> torch.Tensor:
+        """[top_k, d] — les lignes de CONTENU à injecter, taille fixe.
+
+        Le pendant vectoriel de `toprows_sel_fixed` : r4/r5 y transportaient des
+        ID de tokens (le préfixe faisait `embed(inj)`), `tophid` transporte les
+        lignes elles-mêmes puisqu'aucune table ne peut les reconstruire. Même
+        convention de complétion : la dernière ligne est répétée.
+        """
+        k, d = self.cfg.top_k, self.cfg.d_model
+        dev = self.embed.weight.device
+        idx = self.toprows_sel_idx(seg_tok)
+        n = int(idx.numel())
+        if n == 0:                     # segment vide (jamais observé)
+            return torch.zeros(k, d, device=dev)
+        e = rms_unit(self.seg_hidden(seg_tok)[idx])
+        if n < k:
+            e = torch.cat([e, e[-1].expand(k - n, d)])
+        return e[:k].detach()
 
     # ── candidats du readout position-conscient ─────────────────────────────
     def candidates(self, bank, bank_mask):
@@ -1538,9 +1629,16 @@ class ToyReadLM(nn.Module):
         if inject is not None:
             assert self.cfg.variant in INJECT_VARIANTS, self.cfg.variant
             B, T = ids.shape
-            inj = inject if inject.dim() == 3 else inject[:, None, :]
+            # `tophid` transporte des LIGNES ([B,(G,)k,d]), les autres des ID
+            # ([B,(G,)k]) : le dispatch se fait sur le CODE, jamais sur le rang
+            # du tenseur — à G=1 un [B,k,d] de lignes et un [B,G,k] d'ID ont le
+            # même rang, et deviner ferait passer des embeddings pour des index.
+            hid = self.cfg.code in HID_CODES
+            want = 4 if hid else 3
+            inj = inject if inject.dim() == want else inject.unsqueeze(1)
             G, k = inj.shape[1], inj.shape[2]
-            pre = self.embed(inj) + self.inject_type    # [B,G,k,d], NON normé
+            pre = ((inj.to(x.dtype) * self.hid_scale) if hid
+                   else self.embed(inj)) + self.inject_type   # [B,G,k,d]
             sep = self.embed(torch.full((B, G, 1), int(self.cfg.inject_sep_id),
                                         dtype=torch.long, device=ids.device))
             # [groupe0 | sép | groupe1 | sép | …] puis le tour, un cran plus loin
@@ -1802,6 +1900,8 @@ class OracleEnv:
                 # TAILLE FIXE : les plans d'un batch s'empilent, ils doivent
                 # tous faire top_k (cf. toprows_sel_fixed).
                 fifo.append((f[0], f[1],
+                             model.tophid_rows_fixed(self.seg_tokens(seg))
+                             if model.cfg.code in HID_CODES else
                              model.toprows_sel_fixed(self.seg_tokens(seg))))
                 fifo = fifo[-self.max_mem:]
         return plan
@@ -4132,6 +4232,65 @@ def _selftest() -> None:
         f"partagé ou le tirage des poids")
     # … et la MÊME garantie pour `toprows` en readout_mix=linear (le défaut),
     # constante relevée sur le commit 1345f49 (phase 6, avant MoS et r4).
+    # ── phase 9 : `tophid` — la ligne est un ÉTAT POST-NORM, pas un embedding ─
+    K9 = 5
+    m_tr9 = _mk("toprows", d=512, top_k=K9)
+    m_th9 = _mk("tophid", d=512, top_k=K9)
+    # (a) la SÉLECTION est la même opération : refactoriser toprows_sel en
+    #     toprows_sel_idx ne doit pas avoir déplacé un seul token.
+    assert torch.equal(m_tr9.toprows_sel(seg20),
+                       seg20.reshape(-1)[m_tr9.toprows_sel_idx(seg20)])
+    assert torch.equal(m_tr9.toprows_sel_idx(seg20),
+                       m_th9.toprows_sel_idx(seg20)), \
+        "tophid doit sélectionner AUX MÊMES POSITIONS que toprows"
+    g_tr = m_tr9.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
+    g_th = m_th9.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
+    # (b) même LAYOUT, même clé : seul le contenu des lignes 1.. change.
+    assert g_tr.shape == g_th.shape == (1 + K9, 512), (g_tr.shape, g_th.shape)
+    assert torch.equal(g_tr[0], g_th[0]), \
+        "la ligne-clé doit être IDENTIQUE : l'A/B ne porte que sur le contenu"
+    assert not torch.equal(g_tr[1:], g_th[1:]), \
+        "les lignes de contenu doivent DIFFÉRER, sinon l'A/B ne mesure rien"
+    # (c) les lignes post-norm sont normées comme celles de toprows (RMS 1) :
+    #     sans ça le bras perdrait sur l'ÉCHELLE et pas sur son contenu.
+    for g in (g_tr, g_th):
+        r = g[1:].pow(2).mean(-1).sqrt()
+        assert float((r - 1.0).abs().max()) < 1e-4, float(r.max())
+    # (d) AUCUN gradient ne traverse la banque (invariant du design) — et
+    #     `seg_hidden` a bien débranché la banque pour se calculer.
+    assert not g_th.requires_grad
+    assert m_th9.seg_hidden(seg20).shape == (int(seg20.numel()), 512)
+    # (e) l'injection transporte des LIGNES, pas des ID, et son contenu compte.
+    m_i9 = ToyReadLM(ToyCfg(vocab_size=512, d_model=64, n_layers=1, n_heads=4,
+                            mem_dim=64, variant="r4", max_seq_len=64,
+                            code="tophid", top_k=3, seg_n_pos=8, sif_a=A_SIF),
+                     env.n_slots, env.n_attrs, sif_w=_sifw(512)).eval()
+    rows9 = m_i9.tophid_rows_fixed(seg20)
+    assert rows9.shape == (3, 64) and not rows9.requires_grad
+    ids9 = torch.tensor([[5, 6, 7]])
+    with torch.no_grad():
+        o_nu = m_i9(ids9, None, None)
+        o_a = m_i9(ids9, None, None, inject=rows9[None])           # [B,k,d]
+        o_b = m_i9(ids9, None, None, inject=rows9[None, None])     # [B,1,k,d]
+        o_c = m_i9(ids9, None, None, inject=rows9[None] * 0.5)
+    assert torch.equal(o_a, o_b), "[B,k,d] et [B,1,k,d] doivent coïncider"
+    assert not torch.equal(o_a, o_nu), "l'injection doit changer le forward"
+    assert not torch.equal(o_a, o_c), "le CONTENU de la ligne doit compter"
+    # (f) `hid_scale` existe, vaut 1.0 à l'init (⇒ la ligne entre telle quelle)
+    #     et reçoit du gradient — sinon le confondant d'échelle reste non traité.
+    assert float(m_i9.hid_scale) == 1.0
+    assert not hasattr(m_tr9, "hid_scale"), \
+        "toprows ne doit PAS gagner de paramètre : le bras resterait comparable"
+    m_i9.zero_grad()
+    m_i9(ids9, None, None, inject=rows9[None]).sum().backward()
+    assert m_i9.hid_scale.grad is not None and \
+        float(m_i9.hid_scale.grad.abs()) > 0, "hid_scale sans gradient"
+    # (g) le NOMMAGE sépare les deux bras (sinon un run écrase l'autre).
+    assert run_name_for(m_tr9.cfg).replace("r3", "r4") != \
+        run_name_for(m_th9.cfg).replace("r3", "r4")
+    # (top_k=3 ≠ défaut ⇒ suffixe _k3, cf. le sweep de k : c'est voulu)
+    assert run_name_for(m_i9.cfg) == "r4_tophid_k3", run_name_for(m_i9.cfg)
+
     torch.manual_seed(4242)
     m_r2 = _mk("toprows", d=64, n_pos=4, vocab=512, seg_n_pos=8, top_k=3)
     rows_r2 = m_r2.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
@@ -4228,6 +4387,14 @@ def _selftest() -> None:
           "retr_topk/retr_train_groups/order/ce/detach entrent tous dans le "
           "save_dir, 7 configs r5 ⇒ 7 noms DISTINCTS (r5_toprows reste le run "
           "de référence à G=1)")
+    print("  phase 9 — TOPHID (la ligne est l'état POST-`norm_f`, pas "
+          "l'embedding d'entrée) : MÊME sélection SIF aux MÊMES positions, "
+          "MÊME clé ligne 0, MÊME layout 1+top_k, MÊME RMS 1 — seul le vecteur "
+          "normé change (l'A/B est isolé à ce point) ; banque detachée et "
+          "`seg_hidden` calculé banque DÉBRANCHÉE ; injection par LIGNES "
+          "([B,k,d] ≡ [B,1,k,d], contenu ET échelle comptent), `hid_scale` "
+          "init 1.0 et dérivable, absent de toprows (bras comparables) ; "
+          "r4_tophid ≠ r4_toprows au nommage")
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "
