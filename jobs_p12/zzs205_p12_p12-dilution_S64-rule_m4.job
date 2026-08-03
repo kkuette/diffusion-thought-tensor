@@ -1,0 +1,13 @@
+# Labo jouet PHASE 12 — maintenance PROCÉDURALE (S6) et dilution (S8), spec §2.3/§2.8
+# S8 — COURBE DE DILUTION (KT8 au jouet) : où l'attention PLATE
+# s'écroule-t-elle quand la banque grandit ?
+# cellule p12-dilution_S64-rule_m4 : bras S64-rule, env rule, S=64 m=4 | ~47.1 M params, VRAM est. 2.24 Go
+# Base = le sommet ADOPTÉ du carré factoriel : --tap postnorm (S1 tranché), read kv_proj.
+# ⚠️ AUCUN RL : la maintenance est hors graphe, seul le read apprend (spec §2.9).
+# Adjudication (règle durcie 08-03) : nll_live ABSOLU apparié + grade décodé + r@1 — jamais le Δnll intra-modèle.
+# Sorties : $TB_MNT/checkpoints/toy_read_lab_p12/p12-dilution_S64-rule_m4/  (metrics.csv, results.json, ckpts)
+set -o pipefail
+export TB_ROOT="$TB_MNT"
+mkdir -p "$TB_MNT/runs/toy_read_lab_p12"
+python -u -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml --read kv_proj --tap postnorm --m 4 --p12-exam dilution --p11-env rule --max-mem 64 --bank-fill foreign --cond-decoys 0 --steps 3000 --cond --device cuda \
+  2>&1 | tee $TB_MNT/runs/toy_read_lab_p12/p12-dilution_S64-rule_m4.log
