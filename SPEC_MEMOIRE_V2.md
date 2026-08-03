@@ -373,7 +373,7 @@ verdict. Rien d'autre n'est ouvert.
 | S13 | self-writes : boucle fermée maîtrisable | horizon de divergence self-writes ON/OFF (+ KT10 scheduled sampling comme levier) | à lancer | si OFF >> ON, la capture self recule vers `<think>`-seul |
 | S14 | copie indue (négatifs copy-head) | KT7 : wrong-slot / slot-périmé, calibration `log_alpha` | avant toute démo de rappel | taux de copie indue = métrique de première classe |
 | S15 | falaise layout | KT9 : varier nombre/ordre de groupes à l'éval sur le ckpt copy | à lancer | fixe la normalisation §4.3 |
-| S16 | mem_dim (taille de slot) | stats atomes/tour sur corpus réel (recall_env + data SOTA) ; masque de vide au softmax | à chiffrer (cheap, CPU) | mem_dim = quantile haut atomes/tour + marge propagation — jamais une fraction de seq_len |
+| S16 | mem_dim (taille de slot) | `analysis/s16_memdim_stats.py` (recall_env exact + ultrachat proxy SIF) | **FAIT 08-03** | recall_env : ≤10 tokens/tour (mem_dim 16 confirmé, seq_len/2 réfuté), write 0,234 ⇒ horizon ×4,27 ; ultrachat : assistant p50 37 candidats ≫ k=13 (les tours longs saturent la sélection ⇒ rôle du `<think>`-synthèse), write 0,944 ⇒ en chat dense la dédup n'étire pas l'horizon — la charge est sur la propagation (S6) |
 | S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr4xx` sur l'env `span` (longueurs MESURÉES 1..6, grade par strate de longueur) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
 
 ## 4. Corrections pré-run (état)
