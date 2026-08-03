@@ -459,6 +459,23 @@ class ToyCfg:
                               # plus rot(0)=identité, donc son token ne se
                               # superpose plus à K/A (qui, eux, ne sont jamais
                               # tournés). Cf. phase_tables pour le wrap.
+    # ── COMPOSITION DU GRADIENT de la boucle fast-weight (correctif terrain) ─
+    fw_additive: bool = False  # stop-gradient sur l'ÉTAT PORTÉ de la boucle
+                              # séquentielle de FastWeightRead : chaque
+                              # itération lit y0 + (y − y0).detach() au lieu de
+                              # y. Le FORWARD est numériquement IDENTIQUE (même
+                              # valeur, autre graphe) ; seul le BACKWARD change
+                              # — le produit de jacobiennes sur M×n_layers
+                              # étages disparaît, chaque slot ne garde que le
+                              # gradient LOCAL de son propre `upd`.
+                              # POURQUOI : mesuré sur la ferme, le bras `seq_fw`
+                              # multiplicatif diverge dans 5 cellules sur 6
+                              # (gnorm pré-clip 1e4 → 4.7e9, loss 6.8-11.3,
+                              # Δnll de citation NÉGATIF) ; seule survit la
+                              # cellule à M minimal. grad_clip ne corrige que
+                              # la norme, pas la direction. Cf. FastWeightRead.
+                              # DÉFAUT OFF : le bras divergent EST une donnée
+                              # de la grille, on ne le réécrit pas.
     # ── axe CHEMIN DE LECTURE (phase 10, spec §2.4 « VUE PLATE + ATTENTION »)
     read_path: str = "entry"  # OÙ les lignes entrent, pour les variantes
                               # d'injection :
@@ -612,6 +629,14 @@ class ToyCfg:
                 f"pos_offset {self.pos_offset} >= n_pos {npos} : TOUTES les "
                 f"positions wrappent sur l'identité")
         # ── phase 10 : prélèvement, âge, conditionnement ────────────────────
+        if self.fw_additive:
+            assert self.uses_fw, (
+                f"code.fw_additive change la COMPOSITION DU GRADIENT de la "
+                f"boucle séquentielle de FastWeightRead : il n'a de sens que "
+                f"pour les variantes qui en portent une ({'/'.join(v for v in VARIANTS if v in ('r0', 'r2'))} "
+                f"— le bras `--read seq_fw` de la grille). Reçu --variant "
+                f"{self.variant}, qui lit par ATTENTION : il n'y a aucune "
+                f"boucle à rendre additive, le flag serait un no-op silencieux.")
         assert self.read_path in READ_PATHS, (
             f"read_path inconnu {self.read_path!r} (∈ {READ_PATHS})")
         if self.read_path != "entry":
@@ -900,12 +925,46 @@ class FastWeightRead(nn.Module):
     na=2), fw_B la remontée, application SÉQUENTIELLE sur les M slots (les
     transformations se composent en profondeur), résiduel via fw_o sur l'écart
     au point de départ normalisé.
+
+    ── `cfg.fw_additive` (phase 10, correctif terrain) ──────────────────────
+    VERDICT MESURÉ sur la ferme (6 premières cellules `seq_fw` de la grille
+    §2.4, ~1500 steps) : le bras DIVERGE dans 5 cellules sur 6 — gnorm PRÉ-CLIP
+    de 1e4 à 4.7e9, loss coincée entre 6.8 et 11.3, et Δnll de citation NÉGATIF
+    (la banque NUIT contre le bras ablaté). Seule cellule saine :
+    `rot-on_tap-mid_m1` (loss 3.59, gnorm 1.26) — c'est-à-dire celle qui a le
+    MOINS d'itérations. Le `grad_clip` du harnais n'y peut rien : il rescale la
+    NORME, mais la DIRECTION reste dominée par le produit de jacobiennes
+    accumulé sur 16 à 72 itérations × n_layers couches.
+
+    DIAGNOSTIC. La boucle est déjà résiduelle en FORWARD (`y = y + upd`), mais
+    pas en BACKWARD : `upd_i` est calculé à partir de `y_{i-1}`, donc
+    ∂y_M/∂θ_i traverse ∏_{j>i} (I + ∂upd_j/∂y). Ce produit est exactement ce
+    qui explose — c'est la pathologie classique du RNN profond, ici avec M×L
+    étages et aucune porte pour l'amortir.
+
+    LE FIX. Stop-gradient sur l'ÉTAT PORTÉ : chaque itération lit
+    `yin = y0 + (y - y0).detach()` au lieu de `y`.
+      * `y0` GARDE son gradient  ⇒ le chemin REQUÊTE apprend encore (h → y0 →
+        chaque upd_i), c'est lui qui porte « ce que la couche demande à la
+        banque ».
+      * l'ACCUMULÉ `(y - y0)` est coupé ⇒ plus AUCUN produit de jacobiennes.
+      * chaque slot garde le gradient LOCAL de son propre `upd_i` par le terme
+        additif final (`y - y0 = Σ_i upd_i`), donc fw_A/fw_B/la banque du slot
+        i reçoivent toujours un signal — il est simplement devenu ADDITIF au
+        lieu de MULTIPLICATIF.
+    PROPRIÉTÉ CLÉ : `y0 + (y - y0).detach()` vaut NUMÉRIQUEMENT `y`. Le
+    forward est donc identique bit-à-bit ; SEUL le backward change. C'est ce
+    qui rend le flag comparable au bras multiplicatif à poids égaux.
+
+    Défaut OFF : le bras multiplicatif divergent EST une donnée de la grille,
+    on ne le réécrit pas rétroactivement.
     """
 
     def __init__(self, cfg: ToyCfg):
         super().__init__()
         d, r = cfg.d_model, cfg.fw_rank
         self.r, self.d = r, d
+        self.additive = bool(cfg.fw_additive)
         self.fw_A = nn.Linear(cfg.mem_dim, 2 * r * d, bias=False)
         self.fw_B = nn.Linear(cfg.mem_dim, d * r, bias=False)
         self.fw_o = nn.Linear(d, d, bias=False)
@@ -925,8 +984,17 @@ class FastWeightRead(nn.Module):
         y0 = self.norm_fw(h)
         y = y0
         for i in range(M):
-            zg = torch.einsum("brd,btd->btr", A[:, i, 0], y) * ds
-            zv = torch.einsum("brd,btd->btr", A[:, i, 1], y) * ds
+            # `yin` == `y` en VALEUR, au BIT PRÈS, et n'en diffère que par le
+            # graphe. ⚠️ L'ÉCRITURE COMPTE : `y0 + (y − y0).detach()` a la
+            # bonne sémantique mais PAS la bonne arithmétique — en flottant,
+            # a + (b − a) ≠ b (mesuré : le self-test de bit-à-bit tombe).
+            # `y.detach() + (y0 − y0.detach())` ajoute un tenseur EXACTEMENT
+            # nul (x − x = 0 pour tout x fini) et porte le gradient de y0 :
+            #   ∂yin/∂y0 = 1        ⇒ le chemin REQUÊTE apprend
+            #   ∂yin/∂(Σ upd_j) = 0 ⇒ plus aucun produit de jacobiennes
+            yin = (y.detach() + (y0 - y0.detach())) if self.additive else y
+            zg = torch.einsum("brd,btd->btr", A[:, i, 0], yin) * ds
+            zv = torch.einsum("brd,btd->btr", A[:, i, 1], yin) * ds
             z = (F.silu(zg) * zv).clamp(-8.0, 8.0)
             upd = torch.einsum("bdr,btr->btd", Bm[:, i], z) * rs
             y = y + self.drop(upd)
@@ -3022,6 +3090,10 @@ def grid_name(cfg: ToyCfg) -> str:
             f"_rot-{'on' if cfg.age_rope else 'off'}"
             f"_tap-{GRID_TAP.get(cfg.code, cfg.code)}"
             f"_m{cfg.top_k}")
+    if cfg.fw_additive:
+        # Le bras multiplicatif divergent est une DONNÉE de la grille : les
+        # cellules additives ne doivent jamais atterrir sur son dossier.
+        name += "_fwadd"
     if cfg.cond_arm != ToyCfg.cond_arm:
         name += f"_arm-{cfg.cond_arm}"
     if cfg.cond_decoys != ToyCfg.cond_decoys:
@@ -3033,7 +3105,7 @@ def grid_name(cfg: ToyCfg) -> str:
 
 def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
                 rots=(False, True), taps=("postnorm", "mid"),
-                ms=(1, 4, 8)) -> list:
+                ms=(1, 4, 8), fw_additive: bool = False) -> list:
     """La GRILLE COMPLÈTE, en clair. Un dict par combo, dans un ordre stable."""
     out = []
     for rd in reads:
@@ -3041,8 +3113,25 @@ def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
             for m in ms:
                 for rot in rots:
                     out.append({"read": rd, "age_rot": bool(rot), "tap": tp,
-                                "m": int(m)})
+                                "m": int(m),
+                                # le correctif ne s'applique QU'au bras à
+                                # boucle : demander l'additif sur les bras
+                                # attention n'aurait aucun sens (et ToyCfg le
+                                # refuse).
+                                "fw_additive": bool(fw_additive)
+                                and rd == "seq_fw"})
     return out
+
+
+# sous-ensembles nommés du manifeste (cf. --manifest-subset)
+GRID_SUBSETS = {
+    "all":            dict(),
+    "seqfw":          dict(reads=("seq_fw",)),
+    # LES 12 CELLULES DU CORRECTIF : mêmes axes rot/tap/m, gradient ADDITIF,
+    # noms suffixés _fwadd ⇒ elles n'écrasent pas le bras multiplicatif.
+    "seqfw-additive": dict(reads=("seq_fw",), fw_additive=True),
+    "attn":           dict(reads=("inject_entry", "kv_append")),
+}
 
 
 def _grid_cfg(combo: dict, base: dict) -> ToyCfg:
@@ -3051,11 +3140,13 @@ def _grid_cfg(combo: dict, base: dict) -> ToyCfg:
             "mid": "midhid"}[combo["tap"]] if c is None else c
     return ToyCfg(**{**base, "variant": v, "code": code, "read_path": rp,
                      "age_rope": combo["age_rot"], "top_k": int(combo["m"]),
+                     "fw_additive": bool(combo.get("fw_additive")),
                      "cond": True})
 
 
 def print_grid_manifest(config: str, base: dict, save_root: str,
-                        fmt: str = "tsv", b_convs: int = 8) -> None:
+                        fmt: str = "tsv", b_convs: int = 8,
+                        subset: str = "all") -> None:
     """Le MANIFESTE : une ligne par combo, commande exacte + coût estimé.
 
     Colonnes : run | read | rot | tap | m | lignes_lues | commande | note.
@@ -3069,7 +3160,7 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
                  sans allonger la séquence des queries.
     """
     rows = []
-    for combo in grid_combos():
+    for combo in grid_combos(**GRID_SUBSETS[subset]):
         cfg = _grid_cfg(combo, base)
         m = combo["m"]
         G = cfg.cond_groups
@@ -3084,7 +3175,8 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
             unit = "pos. préfixe"
         cmd = (f"python -m deepseek_v4_mini.toy_read_lab {config} --cond "
                f"--read {combo['read']} --tap {combo['tap']} --m {m}"
-               + (" --age-rot" if combo["age_rot"] else ""))
+               + (" --age-rot" if combo["age_rot"] else "")
+               + (" --fw-additive" if combo.get("fw_additive") else ""))
         # COÛT : mesuré, pas deviné. `params` vient de param_report aux dims
         # de la config ; `rel` est le rapport de temps par pas RELEVÉ sur CPU à
         # dims RÉELLES (d512/L6, batch_convs=2, 2 pas) — c'est le RATIO entre
@@ -3104,6 +3196,13 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
         note = ("boucle fast-weight de %d itérations × %d couches : le bras "
                 "LENT (×2.0 relevé)" % (load, cfg.n_layers)
                 if combo["read"] == "seq_fw" else "")
+        if combo.get("fw_additive"):
+            note += (" | gradient ADDITIF (stop-grad sur l'état porté) : "
+                     "forward inchangé, plus de produit de jacobiennes")
+        elif combo["read"] == "seq_fw":
+            note += (" | gradient MULTIPLICATIF : DIVERGE sur la ferme dans "
+                     "5 cellules sur 6 (gnorm pré-clip jusqu'à 4.7e9) — "
+                     "cf. --manifest-subset seqfw-additive")
         if vram > 8.0:
             note = (note + " | ⚠️ NE TIENT PAS EN 8 Go "
                     f"({vram:.1f} Go estimés) — à lancer ailleurs, PAS à "
@@ -3173,6 +3272,8 @@ def run_name_for(cfg: ToyCfg) -> str:
             name += "_nodetach"
     if cfg.write_mode == "every":
         name += "_wev"
+    if cfg.fw_additive:
+        name += "_fwadd"
     # ── phase 10 : chaque axe de la grille §2.4 entre dans le nom ───────────
     if cfg.read_path != ToyCfg.read_path:
         name += f"_{cfg.read_path}"
@@ -3312,6 +3413,22 @@ def main(argv=None):
     ap.add_argument("--cond-eval-convs", type=int, default=None,
                     dest="cond_eval_convs",
                     help="vies-règle gradées par passe d'éval contrastive")
+    ap.add_argument("--fw-additive", action="store_true", dest="fw_additive",
+                    help="CORRECTIF TERRAIN du bras `--read seq_fw` : rend la "
+                         "composition du gradient de la boucle fast-weight "
+                         "ADDITIVE (stop-gradient sur l'état porté). Le "
+                         "forward est numériquement INCHANGÉ, seul le backward "
+                         "l'est — le produit de jacobiennes sur M×n_layers "
+                         "étages disparaît. Défaut OFF (le bras multiplicatif "
+                         "divergent est une donnée de la grille). Ajoute "
+                         "_fwadd au save_dir. Refusé hors variantes à boucle.")
+    ap.add_argument("--manifest-subset", default="all",
+                    choices=("all", "seqfw", "seqfw-additive", "attn"),
+                    dest="manifest_subset",
+                    help="restreint le manifeste : all (36) | seqfw (les 12 "
+                         "cellules fast-weight) | seqfw-additive (les MÊMES 12 "
+                         "axes rot/tap/m avec --fw-additive, noms suffixés "
+                         "_fwadd) | attn (les 24 cellules inject/kv)")
     ap.add_argument("--manifest", choices=("tsv", "json"), default=None,
                     help="n'entraîne RIEN : imprime le MANIFESTE de la grille "
                          "§2.4 (36 combos, commande exacte, save_dir et coût "
@@ -3390,7 +3507,7 @@ def main(argv=None):
     # ── PHASE 10 : knobs YAML puis surcharges CLI ──────────────────────────
     for key, cast in (("hid_tap", float), ("age_rope", bool),
                       ("read_path", str), ("cond_arm", str),
-                      ("cond_decoys", int)):
+                      ("cond_decoys", int), ("fw_additive", bool)):
         if key in cb:
             mc[key] = cast(cb[key])
     if a.read is not None:
@@ -3399,6 +3516,8 @@ def main(argv=None):
         mc["age_rope"] = True
     if a.m_rows is not None:
         mc["top_k"] = int(a.m_rows)
+    if a.fw_additive:
+        mc["fw_additive"] = True
     if a.cond_arm is not None:
         mc["cond_arm"] = a.cond_arm
     if a.cond_decoys is not None:
@@ -3410,7 +3529,8 @@ def main(argv=None):
                        if k not in ("variant", "code", "read_path", "age_rope",
                                     "top_k", "cond")},
             t.get("save_dir", "./checkpoints/toy_read_lab"), a.manifest,
-            b_convs=int(t.get("batch_convs", 8)))
+            b_convs=int(t.get("batch_convs", 8)),
+            subset=a.manifest_subset)
         return
     if a.readout_mix is not None:          # la CLI gagne sur le YAML
         mc["readout_mix"] = a.readout_mix
@@ -3622,6 +3742,19 @@ def main(argv=None):
               + f" | m = {cfg.top_k} ligne(s)/write | âge "
               + ("ROTÉ (DFT sur max_mem rangs de récence)" if cfg.age_rope
                  else "non codé"), flush=True)
+    if cfg.uses_fw:
+        n_sub = cfg.max_mem * (cfg.group_rows if cfg.code in GROUP_CODES else 1)
+        print(f"  boucle fast-weight : {n_sub} sous-slots × {cfg.n_layers} "
+              f"couches, gradient "
+              + ("ADDITIF (stop-grad sur l'état porté : chaque slot ne rend "
+                 "que le gradient LOCAL de son propre upd ; le forward est "
+                 "numériquement IDENTIQUE au bras multiplicatif)"
+                 if cfg.fw_additive else
+                 "MULTIPLICATIF (produit de jacobiennes sur les "
+                 f"{n_sub * cfg.n_layers} étages) — ⚠️ MESURÉ DIVERGENT sur "
+                 f"5 cellules /6 de la grille (gnorm pré-clip 1e4 → 4.7e9, "
+                 f"Δnll de citation NÉGATIF) ; --fw-additive est le correctif"),
+              flush=True)
     if cfg.cond:
         print(f"  CONDITIONNEMENT : {len(COND_REGISTERS)} registres "
               f"(clé de groupe IDENTIQUE pour tous ⇒ l'identité du registre "
@@ -3898,6 +4031,7 @@ def main(argv=None):
                   "tap": GRID_TAP.get(cfg.code, cfg.code),
                   "m": cfg.top_k, "cond_arm": cfg.cond_arm,
                   "cond_decoys": cfg.cond_decoys,
+                  "fw_additive": bool(cfg.fw_additive),
                   "hid_tap_layers": cfg.hid_tap_layers,
                   "d_model": cfg.d_model, "n_layers": cfg.n_layers,
                   "max_mem": cfg.max_mem},
@@ -5501,6 +5635,99 @@ def _selftest() -> None:
     for kk in ("mark_live", "mark_shuf", "mark_none", "acc_live", "dnll_none"):
         assert ec[kk] == ec[kk], f"{kk} NaN : la métrique ne sort pas"
     assert 0.0 <= ec["acc_live"] <= 1.0
+    # ── 21g-bis. CORRECTIF TERRAIN : gradient ADDITIF de la boucle seq_fw ───
+    # Le bras multiplicatif DIVERGE sur la ferme (5 cellules /6, gnorm pré-clip
+    # jusqu'à 4.7e9). Le fix est un stop-gradient sur l'état porté. Ce qu'il
+    # faut prouver ici : (a) le forward ne bouge pas D'UN BIT, (b) le backward,
+    # lui, bouge, (c) sous ON les termes produits ont disparu, (d) le flag est
+    # refusé là où il n'y a pas de boucle.
+    _base10 = dict(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF, seg_n_pos=8,
+                   inject_sep_id=5, max_mem=8)
+
+    def _mk_fw(additive, M=8, top_k=3, seed=31337):
+        torch.manual_seed(seed)
+        c = ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, variant="r0", max_seq_len=64, code="tophid",
+                   top_k=top_k, seg_n_pos=8, sif_a=A_SIF, max_mem=M,
+                   fw_additive=additive)
+        return ToyReadLM(c, env.n_slots, env.n_attrs, sif_w=_sifw(512))
+
+    def _fw_grad(model, M_lines, scale=1.0, seed=99):
+        """(sortie, gnorm total) sur une banque tirée à `scale` donnée."""
+        torch.manual_seed(seed)
+        bk = torch.randn(2, M_lines, 64) * scale
+        bm = torch.ones(2, M_lines, dtype=torch.bool)
+        ids = (torch.arange(12).reshape(2, 6) * 41) % 512
+        model.zero_grad(set_to_none=True)
+        out = model(ids, bk, bm)
+        out.float().pow(2).mean().backward()
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e30)
+        return out.detach(), float(gn)
+
+    # (a) FORWARD IDENTIQUE BIT-À-BIT — c'est ce qui rend les deux bras
+    #     comparables à poids égaux (seul le graphe diffère).
+    m_off, m_on = _mk_fw(False), _mk_fw(True)
+    assert m_off.blocks[0].read.additive is False
+    assert m_on.blocks[0].read.additive is True
+    o_off, g_off = _fw_grad(m_off, 8)
+    o_on, g_on = _fw_grad(m_on, 8)
+    assert torch.equal(o_off, o_on), (
+        "le forward DOIT être bit-à-bit identique : y0 + (y − y0).detach() "
+        "vaut y en VALEUR, seul le graphe change")
+    # (b) les GRADIENTS diffèrent (sinon le fix ne ferait rien)
+    d_max = max(float((p.grad - q.grad).abs().max())
+                for (_, p), (_, q) in zip(m_off.named_parameters(),
+                                          m_on.named_parameters())
+                if p.grad is not None and q.grad is not None)
+    assert d_max > 0.0, "gradients identiques : le stop-grad n'a pas mordu"
+    # (c) LES TERMES PRODUITS ONT DISPARU. Sur un M GRAND et une banque à forte
+    #     échelle, le bras multiplicatif compose M jacobiennes et sa gnorm
+    #     explose de plusieurs ordres ; l'additif reste borné. On exige un
+    #     rapport franc, pas un epsilon.
+    m_off_big, m_on_big = _mk_fw(False, M=64), _mk_fw(True, M=64)
+    _, gb_off = _fw_grad(m_off_big, 64, scale=6.0)
+    _, gb_on = _fw_grad(m_on_big, 64, scale=6.0)
+    assert gb_on < gb_off / 100.0, (
+        f"le gradient additif n'a pas amorti la boucle : additif {gb_on:.3e} "
+        f"contre multiplicatif {gb_off:.3e} (rapport "
+        f"{gb_off / max(gb_on, 1e-30):.1f}×)")
+    assert gb_on == gb_on and gb_on < 1e6, f"gnorm additive non bornée {gb_on}"
+    # et la MONOTONIE du fléau : à M=64 le multiplicatif est bien pire qu'à
+    # M=8, alors que l'additif ne se dégrade pas dans les mêmes proportions.
+    _, g8_off = _fw_grad(_mk_fw(False, M=8), 8, scale=6.0)
+    _, g8_on = _fw_grad(_mk_fw(True, M=8), 8, scale=6.0)
+    assert gb_off / max(g8_off, 1e-30) > gb_on / max(g8_on, 1e-30), (
+        "la gnorm multiplicative doit se dégrader AVEC M plus vite que "
+        f"l'additive (mult {g8_off:.2e}→{gb_off:.2e}, add "
+        f"{g8_on:.2e}→{gb_on:.2e})")
+    # (e) refusé là où il n'y a PAS de boucle (bras attention)
+    for var, code in (("r1", "mean"), ("r3", "tophid"), ("r4", "tophid")):
+        try:
+            ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF, top_k=3,
+                   variant=var, code=code, fw_additive=True)
+        except AssertionError as e:
+            assert "fw_additive" in str(e), str(e)
+        else:
+            raise AssertionError(
+                f"fw_additive aurait dû être refusé pour {var}/{code}")
+    # NOMMAGE : la cellule additive ne peut pas écraser la multiplicative
+    assert grid_name(_mk_fw(True).cfg) != grid_name(_mk_fw(False).cfg)
+    assert grid_name(_mk_fw(True).cfg).endswith("_fwadd"), \
+        grid_name(_mk_fw(True).cfg)
+    # le SOUS-ENSEMBLE de manifeste : 12 cellules, toutes additives, 12 noms
+    _add = grid_combos(**GRID_SUBSETS["seqfw-additive"])
+    assert len(_add) == 12 and all(c["fw_additive"] for c in _add)
+    _addn = [grid_name(_grid_cfg(c, _base10)) for c in _add]
+    assert len(set(_addn)) == 12 and all(n.endswith("_fwadd") for n in _addn)
+    assert not (set(_addn) & {grid_name(_grid_cfg(c, _base10))
+                              for c in grid_combos()}), \
+        "une cellule additive écraserait une cellule multiplicative"
+    # et l'additif ne DÉBORDE PAS sur les bras attention
+    assert not any(c["fw_additive"] for c in
+                   grid_combos(fw_additive=True) if c["read"] != "seq_fw")
+
     # 21h. NOMMAGE : les quatre axes séparent les dossiers (aucun run écrasé).
     _n10 = {run_name_for(_mk_inj(**kw).cfg) for kw in (
         {}, {"age_rope": True}, {"read_path": "kv"}, {"cond": True},
@@ -5511,12 +5738,9 @@ def _selftest() -> None:
                                 read_path="kv").cfg) == \
         "read-kvappend_rot-on_tap-postnorm_m3", _n10
     # la GRILLE : 36 combos, 36 noms DISTINCTS, et le nom se relit
-    _base = dict(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
-                 mem_dim=64, max_seq_len=64, sif_a=A_SIF, seg_n_pos=8,
-                 inject_sep_id=5, max_mem=8)
     _cmb = grid_combos()
     assert len(_cmb) == 36, len(_cmb)
-    _gn = [grid_name(_grid_cfg(cc, _base)) for cc in _cmb]
+    _gn = [grid_name(_grid_cfg(cc, _base10)) for cc in _cmb]
     assert len(set(_gn)) == 36, sorted(_gn)
     assert "read-seqfw_rot-off_tap-mid_m4" in _gn, sorted(_gn)
     # 21i. les GARDE-FOUS : chaque axe refuse les combinaisons qui seraient
@@ -5654,6 +5878,19 @@ def _selftest() -> None:
           f"récence, no-op hors vie-règle ; evaluate_cond rend ses 3 lectures. "
           f"(e) 7 configs de la grille ⇒ 7 save_dir distincts, et 5 "
           f"combinaisons no-op sont REFUSÉES à la construction.", flush=True)
+    print(f"  correctif seq_fw — GRADIENT ADDITIF (code.fw_additive, défaut "
+          f"OFF) : le forward est identique BIT-À-BIT (l'écriture "
+          f"`y.detach() + (y0 − y0.detach())` ajoute un zéro EXACT ; la forme "
+          f"naïve `y0 + (y − y0).detach()` échouait ce test), les GRADIENTS "
+          f"diffèrent, et le produit de jacobiennes a disparu : à M=64 sur "
+          f"une banque à forte échelle, gnorm multiplicative {gb_off:.2e} "
+          f"contre additive {gb_on:.2e} ({gb_off / max(gb_on, 1e-30):.0f}×), "
+          f"et la dégradation avec M est bien plus forte côté multiplicatif "
+          f"(M=8→64 : ×{gb_off / max(g8_off, 1e-30):.0f} contre "
+          f"×{gb_on / max(g8_on, 1e-30):.1f}). Refusé sur r1/r3/r4 (aucune "
+          f"boucle), suffixe _fwadd au save_dir, et le sous-ensemble de "
+          f"manifeste `seqfw-additive` rend 12 cellules dont AUCUNE ne "
+          f"collisionne avec le bras multiplicatif.", flush=True)
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "
