@@ -134,6 +134,21 @@ tenseur à taille CONSTANTE conservé (CUDA-graphs), et les lignes vides MASQUÉ
 du softmax — le vide ne coûte alors ni dilution ni signal, seulement de la
 mémoire. Chiffrage sur corpus réel = §3-S16.
 
+**PRINCIPE DE SUFFISANCE (user 08-03, prime sur tout le reste du budget)** :
+au tour t, la banque doit contenir TOUT le contexte encore intéressant de la
+session — partie agent comprise — c'est-à-dire la STATISTIQUE SUFFISANTE pour
+continuer. C'est le sens opérationnel du RESET (§6.4) : après reset la banque
+est tout ce qui reste ; ce qui n'y est pas est perdu. Conséquence : la
+capacité se dimensionne sur le STOCK utile à l'instant t, pas sur le flux par
+tour — et le chiffrage S16 rend le principe exigeant (chat dense : ~30 atomes
+nouveaux/tour × 100 tours ≈ 3000 pour 128 lignes à 8×16). La banque ne peut
+pas tenir l'union de tout-ce-qui-fut-intéressant : elle tient
+ce-qui-est-ENCORE-intéressant, un ensemble que la maintenance FABRIQUE —
+l'oubli (propagation/rétention S6) n'est pas une fuite, c'est le mécanisme qui
+rend la suffisance tenable ; le `<think>`-synthèse compresse quand le flux
+déborde k ; les self-writes sont non négociables (les engagements de l'agent
+font partie de la statistique suffisante). Mesure du stock réel = S18.
+
 **Comptabilité de capacité** : l'accumulation k×T des tours ne s'empile PAS
 dans mem_dim — elle consomme des SLOTS (un tour = un write = un slot FIFO).
 Factorisation propre des cadrans : mem_dim = largeur d'UN tour (invariant en
@@ -385,6 +400,7 @@ verdict. Rien d'autre n'est ouvert.
 | S15 | falaise layout | KT9 : varier nombre/ordre de groupes à l'éval sur le ckpt copy | à lancer | fixe la normalisation §4.3 |
 | S16 | mem_dim (taille de slot) | `analysis/s16_memdim_stats.py` (recall_env exact + ultrachat proxy SIF∪numérique v2) | **FAIT 08-03** | recall_env : ≤10 tokens/tour (mem_dim 16 confirmé, seq_len/2 réfuté), write 0,234 ⇒ horizon ×4,27 ; ultrachat : assistant p50 38 candidats ≫ k=13 (les tours longs saturent la sélection ⇒ rôle du `<think>`-synthèse), write 0,944 ⇒ en chat dense la dédup n'étire pas l'horizon — la charge est sur la propagation (S6) ; part numérique hors-SIF ~2 % sur ultrachat MAIS le biais chiffres porte sur code/outils (KT3) ⇒ sélecteur déployé = SIF ∪ copy_mask procédural (§2.3), à re-mesurer sur corpus agentique |
 | S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr4xx` sur l'env `span` (longueurs MESURÉES 1..6, grade par strate de longueur) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
+| S18 | STOCK utile à l'instant t (principe de suffisance §2.2) | empreinte de référence arrière sur corpus réel : combien de contenu antérieur (et à quelle distance) le tour t mobilise — proxy lexical/coréférence, CPU | à chiffrer | dimensionne max_mem×mem_dim comme STOCK (pas flux) ; donne la cible de décroissance que la rétention S6 doit atteindre (stock(t) ≤ capacité pour tout t) |
 
 ## 4. Corrections pré-run (état)
 
