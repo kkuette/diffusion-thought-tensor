@@ -137,7 +137,19 @@ texte (la seule modalité où le verbatim existe).
 Capture par défaut SYMÉTRIQUE user/self : chaque tour écrit sa sélection SIF
 top-k (copy_mask, §4.1) — 0 forward, aucune politique. Argument décisif = le
 RESET : sans self-writes, amnésie asymétrique de ses propres engagements
-post-reset. Risque assumé = boucle fermée (le serve divergeait en ~5-10 tours) ;
+post-reset.
+
+Mécanique du curseur Δn (précision 08-03) : la matrice d'états `(n, d)` grandit
+pendant le décodage, et on conserve une COPIE de n (le curseur du dernier
+write). La provenance se lit dans le PAS de croissance — un saut Δn > 1 = un
+bloc arrivé en prefill (tour user ; system pour le tout premier bloc), +1 par
+step = token émis par le modèle. Le tag user/self/system (§2.5) est donc dérivé
+mécaniquement du décodage lui-même, aucun parsing de template. La sélection ne
+porte QUE sur la tranche delta `[n_prev, n)` : les nouveaux vecteurs sont
+scorés SIF puis COMPARÉS À LA BANQUE pour décider quoi ajouter (la redondance
+avec l'existant s'écarte, la nouveauté entre) — **jamais tout n contre la
+banque entière**. Coût O(Δn·S), incrémental par construction. Le curseur est un
+état de FENÊTRE : il repart à zéro au RESET, la banque non. Risque assumé = boucle fermée (le serve divergeait en ~5-10 tours) ;
 défenses : tag de provenance (le read pondère « j'ai dit » ≠ « on m'a dit »),
 rétention par usage (le junk s'affame), et le kill-test horizon de divergence
 self-writes ON/OFF (§3-S13). Le `<think>` ne porte plus la capture : il porte
@@ -268,7 +280,7 @@ la fenêtre.
 
 | apprend (dans le graphe) | n'apprend pas (procédural, hors graphe) |
 |---|---|
-| le read (projections kvproj, fréquences d'âge) | sélection SIF top-k + copy_mask |
+| le read (projections kvproj, fréquences d'âge) | sélection SIF top-k sur la tranche Δn + dédup contre la banque ; curseur n ; tag par pas de croissance |
 | la copy-head | FIFO, propagation, résurrection, épinglage |
 | le `<think>` (synthèse, salience) — GRPO | rotations (âge log, plans de canal) |
 | le retrieve (GRPO, puis hiérarchie soft) | compteurs de naissance/usage |
