@@ -125,6 +125,15 @@ sélection). La grille ph.10 confirme : m est un cadran réel pour l'attention
 point de prélèvement gist (dernière couche vs ~2/3 de profondeur vs scalar-mix)
 reste un knob phase 1 (§3-S10).
 
+**Dimensionnement de mem_dim (précision 08-03)** : l'ancre n'est PAS seq_len
+mais la statistique d'ATOMES PAR TOUR — KT3 : max 11 atomes citables observés,
+k=13 suffit (inclusion pleine 1,000). Une fraction de seq_len (même /2)
+produirait une banque massivement vide (2048/2 = 1024 lignes pour ~13 utiles).
+Règle : mem_dim = quantile haut des atomes/tour (≈ k + marge propagation),
+tenseur à taille CONSTANTE conservé (CUDA-graphs), et les lignes vides MASQUÉES
+du softmax — le vide ne coûte alors ni dilution ni signal, seulement de la
+mémoire. Chiffrage sur corpus réel = §3-S16.
+
 **Ancrage cross-modal** : la banque est une modalité — cible long-terme =
 vision/son/texte écrivant dans le même store via des encodeurs de write par
 modalité. Aucun choix ne doit fermer cette voie ; l'attention sur un ensemble de
@@ -223,6 +232,12 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
   réimplémentation du chat template dans l'espace où il n'existe plus (la
   sélection top-k détruit les balises de rôle ; précédent : TS-RoPE, locuteur).
   Le tag system + épinglage (§2.1) = le prompt système banque-résident.
+- **Position LOCALE intra-span (troisième famille, précision 08-03)** : sans
+  ordre interne, un span multi-tokens devient un sac (« New York » = {New,
+  York}) — cassant pour la citation. On encode l'INDEX LOCAL de la ligne dans
+  son write (0..mem_dim−1, borné ⇒ aucun risque d'OOD, fréquences standard).
+  Jamais la position absolue de fenêtre : elle meurt au RESET et le « quand »
+  est déjà porté par les plans d'âge. Test de nécessité = §3-S17.
 - **Jamais dans la bande RoPE du backbone** — les plans vivent dans les
   projections K dédiées de kvproj : la dédicace est un MOYEN d'hébergement, pas
   une fin (§2.4).
@@ -309,6 +324,8 @@ verdict. Rien d'autre n'est ouvert.
 | S13 | self-writes : boucle fermée maîtrisable | horizon de divergence self-writes ON/OFF (+ KT10 scheduled sampling comme levier) | à lancer | si OFF >> ON, la capture self recule vers `<think>`-seul |
 | S14 | copie indue (négatifs copy-head) | KT7 : wrong-slot / slot-périmé, calibration `log_alpha` | avant toute démo de rappel | taux de copie indue = métrique de première classe |
 | S15 | falaise layout | KT9 : varier nombre/ordre de groupes à l'éval sur le ckpt copy | à lancer | fixe la normalisation §4.3 |
+| S16 | mem_dim (taille de slot) | stats atomes/tour sur corpus réel (recall_env + data SOTA) ; masque de vide au softmax | à chiffrer (cheap, CPU) | mem_dim = quantile haut atomes/tour + marge propagation — jamais une fraction de seq_len |
+| S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | à lancer (avec S3-S5) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
 
 ## 4. Corrections pré-run (état)
 
