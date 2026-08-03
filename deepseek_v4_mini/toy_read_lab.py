@@ -261,6 +261,9 @@ TAG_MODES = ("none", "rot", "add")
 LOC_MODES = ("none", "rot", "add")
 # environnements de la phase 11 (cf. ToyCfg.p11_env).
 P11_ENVS = ("rule", "prov", "span")
+# les QUATRE examens (cf. ToyCfg.p11_exam et P11_EXAMS plus bas) : S3, S4, S5,
+# S17 du registre §3.
+P11_EXAM_NAMES = ("age", "ood", "tag", "locidx")
 # canaux de PROVENANCE de l'env `prov` : qui a dit la ligne. Ordre FIGÉ — il
 # indexe les plans de rotation (un plan 0/π par canal) et les vecteurs additifs.
 CHANNELS = ("user", "self")
@@ -683,6 +686,19 @@ class ToyCfg:
                               # fait déborder les métadonnées dans la bande
                               # rapide, où le code d'âge se mélangerait à la
                               # position du lecteur.
+    p11_exam: str = ""        # EXAMEN DÉCLARÉ (age | ood | tag | locidx), vide
+                              # = ce n'est pas une cellule de la phase 11.
+                              # POURQUOI IL EST DÉCLARÉ ET NON DÉDUIT : le bras
+                              # de CONTRÔLE de S3 (`agezero`) n'active AUCUNE
+                              # métadonnée — sa config est exactement celle
+                              # d'une cellule kvproj de la grille §2.4, et
+                              # rien dans le modèle ne pourrait la distinguer.
+                              # Sans champ déclaré, le contrôle retomberait sur
+                              # le dossier de la ph.10 et l'examen n'aurait
+                              # plus sa baseline dans son propre espace de
+                              # noms. C'est aussi la cohérence qu'exige la
+                              # règle S3 : la baseline doit être mesurée par le
+                              # MÊME harnais que les bras qu'elle arbitre.
     p11_env: str = "rule"     # environnement de la phase 11 :
                               #   rule — la vie-règle de la ph.10 (S3/S4 :
                               #          conditionnement contrastif, appariable
@@ -858,6 +874,15 @@ class ToyCfg:
             f"loc_mode inconnu {self.loc_mode!r} (∈ {LOC_MODES})")
         assert self.p11_env in P11_ENVS, (
             f"p11_env inconnu {self.p11_env!r} (∈ {P11_ENVS})")
+        assert self.p11_exam in ("",) + tuple(P11_EXAM_NAMES), (
+            f"p11_exam inconnu {self.p11_exam!r} "
+            f"(∈ {('',) + tuple(P11_EXAM_NAMES)})")
+        if self.uses_p11_meta or self.p11_env != "rule":
+            assert self.p11_exam, (
+                "toute cellule de la phase 11 DÉCLARE son examen "
+                "(--p11-exam age|ood|tag|locidx) : c'est lui qui nomme le "
+                "dossier, et le bras de contrôle n'a rien d'autre pour se "
+                "distinguer d'une cellule de la grille §2.4")
         if self.uses_p11_meta:
             # Les métadonnées vivent dans les projections K DÉDIÉES (§2.5 :
             # « jamais dans la bande RoPE du backbone ») et sur des lignes
@@ -4289,7 +4314,7 @@ def grid_name(cfg: ToyCfg) -> str:
     Le seed n'entre PAS dans le nom : la grille tourne à seed FIXE, un run par
     combo. Un balayage de graine, s'il vient, ajoutera son propre suffixe.
     """
-    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+    if cfg.p11_exam:
         # PHASE 11 : ses cellules ont leur propre espace de noms — aucune ne
         # peut retomber sur un dossier de la grille §2.4 déjà lancée.
         return p11_name(cfg)
@@ -4327,12 +4352,8 @@ P11_ARM = {"none": "agezero", "age-log": "agelog", "age-raw": "ageraw",
 
 
 def p11_exam(cfg: ToyCfg) -> str:
-    """L'examen d'une config : age (S3) | ood (S4) | tag (S5) | locidx (S17)."""
-    if cfg.p11_env == "prov":
-        return "tag"
-    if cfg.p11_env == "span":
-        return "locidx"
-    return "ood" if cfg.age_aug else "age"
+    """L'examen DÉCLARÉ d'une config (cf. ToyCfg.p11_exam)."""
+    return cfg.p11_exam
 
 
 def p11_name(cfg: ToyCfg) -> str:
@@ -4390,7 +4411,7 @@ def _p11_cfg(combo: dict, base: dict) -> ToyCfg:
     kw = {k: v for k, v in combo.items() if k not in ("exam", "env", "m")}
     return ToyCfg(**{**base, "variant": "r4", "code": "tophid",
                      "read_path": "kvproj", "top_k": int(combo["m"]),
-                     "p11_env": combo["env"],
+                     "p11_env": combo["env"], "p11_exam": combo["exam"],
                      "cond": combo["env"] == "rule", **kw})
 
 
@@ -4491,7 +4512,7 @@ def print_p11_manifest(config: str, base: dict, save_root: str,
             flags += f" --locidx {cfg.loc_mode}"
         cmd = (f"python -m deepseek_v4_mini.toy_read_lab {config} "
                f"--read kv_proj --tap postnorm --m {m} "
-               f"--p11-env {combo['env']}{flags}"
+               f"--p11-exam {exam} --p11-env {combo['env']}{flags}"
                + (" --cond" if cfg.cond else ""))
         note = P11_NOTE[exam]
         if rot is not None:
@@ -4635,7 +4656,7 @@ def run_name_for(cfg: ToyCfg) -> str:
     à UN groupe injecté, donc tout entraînement à plusieurs groupes doit sortir
     ailleurs, y compris quand c'est devenu le défaut.
     """
-    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+    if cfg.p11_exam:
         return p11_name(cfg)
     if cfg.cond:
         # PHASE 10 : le dossier se relit comme le combo de la grille §2.4.
@@ -4862,6 +4883,14 @@ def main(argv=None):
                     help="famille INDEX LOCAL intra-span (S17) : none | rot "
                          "(R_loc(j), opérateur successeur constant) | add "
                          "(embedding de position locale appris).")
+    ap.add_argument("--p11-exam", choices=P11_EXAM_NAMES, default=None,
+                    dest="p11_exam",
+                    help="DÉCLARE l'examen de la cellule (age|ood|tag|locidx) "
+                         "— c'est lui qui nomme le save_dir. Obligatoire dès "
+                         "qu'une famille de métadonnées ou un env ph.11 est "
+                         "actif : le bras de CONTRÔLE (agezero) n'active rien "
+                         "et n'aurait sinon aucun moyen de se distinguer d'une "
+                         "cellule de la grille §2.4.")
     ap.add_argument("--p11-env", choices=P11_ENVS, default=None,
                     dest="p11_env",
                     help="env de la phase 11 : rule (la vie-règle de la "
@@ -4986,11 +5015,12 @@ def main(argv=None):
                       ("age_eval_scales", str), ("tag_mode", str),
                       ("n_channels", int), ("loc_mode", str),
                       ("loc_planes", int), ("rot_drift_max", float),
-                      ("p11_env", str)):
+                      ("p11_env", str), ("p11_exam", str)):
         if key in pb:
             mc[key] = cast(pb[key])
     for key, val in (("bank_rot", a.bank_rot), ("tag_mode", a.tag_mode),
                      ("loc_mode", a.loc_mode), ("p11_env", a.p11_env),
+                     ("p11_exam", a.p11_exam),
                      ("age_eval_scales", a.age_eval_scales)):
         if val is not None:
             mc[key] = val
@@ -5000,8 +5030,9 @@ def main(argv=None):
         print_p11_manifest(
             a.config, {k: v for k, v in mc.items()
                        if k not in ("variant", "code", "read_path", "top_k",
-                                    "cond", "p11_env", "bank_rot", "age_aug",
-                                    "tag_mode", "loc_mode")},
+                                    "cond", "p11_env", "p11_exam",
+                                    "bank_rot", "age_aug", "tag_mode",
+                                    "loc_mode")},
             t.get("save_dir", "./checkpoints/toy_read_lab"), a.manifest,
             b_convs=int(t.get("batch_convs", 8)), exam=a.manifest_subset)
         return
@@ -5242,7 +5273,7 @@ def main(argv=None):
               + f" | m = {cfg.top_k} ligne(s)/write | âge "
               + ("ROTÉ (DFT sur max_mem rangs de récence)" if cfg.age_rope
                  else "non codé"), flush=True)
-    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+    if cfg.p11_exam:
         rot = next((b.attn.rot for b in model.blocks
                     if getattr(b.attn, "rot", None) is not None), None)
         print(f"  PHASE 11 — examen `{p11_exam(cfg)}` (spec §2.5, registre "
@@ -5690,7 +5721,7 @@ def main(argv=None):
                                          "strates": fp11["strates"]}
                                         if fp11 else None),
                  "ood_age": food}
-                if (cfg.uses_p11_meta or cfg.p11_env != "rule") else None),
+                if cfg.p11_exam else None),
         "citation": ({"grade_live": fv["grade_live"],
                       "grade_abl": fv["grade_abl"], "dnll": fv["dnll"],
                       "grade_resident": fv["grade_resident"],
@@ -7623,6 +7654,294 @@ def _selftest() -> None:
         else:
             raise AssertionError(f"ToyCfg aurait dû refuser {bad}")
 
+    # ══ 22. PHASE 11 — LES TROIS FAMILLES DE MÉTADONNÉES (spec §2.5) ═══════
+    # Dimensions du bloc : d_model 64 / 2 TÊTES (⇒ 32 dims de tête, 16 paires
+    # RoPE). Pourquoi 2 et pas 4 : à 8 paires la bande quasi statique ne loge
+    # pas 4 plans (dérive 3,19 rad sur T=64) et le garde-fou refuserait — À
+    # RAISON. On élargit la tête plutôt que d'assouplir l'invariant.
+    def _mk11(**kw):
+        torch.manual_seed(90210)
+        c = ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=2,
+                   mem_dim=64, variant="r4", max_seq_len=64, code="tophid",
+                   top_k=3, seg_n_pos=8, sif_a=A_SIF, inject_sep_id=5,
+                   max_mem=8, read_path="kvproj",
+                   **{"p11_exam": "age", **kw})
+        return ToyReadLM(c, env.n_slots, env.n_attrs, sif_w=_sifw(512)).eval()
+
+    ids11 = torch.tensor([[3, 4, 5]])
+    rows11 = torch.randn(1, 2, 3, 64)
+    age11 = torch.tensor([[0, 1]])
+    chan11 = torch.tensor([[0, 1]])
+    m11_off = _mk11()
+    with torch.no_grad():
+        ref11 = m11_off(ids11, None, None, inject=rows11, inject_age=age11,
+                        inject_chan=chan11)
+    assert getattr(m11_off.blocks[0].attn, "rot", None) is None, \
+        "aucune famille active ⇒ AUCUN module de rotation ne doit exister"
+    # (a) APPARIEMENT §2.5 : les plans sont les paires les PLUS LENTES du RoPE
+    #     de tête, et la requête ne tourne quasiment pas dessus sur toute la
+    #     fenêtre. C'est LA condition qui rend le codage lisible côté banque.
+    _dh, _th, _T = 32, 10000.0, 64
+    idx11, drift11 = slow_rope_planes(_dh, _th, 4, _T)
+    _inv = 1.0 / (_th ** (torch.arange(0, _dh, 2).float() / _dh))
+    assert set(int(i) for i in idx11) == set(
+        int(i) for i in torch.argsort(_inv)[:4]), \
+        "les plans ne sont pas les paires les plus LENTES"
+    assert drift11 < 0.35, f"dérive de requête trop grande : {drift11}"
+    # le garde-fou MORD : demander une bande trop large ÉCHOUE à la
+    # construction plutôt que de coder l'âge dans la bande rapide.
+    try:
+        _mk11(bank_rot="age-log", age_planes=12)
+    except AssertionError as e:
+        assert "APPARIEMENT REFUSÉ" in str(e), str(e)
+    else:
+        raise AssertionError("12 plans auraient dû être refusés (§2.5)")
+    # (b) ÂGE. Rotation ⇒ le forward bouge ET l'âge COMPTE ; le bras `none`
+    #     est le contrôle θ_âge=0 exact.
+    m11_log, m11_raw = _mk11(bank_rot="age-log"), _mk11(bank_rot="age-raw")
+    with torch.no_grad():
+        o_log = m11_log(ids11, None, None, inject=rows11, inject_age=age11,
+                        inject_chan=chan11)
+        o_log2 = m11_log(ids11, None, None, inject=rows11,
+                         inject_age=age11 * 10, inject_chan=chan11)
+        o_zero = m11_log(ids11, None, None, inject=rows11,
+                         inject_age=torch.zeros_like(age11),
+                         inject_chan=chan11)
+    assert not torch.equal(ref11, o_log), "la rotation d'âge ne mord pas"
+    assert not torch.equal(o_log, o_log2), "l'ÂGE ne change rien : le code est mort"
+    assert torch.allclose(ref11, o_zero, atol=1e-6), (
+        "âge 0 partout ⇒ rot(0) = IDENTITÉ ⇒ le forward doit retomber sur le "
+        "kvproj nu")
+    # log vs brut : ILS COÏNCIDENT dans la plage vue au train (φ(A_ref)=A_ref)
+    # et DIVERGENT en OOD — c'est ce qui rend S4 lisible.
+    _rot = m11_log.blocks[0].attn.rot
+    _a = torch.tensor([[0.0, 1.0, 8.0, 800.0]])
+    _phi = _rot.phi_age(_a)
+    assert abs(float(_phi[0, 2]) - 8.0) < 1e-4, float(_phi[0, 2])
+    assert float(_phi[0, 3]) < 0.1 * 800.0, (
+        f"la compression log doit écraser un âge de 800 writes (A_ref 8 ⇒ "
+        f"φ ≈ 24, soit 3× l'horizon normal pour 100× le compteur) : "
+        f"{float(_phi[0, 3]):.1f}")
+    assert float(m11_raw.blocks[0].attn.rot.phi_age(_a)[0, 3]) == 800.0
+    # fréquences APPRISES : géométriques à l'init, et dérivables.
+    _om = torch.exp(_rot.age_log_omega.detach())
+    assert _om.numel() == 4 and float(_om[0]) > float(_om[-1]), _om
+    o = m11_log(ids11, None, None, inject=rows11, inject_age=age11)
+    o.float().pow(2).mean().backward()
+    assert float(m11_log.blocks[0].attn.rot.age_log_omega.grad.abs().max()) > 0, \
+        "les fréquences d'âge ne reçoivent AUCUN gradient"
+    # (c) LE FALLBACK `age-bias` : init 0 ⇒ bit-à-bit le kvproj nu, et il
+    #     MORD + reçoit du gradient dès le premier backward (un terme additif
+    #     au logit, jamais une porte multiplicative).
+    m11_b = _mk11(bank_rot="age-bias")
+    with torch.no_grad():
+        assert torch.equal(ref11, m11_b(ids11, None, None, inject=rows11,
+                                        inject_age=age11, inject_chan=chan11))
+        m11_b.blocks[0].attn.rot.age_bias_w.fill_(1.0)
+        assert not torch.equal(ref11, m11_b(ids11, None, None, inject=rows11,
+                                            inject_age=age11)), \
+            "le biais de récence ne mord pas sur la sortie"
+        m11_b.blocks[0].attn.rot.age_bias_w.zero_()
+    o = m11_b(ids11, None, None, inject=rows11, inject_age=age11)
+    o.float().pow(2).mean().backward()
+    assert float(m11_b.blocks[0].attn.rot.age_bias_w.grad.abs().max()) > 0, \
+        "le biais de récence est un paramètre mort"
+    assert sum(p.numel() for n, p in m11_b.named_parameters()
+               if "age_bias_w" in n) == m11_b.cfg.n_layers, \
+        "le biais de récence doit coûter UN paramètre par couche lectrice"
+    # (d) TAG DE PROVENANCE. Rotation : un plan PAR CANAL, angle 0 ou π ⇒
+    #     R(π)² = I (le code n'est pas orienté, assumé). Additif : MÊMES dims
+    #     réservées, init 0 ⇒ démarre exactement sur le kvproj nu, et il
+    #     apprend (le gradient d'un terme additif n'est pas nul à zéro).
+    m11_tr = _mk11(tag_mode="rot", p11_env="prov")
+    m11_ta = _mk11(tag_mode="add", p11_env="prov")
+    with torch.no_grad():
+        t_a = m11_tr(ids11, None, None, inject=rows11, inject_chan=chan11)
+        t_b = m11_tr(ids11, None, None, inject=rows11,
+                     inject_chan=1 - chan11)
+        assert not torch.equal(t_a, t_b), "le canal ne change rien au forward"
+        assert torch.equal(ref11, m11_ta(ids11, None, None, inject=rows11,
+                                         inject_chan=chan11)), \
+            "le steelman ADDITIF doit démarrer bit-à-bit sur le kvproj nu"
+    assert m11_tr.blocks[0].attn.rot.tag_idx.numel() == \
+        m11_ta.blocks[0].attn.rot.tag_idx.numel() == 2, \
+        "rot et add doivent réserver le MÊME nombre de plans (budget apparié)"
+    o = m11_ta(ids11, None, None, inject=rows11, inject_chan=chan11)
+    o.float().pow(2).mean().backward()
+    assert float(m11_ta.blocks[0].attn.rot.tag_add.grad.abs().max()) > 0, \
+        "le vecteur de tag additif ne reçoit aucun gradient"
+    # R(π) sur un plan : appliquer DEUX fois le même canal revient à l'identité
+    _r = m11_tr.blocks[0].attn.rot
+    _km = torch.randn(1, 2, 2, 32)
+    _meta = torch.zeros(1, 2, 3, dtype=torch.long)
+    _meta[..., 1] = 1
+    assert torch.allclose(_r(_r(_km, _meta), _meta), _km, atol=1e-5), \
+        "R(π)² doit valoir l'identité (un plan 0/π par canal)"
+    # (e) INDEX LOCAL. rot : l'OPÉRATEUR SUCCESSEUR est CONSTANT — passer de
+    #     j à j+1 est la MÊME rotation quel que soit j et quel que soit le
+    #     contenu. C'est l'argument structurel contre l'additif (§2.5).
+    m11_lr = _mk11(loc_mode="rot")
+    _r = m11_lr.blocks[0].attn.rot
+    _k0 = torch.randn(1, 2, 1, 32)
+    def _at(j):
+        mm = torch.zeros(1, 1, 3, dtype=torch.long)
+        mm[..., 2] = j
+        return _r(_k0, mm)
+    _d = [(_at(j + 1) - _at(j)) for j in range(3)]
+    # l'écart entre deux positions successives n'est PAS constant en valeur
+    # (c'est une rotation, pas une translation) : ce qui est constant, c'est
+    # l'OPÉRATEUR. On le vérifie en angle sur le plan local.
+    _pl = int(_r.loc_idx[0])
+    def _ang(x, j):
+        z = x[0, 0, 0, 2 * _pl:2 * _pl + 2]
+        return math.atan2(float(z[1]), float(z[0]))
+    _da = [(_ang(_at(j + 1), j + 1) - _ang(_at(j), j)) % (2 * math.pi)
+           for j in range(3)]
+    assert max(_da) - min(_da) < 1e-4, (
+        f"R_loc(1) doit être un opérateur CONSTANT : {_da}")
+    m11_la = _mk11(loc_mode="add")
+    with torch.no_grad():
+        assert torch.equal(ref11, m11_la(ids11, None, None, inject=rows11)), \
+            "l'index local ADDITIF doit démarrer bit-à-bit sur le kvproj nu"
+        assert not torch.equal(ref11, m11_lr(ids11, None, None,
+                                             inject=rows11)), \
+            "l'index local rotatif ne mord pas"
+    o = m11_la(ids11, None, None, inject=rows11)
+    o.float().pow(2).mean().backward()
+    assert float(m11_la.blocks[0].attn.rot.loc_add.grad.abs().max()) > 0
+    # (f) LES TROIS FAMILLES SONT DISJOINTES (aucun plan partagé).
+    m11_all = _mk11(bank_rot="age-log", tag_mode="rot", loc_mode="rot",
+                    p11_env="prov", age_planes=2, loc_planes=2,
+                    rot_drift_max=1.0)
+    _r = m11_all.blocks[0].attn.rot
+    _sets = [set(map(int, _r.age_idx)), set(map(int, _r.tag_idx)),
+             set(map(int, _r.loc_idx))]
+    assert len(set().union(*_sets)) == sum(len(s) for s in _sets), \
+        "les familles se marchent dessus : les plans doivent être DISJOINTS"
+    # (g) LA SONDE d'attention : elle N'ALTÈRE PAS le forward, et sa masse est
+    #     une distribution sur les lignes de banque.
+    with torch.no_grad():
+        with bank_attn_probe(m11_log) as _p:
+            _o1 = m11_log(ids11, None, None, inject=rows11, inject_age=age11,
+                          inject_chan=chan11)
+            _mass = _p.mass()
+        _o2 = m11_log(ids11, None, None, inject=rows11, inject_age=age11,
+                      inject_chan=chan11)
+    assert torch.equal(_o1, _o2), "la sonde a changé le forward"
+    assert _mass.shape == (1, 6) and float(_mass.sum()) <= 1.0 + 1e-4
+    assert all(not b.attn.want_bank_attn for b in m11_log.blocks), \
+        "la sonde doit s'éteindre à la sortie du contexte"
+    # (h) LES GARDE-FOUS : chaque famille refuse ce qui serait un no-op.
+    for bad in ({"bank_rot": "age-log", "read_path": "kv"},
+                {"bank_rot": "age-log", "read_path": "entry"},
+                {"tag_mode": "rot"},                      # env `rule`
+                {"loc_mode": "rot", "top_k": 1},
+                {"age_aug": True},                        # sans rotation d'âge
+                {"age_aug": True, "bank_rot": "age-bias"},
+                {"p11_env": "prov", "cond": True}):
+        try:
+            ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=2,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF,
+                   **{"variant": "r4", "code": "tophid", "top_k": 3,
+                      "read_path": "kvproj", "p11_exam": "age", **bad})
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"ToyCfg aurait dû refuser {bad}")
+    # et l'EXAMEN NON DÉCLARÉ : une cellule ph.11 sans `p11_exam` retomberait
+    # sur le nommage de la grille §2.4 — refusé à la construction.
+    try:
+        ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=2, mem_dim=64,
+               max_seq_len=64, sif_a=A_SIF, variant="r4", code="tophid",
+               top_k=3, read_path="kvproj", bank_rot="age-log")
+    except AssertionError as e:
+        assert "DÉCLARE son examen" in str(e), str(e)
+    else:
+        raise AssertionError("une cellule ph.11 sans examen déclaré est passée")
+    # (i) LES ENVS. `prov` : deux writes du MÊME slot et du MÊME attribut (donc
+    #     de clé oracle IDENTIQUE), un par canal, ordre tiré au sort ; la
+    #     question NOMME le canal et vit DANS le seg gradé.
+    ps = PersonaProvStream(tok, seed=11, p_smalltalk=0.0)
+    pconv = ps.next_conv()
+    assert pconv["kind"] == "prov"
+    _w = [s for s in pconv["segs"] if OracleEnv.fact_of(s) is not None]
+    assert len(_w) == 2 and {s["chan"] for s in _w} == {0, 1}, \
+        "la vie `prov` doit écrire UN fait par canal"
+    assert len({OracleEnv.fact_of(s)[:2] for s in _w}) == 1, (
+        "les deux faits doivent partager slot ET attribut — sinon la CLÉ les "
+        "sépare et le canal n'a plus rien à faire")
+    _t = pconv["segs"][pconv["info"]["p11"]["turns"][0]]
+    assert _t["q_len"] > 0 and float(_t["loss_mask"][0, :_t["q_len"]].sum()) == 0, \
+        "la question doit être DANS le seg et NON supervisée"
+    assert float(_t["loss_mask"][0, _t["q_len"]:].sum()) > 0
+    # `span` : longueurs MESURÉES, jamais décrétées.
+    ss = PersonaSpanStream(tok, seed=12, p_smalltalk=0.0)
+    assert len(ss.span_pool) >= 2, ss.span_pool
+    for L, vals in ss.span_pool.items():
+        assert all(len(tok(" " + v, add_special_tokens=False)["input_ids"]) == L
+                   for v in vals), f"bucket {L} mal mesuré"
+    sconv = ss.next_conv()
+    assert sconv["kind"] == "span" and len(sconv["info"]["truths"]) == 1
+    assert sconv["info"]["p11"]["strate"][0].startswith("L")
+    # (j) LE PLAN ph.11 : TOUS les résidents injectés, âges = rangs de récence,
+    #     canaux portés, et la CIBLE du r@1 est bien le groupe du bon canal.
+    m11_p = _mk11(tag_mode="rot", p11_env="prov")
+    pl = env.p11_plan(m11_p, pconv)
+    assert pl, "aucun tour gradé n'a de plan"
+    _i, (_rows, _ages, _chans, _slots) = next(iter(pl.items()))
+    assert _rows.shape[0] == 2 and set(map(int, _chans)) == {0, 1}
+    assert sorted(map(int, _ages)) == [0, 1], "les âges = rangs de récence"
+    _q0 = pconv["info"]["p11"]["chan"][0]
+    _tgt = env.p11_target(pconv, _i, 0, (_rows, _ages, _chans, _slots))
+    assert _tgt is not None and int(_chans[_tgt]) == _q0, (
+        "la cible du r@1 doit être le groupe du canal que la question nomme")
+    assert env.p11_plan(m11_p, rconv) == {}, \
+        "p11_plan doit être un no-op hors des envs de la phase 11"
+    # (k) AUGMENTATION D'ÉCHELLE : l'ORDRE est préservé, l'échelle varie, et
+    #     elle est un NO-OP quand le flag est OFF (rétro-compat).
+    _cfa = _mk11(bank_rot="age-raw", age_aug=True).cfg
+    torch.manual_seed(0)
+    _ag = torch.tensor([[0, 1, 2], [0, 3, 7]])
+    _au = age_augment(_cfa, _ag)
+    assert torch.equal(age_augment(_mk11().cfg, _ag), _ag), \
+        "age_aug OFF doit être un no-op EXACT"
+    for r in range(2):
+        _o = [int(x) for x in _au[r]]
+        assert _o == sorted(_o), f"l'ordre des âges doit être préservé : {_o}"
+    assert float(_au.max()) >= float(_ag.max()), _au
+    # (l) NOMMAGE : 22 cellules, 22 dossiers, AUCUNE collision avec les 96
+    #     déjà lancées (36 grille + 12 _fwadd + 12 dual + 12 kvproj + 12 _bq +
+    #     12 bank-q en file).
+    _p11n, _p11c = [], 0
+    for _ex in P11_EXAMS:
+        _cc = p11_combos(_ex)
+        _p11c += len(_cc)
+        _p11n += [p11_name(_p11_cfg(c, _base10)) for c in _cc]
+    assert _p11c == 22 and len(set(_p11n)) == 22, (len(_p11n), sorted(_p11n))
+    _lancees = set()
+    for _sub in GRID_SUBSETS.values():
+        _lancees |= {grid_name(_grid_cfg(c, _base10))
+                     for c in grid_combos(**_sub)}
+    assert not (set(_p11n) & _lancees), (
+        "une cellule ph.11 écraserait un run de la grille §2.4")
+    assert all(n.startswith("p11-") for n in _p11n), _p11n
+    # et le nom se relit : run_name_for == p11_name, et il PORTE l'examen.
+    for _ex in P11_EXAMS:
+        for c in p11_combos(_ex):
+            _cf = _p11_cfg(c, _base10)
+            assert run_name_for(_cf) == p11_name(_cf) and \
+                p11_name(_cf).startswith(f"p11-{_ex}_") and \
+                p11_name(_cf).endswith(f"_m{c['m']}"), p11_name(_cf)
+    # LE CONTRÔLE DE S3 EST BIEN DANS L'ESPACE DE NOMS ph.11 : sans le champ
+    # déclaré il retomberait sur `read-kvproj_rot-off_tap-postnorm_m4`,
+    # c'est-à-dire sur une cellule DÉJÀ LANCÉE du carré factoriel.
+    _ctl = _p11_cfg({"exam": "age", "env": "rule", "m": 4,
+                     "bank_rot": "none"}, _base10)
+    assert run_name_for(_ctl) == "p11-age_agezero_m4", run_name_for(_ctl)
+    assert not _ctl.uses_p11_meta, (
+        "le contrôle θ_âge=0 ne doit activer AUCUNE métadonnée — c'est sa "
+        "définition (HoPE)")
+
     torch.manual_seed(4242)
     m_r2 = _mk("toprows", d=64, n_pos=4, vocab=512, seg_n_pos=8, top_k=3)
     rows_r2 = m_r2.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
@@ -7777,6 +8096,32 @@ def _selftest() -> None:
           f"leur état est JETÉ en sortie de stack ; bank_q REFUSÉ hors kvproj. "
           f"Nommage : 12 cellules kvproj + 12 _bq, sans collision avec les 36 "
           f"lancées, les 12 _fwadd ni les 12 dual.", flush=True)
+    print(f"  PHASE 11 — MÉTADONNÉES PAR ROTATION sur K' (spec §2.5). "
+          f"(a) APPARIEMENT : les plans sont les paires les PLUS LENTES du "
+          f"RoPE de tête (tri par fréquence, pas une convention d'index) et "
+          f"la requête ne tourne que de {drift11:.4f} rad sur toute la "
+          f"fenêtre ; une bande trop large est REFUSÉE à la construction. "
+          f"(b) ÂGE : rot(0) ≡ identité (le kvproj nu au bit près), l'âge "
+          f"MORD, log et brut COÏNCIDENT à A_ref et divergent en OOD "
+          f"(a=800 ⇒ φ 24.3 contre 800), fréquences apprises géométriques et "
+          f"DÉRIVABLES. (c) `age-bias` : UN paramètre par couche, init 0 ≡ "
+          f"kvproj nu, mord et reçoit du gradient. (d) TAG : R(π)² = I "
+          f"vérifié, le canal change le forward, le steelman ADDITIF réserve "
+          f"le MÊME nombre de plans et démarre bit-à-bit sur le nu. "
+          f"(e) INDEX LOCAL : R_loc(1) est un opérateur CONSTANT (écarts "
+          f"d'angle égaux à 1e-4 près) — l'argument structurel contre "
+          f"l'additif. (f) les trois familles occupent des plans DISJOINTS. "
+          f"(g) la sonde d'attention n'altère pas le forward et s'éteint. "
+          f"(h) 8 combinaisons no-op REFUSÉES, examen non déclaré compris. "
+          f"(i) envs : `prov` écrit UN fait par canal à slot ET attribut "
+          f"IDENTIQUES (la clé ne peut rien) et pose la question DANS le seg "
+          f"gradé, NON supervisée ; `span` mesure ses longueurs au lieu de "
+          f"les décréter. (j) p11_plan : tous les résidents, âges = rangs de "
+          f"récence, canaux portés, cible du r@1 = le groupe du bon canal, "
+          f"no-op hors ph.11. (k) augmentation d'échelle : ordre préservé, "
+          f"no-op EXACT quand OFF. (l) 22 cellules ⇒ 22 dossiers, ZÉRO "
+          f"collision avec les 96 de la grille §2.4, et le contrôle θ_âge=0 "
+          f"vit bien dans l'espace de noms ph.11.", flush=True)
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "
