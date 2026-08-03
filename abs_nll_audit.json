@@ -1,0 +1,25 @@
+{
+ "read-kvproj_rot-off_tap-mid_m1": {
+  "nll_live": 4.268028259277344,
+  "nll_abl": 5.3296026632088385,
+  "dnll_recomputed": 1.0615744039314945,
+  "n_tok": 147.0,
+  "grade_live": 0.0,
+  "dnll_evaluate": 1.0615744039314945,
+  "dnll_stored": 0.807846420139401,
+  "combo": {
+   "read": "kv_proj",
+   "age_rot": false,
+   "tap": "mid",
+   "m": 1,
+   "cond_arm": "true",
+   "cond_decoys": 1,
+   "fw_additive": false,
+   "hid_tap_layers": 4,
+   "d_model": 512,
+   "n_layers": 6,
+   "max_mem": 8
+  },
+  "harness_ok": false
+ }
+}

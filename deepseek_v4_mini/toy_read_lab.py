@@ -209,7 +209,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .math_school_data import A_OPEN
+from .math_school_data import A_OPEN, CLOSE as CLOSE_P11
 from .paths import load_yaml
 from .persona_chat_data import PersonaChatStream, fact_id_maps, grade_recall
 from .streams import chat_stream_class
@@ -2937,6 +2937,231 @@ class PersonaRuleStream(PersonaChatStream):
         return self._conv_recall()
 
 
+# ══ PHASE 11 — LES DEUX ENVIRONNEMENTS NOUVEAUX (S5 et S17) ═════════════════
+#
+# CE QU'ILS CHANGENT AU LAYOUT, ET POURQUOI C'EST OBLIGATOIRE. Dans les phases
+# 6-10, le tour gradé est décodé depuis `A_OPEN` SEUL : la question n'est dans
+# AUCUN forward du tour de réponse (le labo forwarde seg par seg). C'était
+# tenable tant que le préfixe injecté ne contenait qu'un candidat plausible —
+# la ph.8 l'a d'ailleurs mesuré : à préfixe multi-groupes en ordre aléatoire,
+# la copie tombe à 0.21 parce que RIEN n'identifie le bon groupe.
+#
+# S5 et S17 sont précisément des tâches où deux candidats coexistent et où
+# c'est la QUESTION qui tranche (« qu'a dit l'utilisateur » vs « qu'ai-je
+# dit »). Décoder sans la question rendrait la tâche INDÉCIDABLE et l'A/B
+# rotation/additif ne mesurerait plus que du bruit. Les deux envs posent donc
+# la question et la réponse dans UN SEUL SEG (question non supervisée, réponse
+# supervisée) — au train comme à l'éval, isomorphes par construction (§4.3).
+U_OPEN_P11 = "<|im_start|>user\n"
+
+PROV_SELF_TMPL = [
+    "Understood, I have logged your {p}reference as {v} on my side.",
+    "Noted. On my end I am filing this under {v}.",
+    "I will keep {v} as my own working label for it.",
+]
+PROV_Q = {
+    # la question NOMME le canal — c'est tout le test : deux faits du MÊME
+    # attribut, même clé oracle, seul le locuteur les sépare.
+    "user": ["What did I tell you it was?",
+             "Remind me of the value that I gave you."],
+    "self": ["What did you file it under on your side?",
+             "Remind me of the label that you chose yourself."],
+}
+PROV_A = {"user": ["You told me it was {v}.", "The value you gave me is {v}."],
+          "self": ["I filed it under {v}.", "The label I chose is {v}."]}
+PROV_SLOT = "ref"             # slot d'ACCUEIL : pool large (2500), valeurs
+                              # arbitraires sans prior LM (strate `code`).
+SPAN_SLOT = "ref"
+
+
+def span_value_pool(tok, lengths=(1, 2, 3, 4, 5, 6), per_bucket: int = 48
+                    ) -> dict:
+    """{longueur en tokens → valeurs} — les valeurs de l'env `span` (S17).
+
+    La longueur d'une valeur n'est PAS choisie, elle est MESURÉE : on engendre
+    un large jeu de candidats (de 1 à ~12 caractères, du sigle nu au code
+    segmenté « SV-19 62 1 »), on les tokenise avec LE tokenizer du run, et on
+    les range par longueur RÉELLE de `" "+v`. Aucune hypothèse sur le BPE ne
+    traîne dans le code — c'est ce qui rend l'env portable du stub hermétique
+    (1 char = 1 token) au SmolLM2 du run.
+
+    Les buckets vides sont simplement absents (avec le stub, la longueur 1 est
+    inatteignable : « " "+v » fait au moins 2 caractères). Le stream exige
+    seulement DEUX buckets non vides — en dessous, il n'y a plus de courbe
+    « écart rot/add en fonction de la longueur » à tracer.
+    """
+    LET = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    cands: list = []
+    for a in LET:
+        cands.append(a)                                   # 1 caractère
+        for b in LET[:8]:
+            n1, n2 = ord(b) % 90 + 10, ord(a) % 90 + 10
+            d = (ord(a) + ord(b)) % 9 + 1
+            cands += [a + b, f"{a}-{n1:02d}", f"{a}{b}-{n1:02d}",
+                      f"{a}{b} {n1:02d}", f"{n1:02d}{n2:02d}", f"{n1}{n2}{d}",
+                      f"{a}{b}{n1:02d}{n2:02d}",
+                      f"{a}{b}-{n1:02d} {n2:02d}",
+                      f"{a}{b}-{n1:02d} {n2:02d} {d}"]
+    out: dict = {int(n): [] for n in lengths}
+    for v in cands:
+        n = len(tok(" " + v, add_special_tokens=False)["input_ids"])
+        if n in out and len(out[n]) < per_bucket and v not in out[n]:
+            out[n].append(v)
+    return {n: vs for n, vs in out.items() if vs}
+
+
+class Persona11Stream(PersonaChatStream):
+    """Base des deux envs de la phase 11 : le tour gradé porte SA question.
+
+    `_qa_seg` fabrique un seg unique [question user | ouverture assistant |
+    réponse], la question NON supervisée (aucun gradient dessus, elle n'est là
+    que pour être lue) et la réponse supervisée avec son `val_mask`. `q_len`
+    dit où s'arrête le préfixe : c'est EXACTEMENT le prompt de décodage de
+    l'éval, donc le décodage greedy voit ce que l'entraînement a vu.
+    """
+
+    def _qa_seg(self, q: str, a: str, v: str) -> dict:
+        pieces = [(U_OPEN_P11, False), (q + "\n", False), (CLOSE_P11, False),
+                  (A_OPEN, False), (a, True), ("\n", True), (CLOSE_P11, True)]
+        seg = self._seg(pieces, "assistant")
+        seg["q_len"] = sum(self._ids(p).numel() for p, _ in pieces[:4])
+        return self._val_mask(seg, v)
+
+    def _fact_channels(self, seg: dict, slot: str, v: str, p: str = "") -> dict:
+        """Pose les canaux d'identité de fait sur un seg DÉJÀ construit.
+
+        `fact_of` les lit pour décider qu'un seg est un WRITE : sans eux, un
+        fait énoncé par le MODÈLE (canal `self`) n'entrerait jamais en banque —
+        or l'asymétrie user/self est précisément ce que S5 mesure.
+        """
+        T = seg["input_ids"].size(1)
+        seg["fact_slot"] = torch.full((1, T), self.slot_ids.get(slot, 0),
+                                      dtype=torch.long)
+        seg["fact_val"] = torch.full((1, T), self.val_ids.get(v, 0),
+                                     dtype=torch.long)
+        seg["fact_attr"] = torch.full((1, T), self.attr_ids.get(p, 0),
+                                      dtype=torch.long)
+        return seg
+
+
+class PersonaProvStream(Persona11Stream):
+    """S5 — vies à LOCUTEUR : deux faits du MÊME attribut, deux voix.
+
+    Une vie pose DEUX valeurs pour le même slot : l'une énoncée par
+    l'UTILISATEUR, l'autre par le MODÈLE lui-même (canal `self` — le
+    self-write de la spec §2.3). Les deux writes ont donc :
+      * la MÊME clé oracle `pack_key[slot, attr]` (rien à gagner par la clé),
+      * un ORDRE TIRÉ AU SORT (rien à gagner par la récence),
+      * des contenus également plausibles (rien à gagner par le prior LM).
+    Seul le CANAL les sépare — c'est la seule information qui peut faire
+    gagner un bras, et elle n'existe que si le read la code.
+
+    La question nomme le canal ; la réponse cite la valeur de CE canal.
+    """
+
+    def __init__(self, tok, *, prov_fillers: tuple = (1, 3), **kw) -> None:
+        super().__init__(tok, **kw)
+        self.prov_fillers = tuple(int(v) for v in prov_fillers)
+
+    def _conv_prov(self) -> dict:
+        pool = self.slots[PROV_SLOT][4]
+        v_user, v_self = self.rng.sample(pool, 2)
+        st = self.slots[PROV_SLOT][0]
+        u_seg = self._user_valued(self.rng.choice(st).format(v=v_user, p=""),
+                                  v_user, slot=PROV_SLOT, p="")
+        u_seg["chan"] = 0                                  # CHANNELS[0] = user
+        s_txt = self.rng.choice(PROV_SELF_TMPL).format(v=v_self, p="")
+        s_seg = self._fact_channels(self._assistant_valued(s_txt, v_self),
+                                    PROV_SLOT, v_self)
+        s_seg["chan"] = 1                                  # CHANNELS[1] = self
+        # ORDRE TIRÉ AU SORT : la récence ne doit RIEN prédire.
+        writes = [u_seg, s_seg]
+        self.rng.shuffle(writes)
+        segs = list(writes)
+        for _ in range(self.rng.randint(*self.prov_fillers)):
+            segs += self._filler_pair()
+        truths, chans, queries = [], [], []
+        for _ in range(self.rng.randint(*self.n_queries)):
+            c = self.rng.choice(list(CHANNELS))
+            v = v_user if c == "user" else v_self
+            q = self.rng.choice(PROV_Q[c])
+            segs.append(self._qa_seg(q, self.rng.choice(PROV_A[c]).format(v=v),
+                                     v))
+            truths.append(v)
+            chans.append(CHANNELS.index(c))
+            queries.append(q)
+        return {"kind": "prov", "segs": segs,
+                "info": {"truths": truths, "queries": queries, "ages": [],
+                         "q_slots": [PROV_SLOT] * len(truths),
+                         "p11": {"turns": [i for i, s in enumerate(segs)
+                                           if "q_len" in s],
+                                 "chan": chans, "strate": [CHANNELS[c]
+                                                           for c in chans]}}}
+
+    def next_conv(self) -> dict:
+        if self.rng.random() < self.p_smalltalk:
+            return self._conv_smalltalk()
+        return self._conv_prov()
+
+
+class PersonaSpanStream(Persona11Stream):
+    """S17 — valeurs multi-tokens de LONGUEUR GRADUÉE, citation ORDONNÉE.
+
+    Une vie pose UN fait dont la valeur fait 1, 2, 3 ou 4 tokens (mesurés, cf.
+    `span_value_pool`) et `span_decoys` faits leurres d'autres slots. La
+    question est dans le seg gradé, la réponse doit rendre la valeur — et
+    `grade_recall` exige la chaîne EXACTE, donc l'ORDRE des tokens.
+
+    C'est le test de nécessité de la troisième famille (§2.5) : sans index
+    local, un span multi-tokens est un SAC de lignes ; la prédiction inscrite
+    est que l'écart rot/add CROÎT avec la longueur, parce que l'additif donne
+    des signatures là où la rotation donne l'opérateur successeur R_loc(1).
+    """
+
+    def __init__(self, tok, *, span_decoys: int = 1,
+                 span_fillers: tuple = (1, 3), **kw) -> None:
+        super().__init__(tok, **kw)
+        self.span_decoys = int(span_decoys)
+        self.span_fillers = tuple(int(v) for v in span_fillers)
+        self.span_pool = span_value_pool(tok)
+        assert len(self.span_pool) >= 2, (
+            f"env `span` : moins de deux longueurs de valeur atteignables avec "
+            f"ce tokenizer ({ {k: len(v) for k, v in self.span_pool.items()} }) "
+            f"— la courbe « écart par longueur » n'existerait pas")
+        self.span_lens = sorted(self.span_pool)
+
+    def _conv_span(self) -> dict:
+        L = self.rng.choice(self.span_lens)
+        v = self.rng.choice(self.span_pool[L])
+        st, qs, ans, _, _ = self.slots[SPAN_SLOT]
+        writes = [self._user_valued(self.rng.choice(st).format(v=v, p=""), v,
+                                    slot=SPAN_SLOT, p="")]
+        used_slots, used_vals = {SPAN_SLOT}, {v}
+        for _ in range(self.span_decoys):
+            f = self._sample_fact(used_slots, used_vals)
+            used_slots.add(f["slot"])
+            used_vals.add(f["v"])
+            writes.append(self._user_valued(
+                self.rng.choice(f["st"]).format(v=f["v"], p=f["p"]), f["v"],
+                slot=f["slot"], p=f["p"]))
+        self.rng.shuffle(writes)
+        segs = list(writes)
+        for _ in range(self.rng.randint(*self.span_fillers)):
+            segs += self._filler_pair()
+        q = self.rng.choice(qs).format(p="")
+        segs.append(self._qa_seg(q, self.rng.choice(ans).format(v=v, p=""), v))
+        return {"kind": "span", "segs": segs,
+                "info": {"truths": [v], "queries": [q], "ages": [],
+                         "q_slots": [SPAN_SLOT],
+                         "p11": {"turns": [len(segs) - 1], "chan": [0],
+                                 "strate": [f"L{L}"]}}}
+
+    def next_conv(self) -> dict:
+        if self.rng.random() < self.p_smalltalk:
+            return self._conv_smalltalk()
+        return self._conv_span()
+
+
 class GroupBank(list):
     """Banque du format `toprows` : une LISTE DE LIGNES qui se souvient de ses
     GROUPES.
@@ -3107,6 +3332,70 @@ class OracleEnv:
                 fifo = fifo[-self.max_mem:]
         return out
 
+    def p11_plan(self, model: ToyReadLM, conv: dict) -> dict:
+        """PHASE 11 — {index du seg gradé → (lignes, âges, canaux)}.
+
+        Même mécanique que `cond_plan` (rejeu du FIFO, TOUS les résidents
+        injectés, aucun privilège de retrieval) avec UN canal de plus : la
+        PROVENANCE du write, lue sur le seg qui l'a produit (`seg["chan"]`,
+        posé par l'env `prov` ; 0 partout ailleurs). C'est le seul endroit où
+        le locuteur entre dans le système — il ne survit pas à la sélection
+        top-k, exactement comme les balises de rôle du chat template au 350M
+        (§2.5 : la rotation de provenance RÉIMPLÉMENTE le template dans
+        l'espace où il n'existe plus).
+
+        Rend {} hors des envs de la phase 11 : les chemins ph.6-10 ne voient
+        rien.
+        """
+        p11 = (conv.get("info") or {}).get("p11")
+        if not p11:
+            return {}
+        turns = set(p11["turns"])
+        hid = model.cfg.code in HID_CODES
+        out, fifo, w = {}, [], 0
+        for i, seg in enumerate(conv["segs"]):
+            if i in turns and fifo:
+                out[i] = (torch.stack([r for r, _, _, _ in fifo]),
+                          torch.tensor([w - 1 - t for _, t, _, _ in fifo],
+                                       dtype=torch.long),
+                          torch.tensor([c for _, _, c, _ in fifo],
+                                       dtype=torch.long),
+                          torch.tensor([sl for _, _, _, sl in fifo],
+                                       dtype=torch.long))
+            f = self.fact_of(seg)
+            if f is not None:
+                st = self.seg_tokens(seg)
+                fifo.append(((model.tophid_rows_fixed(st) if hid
+                              else model.toprows_sel_fixed(st)), w,
+                             int(seg.get("chan", 0)), int(f[0])))
+                w += 1
+                fifo = fifo[-self.max_mem:]
+        return out
+
+    def p11_target(self, conv: dict, seg_idx: int, qidx: int, ent) -> int | None:
+        """Index, DANS LE PRÉFIXE INJECTÉ, du groupe qui porte la réponse.
+
+        C'est la cible du r@1 de `evaluate_p11`, et elle se lit dans les
+        métadonnées elles-mêmes :
+          env `prov` — le groupe dont le CANAL est celui que la question nomme
+            (les deux groupes partagent slot, attribut et donc clé oracle : le
+            canal est LE seul discriminant, ce qui est tout le test) ;
+          env `span` — le groupe du SLOT interrogé (les leurres sont d'autres
+            slots).
+        Le plus RÉCENT gagne en cas d'égalité — la même convention qu'ailleurs
+        dans le labo. None = aucun groupe résident ne porte la réponse.
+        """
+        p11 = (conv.get("info") or {}).get("p11") or {}
+        chans, slots = ent[2], ent[3]
+        if conv.get("kind") == "prov":
+            want = int(p11["chan"][qidx]) if qidx < len(p11["chan"]) else 0
+            hit = [g for g in range(len(chans)) if int(chans[g]) == want]
+        else:
+            qs = (conv.get("info") or {}).get("q_slots") or []
+            sid = self.slot_ids.get(qs[qidx]) if qidx < len(qs) else None
+            hit = [g for g in range(len(slots)) if int(slots[g]) == sid]
+        return hit[-1] if hit else None
+
     def retr_plan(self, model: ToyReadLM, conv: dict) -> dict:
         """L'ÉTAT DE BANQUE vu par chaque segment de RÉPONSE gradé.
 
@@ -3217,6 +3506,27 @@ def pad_bank_age(banks: list, device, group_rows: int = 1):
             out[i, pos:pos + sz] = ng - 1 - g
             pos += sz
     return out
+
+
+def age_augment(cfg: ToyCfg, ages: torch.Tensor) -> torch.Tensor:
+    """S4 — AUGMENTATION D'ÉCHELLE des âges, à l'ENTRAÎNEMENT seulement.
+
+    Chaque lane du sous-lot tire un facteur LOG-UNIFORME dans [1, age_aug_max]
+    et ses âges sont multipliés par lui. L'ORDRE est intact (c'est lui qui
+    porte l'information « qui est plus vieux que qui ») ; seule l'ÉCHELLE du
+    compteur varie. C'est le steelman du bras BRUT : sans compression, il ne
+    peut tenir l'OOD qu'en apprenant cette invariance, et on lui donne les
+    moyens de l'apprendre.
+
+    Borne < échelles d'éval (10, 100) par construction (cf. le garde-fou de
+    ToyCfg) : une augmentation qui couvrirait l'éval ne mesurerait plus rien.
+    Tirage par le RNG GLOBAL de torch ⇒ reproductible à graine fixée.
+    """
+    if not cfg.age_aug or ages is None:
+        return ages
+    s = torch.exp(torch.rand(ages.shape[0], 1, device=ages.device)
+                  * math.log(cfg.age_aug_max))
+    return (ages.float() * s).round().long()
 
 
 def bank_ages_for(model, banks: list, device):
@@ -3341,6 +3651,17 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
     # runs des phases 6-9 ne voient RIEN de plus. `ages` voyage à côté des
     # lignes (c'est lui que `code.age_rope` rote au moment de l'aplatissement).
     ages: list = [{} for _ in convs]
+    chans: list = [{} for _ in convs]
+    if r4 and cfg.p11_env != "rule":
+        # ── PHASE 11 : les tours gradés reçoivent TOUS LES RÉSIDENTS ───────
+        # Aucun privilège de sélection (le préfixe contient le bon groupe ET
+        # ses concurrents), et le seg porte sa propre question : train et éval
+        # voient EXACTEMENT le même layout (§4.3).
+        for i, c in enumerate(convs):
+            for jj, (rows, ag, ch, _sl) in env.p11_plan(model, c).items():
+                plans[i][jj] = rows
+                ages[i][jj] = ag
+                chans[i][jj] = ch
     if r4 and cfg.cond:
         cps = [env.cond_plan(model, c) for c in convs]
         if cfg.cond_arm == "shuffle":
@@ -3435,13 +3756,17 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
             iage = None
             if has_inj and all(j in ages[i] for i in sub):
                 iage = torch.stack([ages[i][j] for i in sub]).to(device)
+                iage = age_augment(cfg, iage)
+            ichan = None
+            if has_inj and all(j in chans[i] for i in sub):
+                ichan = torch.stack([chans[i][j] for i in sub]).to(device)
             sub_banks = [banks[i] for i in sub]
             bank, bmask = pad_bank(sub_banks, device)
             bage = bank_ages_for(model, sub_banks, device)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
                                 enabled=amp):
                 logits = model(X, bank, bmask, inject=inj, inject_age=iage,
-                               bank_age=bage)
+                               bank_age=bage, inject_chan=ichan)
             s, n = seg_ce(logits, X, W)
             obj = s / total_w * scale_by if float(n) > 0 else None
             if obj is not None and ent_c > 0 and \
@@ -3687,7 +4012,8 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
 
 
 @torch.no_grad()
-def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
+def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp,
+                  age_scale: float = 1.0):
     """PHASE 10 — le Δnll CONTRASTIF de conditionnement, en 3 lectures.
 
     Pour chaque tour conditionné on tient DEUX rendus de la même réponse (même
@@ -3759,6 +4085,14 @@ def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
         rows, ages = state[1], state[2]
         if rows is None:
             return None, None, None, None, None
+        if age_scale != 1.0:
+            # ── S4, LA VIE LONGUE SYNTHÉTIQUE ──────────────────────────────
+            # Le fait est TOUJOURS en banque (rien n'est évincé), mais le
+            # COMPTEUR DE WRITES a grandi : c'est exactement l'OOD que le
+            # design doit encaisser. L'ordre des âges est préservé, seule leur
+            # échelle change — comme au train sous `age_aug`, mais 10× ou 100×
+            # au-delà de ce que l'augmentation couvre.
+            ages = (ages.float() * float(age_scale)).round().long()
         return None, None, rows[None].to(device), ages[None].to(device), None
 
     def _nll(seg, state):
@@ -3814,8 +4148,124 @@ def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
         acc[f"n_mark_{cond_name}"] = n_m
     acc["n"] = len(items)
     acc["n_convs"] = len({id(x["conv"]) for x in items})
+    acc["age_scale"] = float(age_scale)
     model.train()
     return acc
+
+
+@torch.no_grad()
+def evaluate_p11(model, env, stream, seed, n_convs, device, tok, stop_id,
+                 max_new, max_len, amp):
+    """PHASE 11 — l'éval des envs `prov` (S5) et `span` (S17).
+
+    DEUX MESURES SÉPARÉES, et c'est le point (§3-S5) :
+
+      `r_at1`  la SÉLECTION. Dans `kvproj` il n'y a pas de retriever : la
+               sélection EST l'attention. On lit donc la MASSE D'ATTENTION par
+               ligne de banque (sonde `bank_attn_probe`, qui n'altère pas le
+               forward), on la somme PAR GROUPE, et on compte les tours où le
+               groupe porteur sort en tête. C'est un r@1 sur le mécanisme
+               réel, pas sur un module de substitution.
+      `grade`  la COPIE. Décodage greedy depuis le préfixe [question | A_OPEN]
+               — le MÊME que celui vu au train — et `grade_recall` exige la
+               chaîne exacte, donc l'ordre des tokens.
+
+    Les deux peuvent diverger, et c'est l'hypothèse à tester : une
+    perturbation rotative des clés peut aider la sélection ET casser le circuit
+    de copie, câblé sur le layout (ph.8). Un chiffre agrégé les confondrait.
+
+    Bras ABLATÉ : le même tour SANS injection (backbone nu). Il borne ce que le
+    prior LM et la question seule donnent.
+    """
+    model.eval()
+    stream.rng = random.Random(seed)
+    rows: list = []
+    done = guard = 0
+    while done < n_convs and guard < n_convs * 20:
+        guard += 1
+        conv = stream.next_conv()
+        p11 = (conv.get("info") or {}).get("p11")
+        if not p11:
+            continue
+        done += 1
+        truths = conv["info"]["truths"]
+        strates = p11["strate"]
+        plan = env.p11_plan(model, conv)
+        qi = 0
+        for i, seg in enumerate(conv["segs"]):
+            if i not in set(p11["turns"]):
+                continue
+            ent = plan.get(i)
+            tr = truths[qi] if qi < len(truths) else "?"
+            st = strates[qi] if qi < len(strates) else "?"
+            ch = p11["chan"][qi] if qi < len(p11["chan"]) else 0
+            qi += 1
+            if ent is None:                 # rien de résident : rien à lire
+                rows.append({"strate": st, "chan": ch, "hit": None,
+                             "live": "", "abl": "", "truth": tr})
+                continue
+            r, ag, cc = (t[None].to(device) for t in ent[:3])
+            X = seg["input_ids"][:, :max_len].to(device)
+            with bank_attn_probe(model) as probe, \
+                    torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
+                                   enabled=amp):
+                model(X, None, None, inject=r, inject_age=ag, inject_chan=cc)
+                mass = probe.mass()
+            hit = None
+            if mass is not None:
+                # somme PAR GROUPE (les lignes d'un groupe sont contiguës, cf.
+                # l'aplatissement [G,k] → [G·k])
+                G, k = r.shape[1], r.shape[2]
+                per_g = mass[0, :G * k].reshape(G, k).sum(-1)
+                # le groupe PORTEUR : celui dont le canal ET la position
+                # correspondent à la question. En `prov` deux groupes existent,
+                # un par canal ; en `span` c'est le groupe du slot interrogé,
+                # qui est le seul dont le canal vaut 0 et la valeur la vérité —
+                # on le repère par sa position dans le plan.
+                tgt = env.p11_target(conv, i, qi - 1, ent)
+                if tgt is not None:
+                    hit = int(int(per_g.argmax()) == tgt)
+            pre = X[:, :int(seg.get("q_len", 0))]
+            live = tok.decode(model.greedy(pre, None, None, max_new, stop_id,
+                                           inject=r, inject_age=ag,
+                                           inject_chan=cc))
+            abl = tok.decode(model.greedy(pre, None, None, max_new, stop_id))
+            rows.append({"strate": st, "chan": ch, "hit": hit,
+                         "live": live, "abl": abl, "truth": tr})
+    out = {"n": len(rows)}
+    live = [r["live"] for r in rows]
+    abl = [r["abl"] for r in rows]
+    tru = [r["truth"] for r in rows]
+    out["grade_live"] = grade_recall(live, tru) if rows else float("nan")
+    out["grade_abl"] = grade_recall(abl, tru) if rows else float("nan")
+    hits = [r["hit"] for r in rows if r["hit"] is not None]
+    out["r_at1"] = (sum(hits) / len(hits)) if hits else float("nan")
+    out["n_sel"] = len(hits)
+    strat: dict = {}
+    for r in rows:
+        strat.setdefault(r["strate"], []).append(r)
+    out["strates"] = {
+        s: {"n": len(v), "grade": grade_recall([x["live"] for x in v],
+                                               [x["truth"] for x in v]),
+            "grade_abl": grade_recall([x["abl"] for x in v],
+                                      [x["truth"] for x in v]),
+            "r_at1": (sum(x["hit"] for x in v if x["hit"] is not None)
+                      / max(sum(1 for x in v if x["hit"] is not None), 1))
+            if any(x["hit"] is not None for x in v) else float("nan")}
+        for s, v in sorted(strat.items())}
+    model.train()
+    return out
+
+
+def parse_scales(s) -> tuple:
+    """« 1,10,100 » → (1.0, 10.0, 100.0). La première EST le régime du train."""
+    if isinstance(s, (list, tuple)):
+        vals = [float(v) for v in s]
+    else:
+        vals = [float(v) for v in str(s).replace(" ", "").split(",") if v]
+    assert vals and vals[0] == 1.0, (
+        f"age_eval_scales doit commencer par 1 (le régime vu au train) : {s!r}")
+    return tuple(vals)
 
 
 # ── nom de run (⇒ save_dir) ──────────────────────────────────────────────────
@@ -3839,6 +4289,10 @@ def grid_name(cfg: ToyCfg) -> str:
     Le seed n'entre PAS dans le nom : la grille tourne à seed FIXE, un run par
     combo. Un balayage de graine, s'il vient, ajoutera son propre suffixe.
     """
+    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+        # PHASE 11 : ses cellules ont leur propre espace de noms — aucune ne
+        # peut retomber sur un dossier de la grille §2.4 déjà lancée.
+        return p11_name(cfg)
     name = (f"read-{GRID_READ.get((cfg.variant, cfg.read_path), cfg.variant)}"
             f"_rot-{'on' if cfg.age_rope else 'off'}"
             f"_tap-{GRID_TAP.get(cfg.code, cfg.code)}"
@@ -3861,6 +4315,83 @@ def grid_name(cfg: ToyCfg) -> str:
     if cfg.write_mode != ToyCfg.write_mode:
         name += f"_w{cfg.write_mode}"
     return name
+
+
+# ══ PHASE 11 — NOMMAGE ET GRILLE DES QUATRE EXAMENS ═════════════════════════
+# Un examen = une question du registre §3, un jeu de bras, un save_dir par
+# cellule. Le préfixe `p11-` isole les 22 cellules des 96 déjà lancées, et le
+# ROOT de save_dir change aussi (checkpoints/toy_read_lab_p11) : deux barrières
+# indépendantes contre l'écrasement d'un run fini.
+P11_ARM = {"none": "agezero", "age-log": "agelog", "age-raw": "ageraw",
+           "age-bias": "agebias"}
+
+
+def p11_exam(cfg: ToyCfg) -> str:
+    """L'examen d'une config : age (S3) | ood (S4) | tag (S5) | locidx (S17)."""
+    if cfg.p11_env == "prov":
+        return "tag"
+    if cfg.p11_env == "span":
+        return "locidx"
+    return "ood" if cfg.age_aug else "age"
+
+
+def p11_name(cfg: ToyCfg) -> str:
+    """`p11-<examen>_<bras>_m<k>` — le nom se relit comme la cellule."""
+    ex = p11_exam(cfg)
+    if ex in ("age", "ood"):
+        arm = P11_ARM[cfg.bank_rot] + ("-aug" if cfg.age_aug else "")
+    elif ex == "tag":
+        arm = "tag" + cfg.tag_mode
+    else:
+        arm = "loc" + cfg.loc_mode
+    return f"p11-{ex}_{arm}_m{cfg.top_k}"
+
+
+# Les bras de chaque examen, EN CLAIR. Chaque liste contient son CONTRÔLE (la
+# baseline à battre) — sans lui l'examen ne tranche rien.
+P11_EXAMS = {
+    # S3 — la rotation d'âge doit BATTRE θ_âge=0 (contrôle HoPE, non
+    # négociable) ; `age-bias` est le fallback prévu par la règle de décision.
+    "age": {"env": "rule", "ms": (4, 8),
+            "arms": [{"bank_rot": "none"}, {"bank_rot": "age-log"},
+                     {"bank_rot": "age-raw"}, {"bank_rot": "age-bias"}]},
+    # S4 — OOD d'âge. Les comparateurs NON augmentés sont les cellules m4 de
+    # l'examen `age` (mêmes graine, mêmes steps, même env : appariement exact),
+    # on ne les relance pas. Ne sont neuves que les deux augmentées.
+    "ood": {"env": "rule", "ms": (4,),
+            "arms": [{"bank_rot": "age-raw", "age_aug": True},
+                     {"bank_rot": "age-log", "age_aug": True}]},
+    # S5 — tag de provenance : rotatif contre additif contre rien.
+    "tag": {"env": "prov", "ms": (4, 8),
+            "arms": [{"tag_mode": "none"}, {"tag_mode": "rot"},
+                     {"tag_mode": "add"}]},
+    # S17 — index local intra-span : rotatif contre additif contre rien.
+    "locidx": {"env": "span", "ms": (4, 8),
+               "arms": [{"loc_mode": "none"}, {"loc_mode": "rot"},
+                        {"loc_mode": "add"}]},
+}
+
+
+def p11_combos(exam: str) -> list:
+    """Les cellules d'un examen, dans un ordre stable."""
+    assert exam in P11_EXAMS, f"examen inconnu {exam!r} (∈ {tuple(P11_EXAMS)})"
+    spec = P11_EXAMS[exam]
+    return [{"exam": exam, "env": spec["env"], "m": int(m), **arm}
+            for arm in spec["arms"] for m in spec["ms"]]
+
+
+def _p11_cfg(combo: dict, base: dict) -> ToyCfg:
+    """Config d'une cellule ph.11 : kvproj + tap postnorm, le SOMMET ADOPTÉ.
+
+    Les axes déjà tranchés sont FIXÉS, pas rebalayés — `kv_proj` (S1) et le
+    prélèvement postnorm (tap ≈ neutre au jouet, ph.10 §6). Ne varient que le
+    bras de métadonnées et m.
+    """
+    kw = {k: v for k, v in combo.items() if k not in ("exam", "env", "m")}
+    return ToyCfg(**{**base, "variant": "r4", "code": "tophid",
+                     "read_path": "kvproj", "top_k": int(combo["m"]),
+                     "p11_env": combo["env"],
+                     "cond": combo["env"] == "rule", **kw})
 
 
 def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
@@ -3911,6 +4442,81 @@ def _grid_cfg(combo: dict, base: dict) -> ToyCfg:
                      "fw_additive": bool(combo.get("fw_additive")),
                      "bank_q": bool(combo.get("bank_q")),
                      "cond": True})
+
+
+P11_NOTE = {
+    "age": ("S3 — la rotation doit BATTRE le contrôle θ_âge=0 (`agezero`, "
+            "HoPE) sur la CITATION ; sinon l'âge passe en biais scalaire "
+            "(`agebias`, 1 paramètre)"),
+    "ood": ("S4 — OOD d'âge : chaque run est ÉVALUÉ aux échelles 1/10/100. "
+            "Comparateurs non augmentés = les cellules m4 de l'examen `age` "
+            "(mêmes graine/steps/env, appariement exact — NE PAS relancer)"),
+    "tag": ("S5 — A/B INÉDIT rotation vs additif sur un tag catégoriel : "
+            "mesurer r@1 (masse d'attention par groupe) ET grade de copie "
+            "SÉPARÉMENT, la rotation peut aider l'un et casser l'autre"),
+    "locidx": ("S17 — prédiction PRÉENREGISTRÉE : l'écart rot−add CROÎT avec "
+               "la longueur du span (l'additif donne des signatures, jamais "
+               "l'opérateur successeur R_loc(1))"),
+}
+
+
+def print_p11_manifest(config: str, base: dict, save_root: str,
+                       fmt: str = "tsv", b_convs: int = 8,
+                       exam: str = "age") -> None:
+    """Le manifeste d'un examen de la phase 11 (cf. print_grid_manifest)."""
+    rows = []
+    for combo in p11_combos(exam):
+        cfg = _p11_cfg(combo, base)
+        m = combo["m"]
+        G = cfg.cond_groups if cfg.cond else 2
+        mod = ToyReadLM(cfg, 11, 12, sif_w=torch.ones(cfg.vocab_size))
+        pr = param_report(mod)
+        rot = next((b.attn.rot for b in mod.blocks
+                    if getattr(b.attn, "rot", None) is not None), None)
+        del mod
+        opt_go = pr["total"] * 16 / 2 ** 30
+        act_go = (b_convs * cfg.max_seq_len * cfg.vocab_size * 4 * 3) / 2 ** 30
+        vram = opt_go + act_go
+        arm = (P11_ARM[cfg.bank_rot] + ("-aug" if cfg.age_aug else "")
+               if exam in ("age", "ood") else
+               "tag" + cfg.tag_mode if exam == "tag" else "loc" + cfg.loc_mode)
+        flags = ""
+        if cfg.bank_rot != "none":
+            flags += f" --bank-rot {cfg.bank_rot}"
+        if cfg.age_aug:
+            flags += " --age-aug"
+        if cfg.tag_mode != "none":
+            flags += f" --tag {cfg.tag_mode}"
+        if cfg.loc_mode != "none":
+            flags += f" --locidx {cfg.loc_mode}"
+        cmd = (f"python -m deepseek_v4_mini.toy_read_lab {config} "
+               f"--read kv_proj --tap postnorm --m {m} "
+               f"--p11-env {combo['env']}{flags}"
+               + (" --cond" if cfg.cond else ""))
+        note = P11_NOTE[exam]
+        if rot is not None:
+            note += (f" | plans {rot.na}âge/{rot.nc}canal/{rot.nl}local, "
+                     f"dérive de requête {rot.drift:.3f} rad sur la fenêtre "
+                     f"(max {cfg.rot_drift_max})")
+        if vram > 8.0:
+            note += f" | ⚠️ NE TIENT PAS EN 8 Go ({vram:.1f} Go estimés)"
+        rows.append({"run": p11_name(cfg), "exam": exam, "arm": arm,
+                     "env": combo["env"], "m": m,
+                     "load": f"{G * m} clés projetées (softmax UNIFIÉ)",
+                     "params_M": f"{pr['total'] / 1e6:.1f}",
+                     "vram_Go_est": f"{vram:.2f}",
+                     "cout_rel": f"{1.22 * (1.0 + 0.03 * (m - 1)):.2f}",
+                     "save_dir": os.path.join(save_root, p11_name(cfg)),
+                     "cmd": cmd, "note": note})
+    if fmt == "json":
+        import json
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    cols = ["run", "exam", "arm", "env", "m", "load", "params_M",
+            "vram_Go_est", "cout_rel", "save_dir", "cmd", "note"]
+    print("\t".join(cols))
+    for r in rows:
+        print("\t".join(str(r[c]) for c in cols))
 
 
 def print_grid_manifest(config: str, base: dict, save_root: str,
@@ -4029,6 +4635,8 @@ def run_name_for(cfg: ToyCfg) -> str:
     à UN groupe injecté, donc tout entraînement à plusieurs groupes doit sortir
     ailleurs, y compris quand c'est devenu le défaut.
     """
+    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+        return p11_name(cfg)
     if cfg.cond:
         # PHASE 10 : le dossier se relit comme le combo de la grille §2.4.
         return grid_name(cfg)
@@ -4228,14 +4836,47 @@ def main(argv=None):
                          "étages disparaît. Défaut OFF (le bras multiplicatif "
                          "divergent est une donnée de la grille). Ajoute "
                          "_fwadd au save_dir. Refusé hors variantes à boucle.")
+    # ── PHASE 11 : les trois familles de métadonnées (spec §2.5) ───────────
+    ap.add_argument("--bank-rot", choices=BANK_ROTS, default=None,
+                    dest="bank_rot",
+                    help="famille ÂGE sur les clés banque projetées (S3/S4) : "
+                         "none = le CONTRÔLE θ_âge=0 (HoPE, la baseline à "
+                         "battre) | age-log = φ(a) log-comprimé, fréquences "
+                         "apprises | age-raw = âge brut | age-bias = pas de "
+                         "rotation, un biais scalaire de récence w·a sur le "
+                         "logit banque (le fallback de la règle S3)")
+    ap.add_argument("--age-aug", action="store_true", dest="age_aug",
+                    help="S4 : au TRAIN, échelle des âges tirée log-uniforme "
+                         "dans [1, age_aug_max] (l'ordre est préservé). "
+                         "Steelman du bras brut face à l'OOD.")
+    ap.add_argument("--age-eval-scales", default=None, dest="age_eval_scales",
+                    help="S4 : échelles d'âge de l'éval contrastive, la "
+                         "première étant 1 (le régime du train). Défaut "
+                         "1,10,100.")
+    ap.add_argument("--tag", choices=TAG_MODES, default=None, dest="tag_mode",
+                    help="famille PROVENANCE (S5) : none | rot (un plan 0/π "
+                         "PAR CANAL) | add (vecteur appris par canal sur les "
+                         "MÊMES dims réservées). Exige --p11-env prov.")
+    ap.add_argument("--locidx", choices=LOC_MODES, default=None,
+                    dest="loc_mode",
+                    help="famille INDEX LOCAL intra-span (S17) : none | rot "
+                         "(R_loc(j), opérateur successeur constant) | add "
+                         "(embedding de position locale appris).")
+    ap.add_argument("--p11-env", choices=P11_ENVS, default=None,
+                    dest="p11_env",
+                    help="env de la phase 11 : rule (la vie-règle de la "
+                         "ph.10) | prov (locuteur user/self, S5) | span "
+                         "(valeurs de longueur graduée, S17)")
     ap.add_argument("--manifest-subset", default="all",
-                    choices=tuple(GRID_SUBSETS),
+                    choices=tuple(GRID_SUBSETS) + tuple(P11_EXAMS),
                     dest="manifest_subset",
                     help="restreint le manifeste : all (36) | seqfw (les 12 "
                          "cellules fast-weight) | seqfw-additive (les MÊMES 12 "
                          "axes rot/tap/m avec --fw-additive, noms suffixés "
                          "_fwadd) | attn (les 24 cellules inject/kv) | dual "
-                         "(les 12 cellules à TÊTES DÉDIÉES)")
+                         "(les 12 cellules à TÊTES DÉDIÉES) | kvproj | "
+                         "kvproj-bq ; PHASE 11 : age (8) | ood (2) | tag (6) "
+                         "| locidx (6)")
     ap.add_argument("--manifest", choices=("tsv", "json"), default=None,
                     help="n'entraîne RIEN : imprime le MANIFESTE de la grille "
                          "§2.4 (36 combos, commande exacte, save_dir et coût "
@@ -4338,6 +4979,32 @@ def main(argv=None):
     if a.cond_decoys is not None:
         mc["cond_decoys"] = int(a.cond_decoys)
     mc["cond"] = bool(a.cond)
+    # ── PHASE 11 : bloc YAML `p11:` puis surcharges CLI ────────────────────
+    pb = dict(raw.get("p11") or {})
+    for key, cast in (("bank_rot", str), ("age_planes", int), ("age_ref", int),
+                      ("age_aug", bool), ("age_aug_max", float),
+                      ("age_eval_scales", str), ("tag_mode", str),
+                      ("n_channels", int), ("loc_mode", str),
+                      ("loc_planes", int), ("rot_drift_max", float),
+                      ("p11_env", str)):
+        if key in pb:
+            mc[key] = cast(pb[key])
+    for key, val in (("bank_rot", a.bank_rot), ("tag_mode", a.tag_mode),
+                     ("loc_mode", a.loc_mode), ("p11_env", a.p11_env),
+                     ("age_eval_scales", a.age_eval_scales)):
+        if val is not None:
+            mc[key] = val
+    if a.age_aug:
+        mc["age_aug"] = True
+    if a.manifest and a.manifest_subset in P11_EXAMS:
+        print_p11_manifest(
+            a.config, {k: v for k, v in mc.items()
+                       if k not in ("variant", "code", "read_path", "top_k",
+                                    "cond", "p11_env", "bank_rot", "age_aug",
+                                    "tag_mode", "loc_mode")},
+            t.get("save_dir", "./checkpoints/toy_read_lab"), a.manifest,
+            b_convs=int(t.get("batch_convs", 8)), exam=a.manifest_subset)
+        return
     if a.manifest:
         print_grid_manifest(
             a.config, {k: v for k, v in mc.items()
@@ -4373,6 +5040,14 @@ def main(argv=None):
                           else t.get("cond_eval_convs", 32))
     if a.smoke:
         mc.update(d_model=64, n_layers=2, n_heads=4, mem_dim=64, x_dim=0)
+        if any(mc.get(k, "none") != "none" for k in ("bank_rot", "tag_mode",
+                                                     "loc_mode")):
+            # PHASE 11 : à 4 têtes le smoke n'a que 8 paires par tête et la
+            # bande quasi statique n'y loge pas 4 plans (dérive 3,19 rad sur la
+            # fenêtre) — le garde-fou §2.5 refuserait, à raison. On élargit la
+            # TÊTE (2 têtes de 32 dims) plutôt que d'assouplir le garde-fou :
+            # un smoke qui passe en desserrant l'invariant ne prouve rien.
+            mc["n_heads"] = 2
         steps, b_convs, eval_every, eval_convs, max_new = 2, 2, 1, 1, 8
         cond_eval_convs = 2
 
@@ -4392,10 +5067,20 @@ def main(argv=None):
         mc["inject_sep_id"] = int(tok.convert_tokens_to_ids("<blank>"))
     cfg = ToyCfg(**mc)
     # PHASE 10 : le stream gagne un troisième genre de conv, il ne perd rien.
-    P = PersonaRuleStream if cfg.cond else chat_stream_class("persona")
+    # PHASE 11 : `prov`/`span` REMPLACENT le stream (leurs tours gradés portent
+    # leur question — cf. Persona11Stream).
+    P = ({"prov": PersonaProvStream, "span": PersonaSpanStream}[cfg.p11_env]
+         if cfg.p11_env != "rule" else
+         PersonaRuleStream if cfg.cond else chat_stream_class("persona"))
+    # kwargs du stream ph.11 : filtrés PAR PRÉFIXE (`prov_*` / `span_*`) —
+    # les deux envs vivent dans le même bloc YAML mais n'acceptent pas les
+    # mêmes arguments, et PersonaChatStream lèverait sur l'intrus.
+    p11_gen = {k: v for k, v in ((raw.get("p11") or {}).get("gen") or {}).items()
+               if k.startswith(f"{cfg.p11_env}_")}
 
     def pk(split, **over):
-        return {**persona_kwargs(raw, split, a.smoke, cond=cfg.cond), **over}
+        return {**persona_kwargs(raw, split, a.smoke, cond=cfg.cond),
+                **(p11_gen if cfg.p11_env != "rule" else {}), **over}
 
     sif_w = None
     if cfg.code in SIF_CODES:
@@ -4557,6 +5242,36 @@ def main(argv=None):
               + f" | m = {cfg.top_k} ligne(s)/write | âge "
               + ("ROTÉ (DFT sur max_mem rangs de récence)" if cfg.age_rope
                  else "non codé"), flush=True)
+    if cfg.uses_p11_meta or cfg.p11_env != "rule":
+        rot = next((b.attn.rot for b in model.blocks
+                    if getattr(b.attn, "rot", None) is not None), None)
+        print(f"  PHASE 11 — examen `{p11_exam(cfg)}` (spec §2.5, registre "
+              f"§3) | env `{cfg.p11_env}` | âge `{cfg.bank_rot}`"
+              + (f" (A_ref {cfg.age_ref}, augmentation d'échelle ON ≤ "
+                 f"×{cfg.age_aug_max:g})" if cfg.age_aug else "")
+              + f" | tag `{cfg.tag_mode}` | index local `{cfg.loc_mode}`",
+              flush=True)
+        if rot is not None:
+            print(f"    plans sur K' (APRÈS W_K', jamais avant) : "
+                  f"âge {list(map(int, rot.age_idx))} | canal "
+                  f"{list(map(int, rot.tag_idx))} | local "
+                  f"{list(map(int, rot.loc_idx))} — paires de tête TRIÉES par "
+                  f"fréquence RoPE, dérive de la requête sur toute la fenêtre "
+                  f"{rot.drift:.4f} rad (garde {cfg.rot_drift_max}) : c'est "
+                  f"l'appariement §2.5 « plans de métadonnées sur les dims "
+                  f"quasi statiques ».", flush=True)
+        if cfg.bank_rot == "age-bias":
+            print("    bras `age-bias` : AUCUNE rotation — un biais scalaire "
+                  "de récence b(a) = w·a (1 paramètre) sur le logit des "
+                  "colonnes banque. Sa valeur finale EST une mesure.",
+                  flush=True)
+        if cfg.p11_env != "rule":
+            print(f"    layout : la QUESTION est DANS le seg gradé (non "
+                  f"supervisée) et le décodage part de [question | A_OPEN] — "
+                  f"au train comme à l'éval. Sans elle, deux candidats en "
+                  f"banque rendraient la tâche indécidable (ph.8). "
+                  f"TOUS les résidents sont injectés : aucun privilège de "
+                  f"sélection.", flush=True)
     if cfg.uses_fw:
         n_sub = cfg.max_mem * (cfg.group_rows if cfg.code in GROUP_CODES else 1)
         print(f"  boucle fast-weight : {n_sub} sous-slots × {cfg.n_layers} "
@@ -4641,6 +5356,42 @@ def main(argv=None):
                   + f" | {time.time()-t0:.0f}s",
                   flush=True)
         last = step == steps - 1
+        if ((step + 1) % eval_every == 0 or last) and cfg.p11_env != "rule":
+            # ── PHASE 11 (S5/S17) : SÉLECTION et COPIE, séparément ─────────
+            # `evaluate` (ph.9) ne s'applique pas ici : son décodage part de
+            # A_OPEN seul et son injection est le groupe ORACLE, deux choses
+            # que ces envs ne font pas (ils injectent TOUS les résidents et
+            # posent la question dans le seg). Un bras au layout jamais
+            # entraîné ne mesure rien (leçon KT2).
+            pv = evaluate_p11(model, env, ev_stream, 1234, eval_convs, device,
+                              tok, stop_id, max_new, max_len, amp)
+            pt = evaluate_p11(model, env, tc_stream, 4321, eval_convs, device,
+                              tok, stop_id, max_new, max_len, amp)
+            print(f"  [eval {step+1}] P11/{cfg.p11_env} HELD-OUT grade "
+                  f"{pv['grade_live']:.3f} (abl {pv['grade_abl']:.3f}) | "
+                  f"r@1 attention {pv['r_at1']:.3f} (n={pv['n_sel']}) "
+                  f"| TRAIN grade {pt['grade_live']:.3f} r@1 "
+                  f"{pt['r_at1']:.3f} | n={pv['n']}", flush=True)
+            print("    strates : " + "  ".join(
+                f"{s} grade {d['grade']:.3f} r@1 {d['r_at1']:.3f} (n={d['n']})"
+                for s, d in pv["strates"].items()), flush=True)
+            with open(csv_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_csv:
+                    w.writerow(["step", "loss", "grade_live", "grade_abl",
+                                "r_at1", "n_sel", "n", "grade_train",
+                                "r_at1_train", "sec"])
+                    new_csv = False
+                w.writerow([step + 1, f"{loss:.5f}", f"{pv['grade_live']:.4f}",
+                            f"{pv['grade_abl']:.4f}", f"{pv['r_at1']:.4f}",
+                            pv["n_sel"], pv["n"], f"{pt['grade_live']:.4f}",
+                            f"{pt['r_at1']:.4f}", f"{time.time()-t0:.0f}"])
+            if pv["grade_live"] > best:
+                best = pv["grade_live"]
+                torch.save({"step": step + 1, "model": model.state_dict(),
+                            "cfg": cfg.__dict__, "grade": best},
+                           os.path.join(save_dir, "best.pt"))
+            continue
         if (step + 1) % eval_every == 0 or last:
             ev = evaluate(model, env, ev_stream, 1234, eval_convs, device, tok,
                           a_open, stop_id, max_new, max_len, amp)
@@ -4754,7 +5505,31 @@ def main(argv=None):
     # l'erreur-type sous 0.03 pour un coût payé UNE fois. Même fonction, même
     # stream held-out, même graine : seul n_convs change.
     fv = fc = None
-    if final_eval_convs > 0:
+    fp11 = None
+    if final_eval_convs > 0 and cfg.p11_env != "rule":
+        fp11 = evaluate_p11(model, env, ev_stream, 1234, final_eval_convs,
+                            device, tok, stop_id, max_new, max_len, amp)
+        se = math.sqrt(max(fp11["grade_live"] * (1 - fp11["grade_live"]), 1e-9)
+                       / max(fp11["n"], 1))
+        print(f"  [final] P11/{cfg.p11_env} ({final_eval_convs} convs) grade "
+              f"{fp11['grade_live']:.3f} ± {se:.3f} (SE) | abl "
+              f"{fp11['grade_abl']:.3f} | r@1 attention {fp11['r_at1']:.3f} "
+              f"(n={fp11['n_sel']}) | n={fp11['n']}", flush=True)
+        for s, d in fp11["strates"].items():
+            print(f"    [final] strate {s} : grade {d['grade']:.3f} "
+                  f"(abl {d['grade_abl']:.3f}) r@1 {d['r_at1']:.3f} "
+                  f"n={d['n']}", flush=True)
+        fpp = os.path.join(save_dir, "p11_metrics.csv")
+        with open(fpp, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["strate", "n", "grade", "grade_abl", "r_at1"])
+            w.writerow(["ALL", fp11["n"], f"{fp11['grade_live']:.5f}",
+                        f"{fp11['grade_abl']:.5f}", f"{fp11['r_at1']:.5f}"])
+            for s, d in fp11["strates"].items():
+                w.writerow([s, d["n"], f"{d['grade']:.5f}",
+                            f"{d['grade_abl']:.5f}", f"{d['r_at1']:.5f}"])
+        print(f"  [final] écrit {fpp}", flush=True)
+    elif final_eval_convs > 0:
         fv = evaluate(model, env, ev_stream, 1234, final_eval_convs, device,
                       tok, a_open, stop_id, max_new, max_len, amp, n_show=0)
         se = math.sqrt(max(fv["grade_live"] * (1 - fv["grade_live"]), 1e-9)
@@ -4832,6 +5607,29 @@ def main(argv=None):
             w.writerow([f"{fc[c]:.5f}" if fc[c] == fc[c] else "" for c in
                         cols[:-2]] + [fc["n"], fc["n_convs"]])
         print(f"  [final] écrit {fcp}", flush=True)
+    # ── S4 : LA COURBE D'OOD D'ÂGE ─────────────────────────────────────────
+    # Le MÊME modèle, la MÊME éval, les MÊMES vies — seul le compteur de
+    # writes est multiplié. C'est la définition opératoire de « vie longue » :
+    # le fait est toujours en banque, son âge a explosé. Le bras qui tient
+    # l'échelle 100 gagne S4.
+    food = None
+    if cfg.cond and final_eval_convs > 0 and cfg.bank_rot != "none":
+        scales = parse_scales(cfg.age_eval_scales)
+        food = {"1.0": {k: fc[k] for k in ("mark_live", "acc_live",
+                                           "dnll_live")}}
+        for sc in scales[1:]:
+            fo = evaluate_cond(model, env, cv_stream, 2468, final_eval_convs,
+                               device, max_len, amp, age_scale=sc)
+            food[str(sc)] = {k: fo[k] for k in ("mark_live", "acc_live",
+                                                "dnll_live")}
+            print(f"  [final] OOD âge ×{sc:g} — Δnll MARQUEURS live "
+                  f"{fo['mark_live']:+.4f} | 2AFC {fo['acc_live']:.3f} | "
+                  f"Δnll tous tokens {fo['dnll_live']:+.4f}", flush=True)
+        print(f"    LECTURE (S4) : le bras qui garde sa marge à ×"
+              f"{scales[-1]:g} tient l'OOD ; la prédiction inscrite est que "
+              f"`age-raw` s'effondre et que `age-log` tient (l'augmentation "
+              f"d'échelle au train, si elle est ON, est le steelman du brut).",
+              flush=True)
     # ── RÉSULTAT PARSABLE : UN json par run, agrégeable sans grep ───────────
     # Il porte le COMBO (les quatre axes en clair) et les DEUX métriques du
     # run : conditionnement contrastif (avec ses contrôles shuf/none) et
@@ -4861,12 +5659,44 @@ def main(argv=None):
                              for b in model.blocks
                              if getattr(b.attn, "kvproj", False)]
                             if cfg.read_path == "kvproj" else None),
+        # ── PHASE 11 : le combo de métadonnées, ses mesures, sa courbe OOD ─
+        "p11": ({"exam": p11_exam(cfg), "env": cfg.p11_env,
+                 "bank_rot": cfg.bank_rot, "age_aug": bool(cfg.age_aug),
+                 "age_ref": cfg.age_ref, "age_planes": cfg.age_planes,
+                 "tag_mode": cfg.tag_mode, "loc_mode": cfg.loc_mode,
+                 "loc_planes": cfg.loc_planes,
+                 "drift_rad": next((round(float(b.attn.rot.drift), 6)
+                                    for b in model.blocks
+                                    if getattr(b.attn, "rot", None) is not None),
+                                   None),
+                 # les FRÉQUENCES APPRISES : leur dérive depuis l'init
+                 # géométrique est une mesure (le modèle a-t-il voulu d'autres
+                 # échelles que celles qu'on lui a données ?)
+                 "age_omega": [[round(float(v), 6) for v in
+                                torch.exp(b.attn.rot.age_log_omega.detach()
+                                          .cpu())]
+                               for b in model.blocks
+                               if getattr(b.attn, "rot", None) is not None
+                               and hasattr(b.attn.rot, "age_log_omega")],
+                 "age_bias_w": [round(float(b.attn.rot.age_bias_w.detach()
+                                            .cpu()), 6)
+                                for b in model.blocks
+                                if getattr(b.attn, "rot", None) is not None
+                                and hasattr(b.attn.rot, "age_bias_w")],
+                 "selection_citation": ({"grade_live": fp11["grade_live"],
+                                         "grade_abl": fp11["grade_abl"],
+                                         "r_at1": fp11["r_at1"],
+                                         "n": fp11["n"], "n_sel": fp11["n_sel"],
+                                         "strates": fp11["strates"]}
+                                        if fp11 else None),
+                 "ood_age": food}
+                if (cfg.uses_p11_meta or cfg.p11_env != "rule") else None),
         "citation": ({"grade_live": fv["grade_live"],
                       "grade_abl": fv["grade_abl"], "dnll": fv["dnll"],
                       "grade_resident": fv["grade_resident"],
                       "n": fv["n"], "n_convs": final_eval_convs,
                       "strates": {g: fv[f"grade_{g}"] for g in GROUPS}}
-                     if final_eval_convs > 0 else None),
+                     if fv is not None else None),
         # Le CONDITIONNEMENT et ses DEUX contrôles, à plat : `live` est le
         # bras, `shuf` la banque MÉLANGÉE, `none` la borne SANS MÉMOIRE.
         "conditioning": (dict(fc) if cfg.cond and final_eval_convs > 0

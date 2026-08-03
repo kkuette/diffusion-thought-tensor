@@ -1,0 +1,190 @@
+# toy_read_lab — PHASE 11 : LES MÉTADONNÉES SE CODENT-ELLES PAR ROTATION ?
+#
+# Clone de toy_read_lab_d512_p10.yaml (mêmes dims, même tokenizer, mêmes 3000
+# steps / seed 0) avec le bloc `p11:` en plus et un save_dir séparé. La grille
+# §2.4 est TRANCHÉE (S1 : kvproj adopté, +0,209 de Δnll citation apparié) : on
+# ne rebalaye ni le chemin de lecture ni le point de prélèvement, on ne fait
+# varier que le CODAGE DES MÉTADONNÉES et m.
+#
+# ── LES QUATRE EXAMENS (registre §3 de SPEC_MEMOIRE_V2) ─────────────────────
+#   age     S3  la rotation d'âge doit BATTRE le contrôle θ_âge=0 (HoPE) sur la
+#               citation. Bras : agezero (contrôle) / agelog / ageraw /
+#               agebias (biais scalaire de récence, 1 paramètre = le fallback
+#               prévu par la règle de décision). 8 cellules.
+#   ood     S4  OOD d'âge : chaque run est évalué aux échelles 1 / 10 / 100
+#               (vies longues synthétiques — le fait reste en banque, le
+#               compteur de writes grandit). 2 cellules NEUVES (les bras non
+#               augmentés SONT les cellules m4 de l'examen `age`, mêmes
+#               graine/steps/env : appariement exact, on ne relance rien).
+#   tag     S5  provenance user/self : rotation (un plan 0/π PAR CANAL) contre
+#               vecteur additif appris sur les MÊMES dims contre rien. C'est
+#               l'A/B que la littérature n'a pas (cf. veille : SIREN-RoPE et
+#               TS-RoPE soutiennent la rotation, aucun ne l'oppose proprement à
+#               l'additif sur un tag catégoriel NON ORDONNÉ). 6 cellules.
+#   locidx  S17 index local intra-span : R_loc(j) contre embedding additif
+#               contre rien, sur des valeurs de longueur GRADUÉE. 6 cellules.
+#
+# Manifestes (une ligne par cellule, commande exacte, save_dir, coût) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p11.yaml \
+#     --manifest tsv --manifest-subset {age|ood|tag|locidx}
+#
+# ── OÙ LES ROTATIONS FRAPPENT, ET POURQUOI LÀ ───────────────────────────────
+# Sur K' = W_K'·g, les clés DÉDIÉES de kvproj, APRÈS la projection. Une
+# rotation posée sur la ligne AVANT W_k (ce que faisait `--age-rot` en ph.10)
+# ne survit pas à la projection : W_k' n'a aucune raison de commuter avec elle.
+# Les plans visent les paires QUASI STATIQUES du RoPE de tête, parce que le q
+# de kvproj est celui du backbone, RoPE compris : le score banque vaut
+# (R(t)·W_Q x)ᵀK', et une métadonnée posée sur une paire rapide se lirait
+# cos(ω·t − φ) — mélangée à la position du LECTEUR, ce que §2.5 interdit.
+# `slow_rope_planes` trie les paires par fréquence et `rot_drift_max` REFUSE la
+# construction si la bande demandée déborde (dims réelles, T=320 : 4 plans
+# ⇒ 0,101 rad de dérive sur toute la fenêtre ; 8 plans ⇒ 0,319).
+#
+# ── CE QUE CHAQUE ENV CHANGE AU LAYOUT ──────────────────────────────────────
+# `prov` et `span` posent la QUESTION dans le seg gradé (non supervisée) et
+# décodent depuis [question | A_OPEN]. Obligatoire : leurs tâches ont DEUX
+# candidats en banque et c'est la question qui tranche — décodée depuis A_OPEN
+# seul (le layout des ph.7-10), la tâche serait indécidable (ph.8 : copie 0,21
+# en ordre aléatoire, « le prompt n'a pas la question »). Train et éval sont
+# isomorphes par construction : le même seg sert aux deux.
+#
+# SMOKE CPU (dims minuscules, filler template, 2 pas) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p11.yaml --read kv_proj \
+#     --tap postnorm --m 4 --cond --bank-rot age-log --smoke --device cpu
+#
+# ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal).
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8              # ⇒ têtes de 64 dims, 32 paires RoPE : la bande lente
+                          # a de quoi loger 4 plans d'âge (dérive 0,101 rad) ou
+                          # 2 plans de canal + 2 plans locaux.
+  d_ff_mult: 4
+  mem_dim: 512
+  max_mem: 8
+  max_seq_len: 320
+  dropout: 0.0
+  fw_rank: 8
+  read_layers: []
+  x_dim: 2048
+  ptr_bias_init: -8.0
+  oracle_ka_scale: 0.2
+  oracle_seed: 20260730
+
+code:
+  n_pos: 8
+  rope_base: 0.0
+  seg_n_pos: 32
+  pos_offset: 0
+  pack_blocks: 8
+  top_k: 13               # écrasé par --m sur chaque cellule
+  row_pos_tag: true
+  readout_mix: linear
+  retr_ce: 1.0
+  retr_topk: 2
+  retr_train_groups: 0
+  retr_train_order: random
+  retr_detach: true
+  pos_entropy: 0.0
+  sif_a: 0.01
+
+# ── PHASE 11 : les trois familles de métadonnées ────────────────────────────
+p11:
+  bank_rot: none          # famille ÂGE. `none` = le CONTRÔLE θ_âge=0 (HoPE :
+                          # θ_temporel=0 MAXIMISE le rappel, +22,23 % V-NIAH) —
+                          # c'est LUI la baseline à battre, et la règle S3 dit
+                          # que si la rotation ne le bat pas, l'âge passe en
+                          # biais scalaire.
+  age_planes: 4           # 4 au jouet (le design 350M en prévoit 8) : échelles
+                          # géométriques ENTRELACÉES de ~4 tours à ~4·A_ref,
+                          # SANS bande haute fréquence (VideoRoPE : les hautes
+                          # fréquences sur l'axe long collisionnent ;
+                          # 2502.11276 : retirer les 16 premières dims AMÉLIORE
+                          # la récupération longue), fréquences APPRISES
+                          # (LieRE : en 1D = RoPE à phases apprises).
+  age_ref: 8              # A_cible de la compression log = l'horizon normal en
+                          # writes (max_mem). φ(A_ref) = A_ref ⇒ les bras log et
+                          # brut COÏNCIDENT dans la plage vue au train et ne
+                          # divergent QU'EN OOD : c'est ce qui rend S4 lisible.
+  age_aug: false          # S4 seulement (--age-aug).
+  age_aug_max: 8.0        # < 10 : l'augmentation ne doit PAS couvrir les
+                          # échelles d'éval, sinon il n'y a plus d'OOD.
+  age_eval_scales: 1,10,100
+  tag_mode: none          # S5 (--tag rot|add).
+  n_channels: 2           # user, self. UN PLAN PAR CANAL — jamais n angles sur
+                          # un plan : à n=4 on inventerait tag0·tag2 = −1 et
+                          # tag0·tag1 = 0, une métrique cyclique entre canaux
+                          # qui n'ont aucun ordre.
+  loc_mode: none          # S17 (--locidx rot|add).
+  loc_planes: 2           # l'index local est BORNÉ par top_k+1 : aucun risque
+                          # d'OOD, fréquences DFT fixes, et le successeur est
+                          # l'opérateur CONSTANT R_loc(1).
+  rot_drift_max: 0.5      # radians. Garde-fou de l'appariement §2.5 : au-delà,
+                          # la construction ÉCHOUE au lieu de coder l'âge dans
+                          # une bande où la position du lecteur le brouille.
+  p11_env: rule
+
+  # kwargs des streams `prov` / `span` (ignorés en env `rule`).
+  gen:
+    prov_fillers:         # paires de filler entre les deux writes et les tours
+    - 1                   # gradés (le labo forwarde seg par seg : le fait est
+    - 3                   # hors fenêtre dès le seg suivant, ce filler n'est là
+                          # que pour le réalisme du flux).
+    span_decoys: 1        # faits LEURRES d'autres slots à côté du fait à span
+                          # gradué ⇒ 2 groupes injectés, la sélection a du
+                          # travail et l'ordre des writes est tiré au sort.
+    span_fillers:
+    - 1
+    - 3
+
+training:
+  seed: 0
+  steps: 3000
+  batch_convs: 8
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  amp: true
+  log_every: 20
+  eval_every: 200
+  eval_convs: 24
+  final_eval_convs: 200   # envs prov/span : ~200-400 tours gradés ⇒ erreur-type
+                          # ~0,03 sur le grade, et les strates de longueur
+                          # gardent n ≥ 50 chacune.
+  max_new: 48
+  cond_eval_convs: 32
+  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab_p11
+
+persona:
+  gen:
+    p_smalltalk: 0.15
+    n_facts:
+    - 1
+    - 3
+    n_queries:
+    - 1
+    - 2
+    p_ack: 0.5
+    p_update: 0.15
+    p_beyond: 0.15
+    value_weight: 4.0
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cap: 20000
+    real_max_tok: 96
+    p_real: 0.8
+    real_cache_dir: ${TB_ROOT}/data_cache
+
+# ── vie-règle (env `rule`, examens age et ood) : inchangée depuis la ph.10 ──
+cond:
+  gen:
+    p_rule: 0.35
+    cond_decoys: 1
+    cond_fillers:
+    - 2
+    - 5
