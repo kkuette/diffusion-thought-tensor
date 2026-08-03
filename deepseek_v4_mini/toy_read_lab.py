@@ -251,7 +251,7 @@ WRITE_MODES = ("fact", "every")
 # mesurées à l'éval sur CHAQUE run (cf. evaluate_cond) : live / shuf / none.
 COND_ARMS = ("true", "shuffle", "none")
 # phase 10 — OÙ les lignes entrent dans le stack (cf. ToyCfg.read_path).
-READ_PATHS = ("entry", "kv")
+READ_PATHS = ("entry", "kv", "dual", "kvproj")
 # phase 10 — les QUATRE chemins de lecture exposés par `--read`, traduits en
 # (variant, code|None, read_path). C'est la table qui rend la grille de la spec
 # §2.4 lançable par un seul flag ; les axes `--tap`, `--age-rot` et `--m` sont
@@ -273,11 +273,47 @@ READ_PATHS = ("entry", "kv")
 #   inject_entry pseudo-tokens en préfixe (r4, lecture α) — le bras de la ph.7-9.
 #   kv_append    lignes appondues aux K/V des couches lectrices (r4 + kv,
 #                lecture β) — sans ré-encodage, sans RoPE.
+#   dual_heads   GROUPE DE TÊTES DÉDIÉ à la banque dans les couches lectrices
+#                (r4 + dual) : le groupe 1 fait l'attention normale sur le
+#                contexte, le groupe 2 attend la BANQUE SEULE (ni RoPE ni
+#                masque causal), les deux sorties fusionnent avant le FFN.
+#                Répond au défaut structurel de kv_append — banque et contexte
+#                s'y disputent la masse softmax dans la MÊME tête, invisible au
+#                jouet mais risque n°1 au 350M à fenêtre longue. Coût assumé :
+#                des paramètres dédiés (cf. BankHeads).
+#   kv_proj      PROJECTIONS DÉDIÉES dans le softmax UNIFIÉ (r4 + kvproj) : K'
+#                et V' viennent de W_k'/W_v' propres à la banque, mais entrent
+#                dans les MÊMES têtes que le contexte. Avec `--bank-q`, les
+#                lignes émettent en plus leurs propres requêtes et se
+#                contextualisent de couche lectrice en couche lectrice.
+#
+# ── LE CARRÉ FACTORIEL 2×2 (design user) ────────────────────────────────────
+# Deux axes ORTHOGONAUX se croisent sur trois de ces bras — c'est ce qui rend
+# le dépouillement causal au lieu d'anecdotique :
+#
+#                     │ softmax UNIFIÉ        │ softmax SÉPARÉ
+#   ──────────────────┼───────────────────────┼──────────────────────
+#   projections       │ kv_append             │ (vide : sans projection
+#   PARTAGÉES         │ (mesuré, 2AFC 1.000)  │  ni tête propre, il n'y
+#                     │                       │  a rien à séparer)
+#   projections       │ kv_proj               │ dual_heads
+#   DÉDIÉES           │                       │
+#
+#   kv_proj vs kv_append  = l'effet PROJECTIONS (géométrie de clés), seul
+#                           delta entre les deux.
+#   kv_proj vs dual_heads = l'effet SOFTMAX PARTAGÉ : arbitrage par une
+#                           distribution unique (la banque peut perdre) contre
+#                           masse garantie (elle ne peut pas).
+#   ±bank_q               = l'effet CONTEXTUALISATION des lignes.
+# Départage sur le Δnll de CITATION et les MARGES aux marqueurs — PAS sur le
+# 2AFC, saturé à 1.000 dès que le canal est ouvert.
 READ_MODES = {
     "seq_fw":       ("r0", None,   "entry"),
     "bank_xattn":   ("r3", None,   "entry"),
     "inject_entry": ("r4", None,   "entry"),
     "kv_append":    ("r4", None,   "kv"),
+    "dual_heads":   ("r4", None,   "dual"),
+    "kv_proj":      ("r4", None,   "kvproj"),
 }
 # formats PARTITIONNÉS (phase 5) : la ligne est un PACK de blocs disjoints —
 # bloc 0 = clé dédiée, blocs 1..B−1 = un token chacun. Readout = PackReadout.
@@ -459,6 +495,30 @@ class ToyCfg:
                               # plus rot(0)=identité, donc son token ne se
                               # superpose plus à K/A (qui, eux, ne sont jamais
                               # tournés). Cf. phase_tables pour le wrap.
+    # ── TÊTES DÉDIÉES À LA BANQUE (phase 10, read_path='dual') ──────────────
+    bank_heads: int = 2       # nombre de têtes du GROUPE BANQUE dans chaque
+                              # couche lectrice. « Quelques têtes suffisent » :
+                              # le groupe n'a qu'un ensemble de max_mem·(1+m)
+                              # lignes à discriminer, pas une fenêtre entière.
+    bank_head_dim: int = 0    # dim par tête du groupe banque. 0 = celle des
+                              # têtes de contexte (d_model // n_heads), pour
+                              # que la géométrie de clés soit comparable.
+    # ── PROJECTIONS DÉDIÉES / SOFTMAX UNIFIÉ (read_path='kvproj') ────────────
+    bank_q: bool = False      # `kvproj` : les lignes ÉMETTENT leurs propres
+                              # requêtes (W_q' dédié) et attendent sur
+                              # [banque ∪ contexte] ; leur état est PORTÉ de
+                              # couche lectrice en couche lectrice, puis jeté à
+                              # la sortie du stack. C'est le test « la ligne
+                              # s'aiguise contre la question ». W_o' zéro-init
+                              # ⇒ à l'init les lanes valent exactement les
+                              # lignes brutes et le bras dégénère en `kvproj`
+                              # nu. ⚠️ CE QUI EST LIVRÉ : les lanes sont un
+                              # SIDE-STREAM (mise à jour résiduelle par
+                              # ATTENTION seule, RMSNorm dédiée, PAS de MLP).
+                              # Leur faire traverser le MLP en ferait une copie
+                              # du flux de tokens, donc `inject_entry` sans
+                              # RoPE — on perdrait le contraste que le bras est
+                              # censé mesurer.
     # ── COMPOSITION DU GRADIENT de la boucle fast-weight (correctif terrain) ─
     fw_additive: bool = False  # stop-gradient sur l'ÉTAT PORTÉ de la boucle
                               # séquentielle de FastWeightRead : chaque
@@ -629,6 +689,19 @@ class ToyCfg:
                 f"pos_offset {self.pos_offset} >= n_pos {npos} : TOUTES les "
                 f"positions wrappent sur l'identité")
         # ── phase 10 : prélèvement, âge, conditionnement ────────────────────
+        if self.bank_q:
+            assert self.read_path == "kvproj", (
+                f"code.bank_q fait ÉMETTRE les lignes dans le softmax unifié "
+                f"de `kvproj` : il n'a de sens que là (reçu read_path="
+                f"{self.read_path!r}) — il serait un no-op silencieux")
+        if self.read_path == "dual":
+            assert self.bank_heads >= 1, self.bank_heads
+            assert self.bank_head_dim >= 0, self.bank_head_dim
+        elif self.bank_heads != ToyCfg.bank_heads or self.bank_head_dim:
+            raise AssertionError(
+                f"bank_heads/bank_head_dim ne pilotent QUE le groupe de têtes "
+                f"dédié (read_path='dual') ; reçu read_path="
+                f"{self.read_path!r} — ils seraient silencieusement ignorés")
         if self.fw_additive:
             assert self.uses_fw, (
                 f"code.fw_additive change la COMPOSITION DU GRADIENT de la "
@@ -856,8 +929,37 @@ class CausalSelfAttn(nn.Module):
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.o = nn.Linear(d, d, bias=False)
         self.theta = cfg.rope_theta
+        # ── PHASE 10, `read_path='kvproj'` : PROJECTIONS DÉDIÉES, SOFTMAX
+        # UNIFIÉ (3ᵉ sommet du carré factoriel, cf. READ_MODES) ─────────────
+        # Construites EN DERNIER et seulement pour ce chemin : les tirages de
+        # poids des chemins existants ne bougent pas d'un bit.
+        self.kvproj = cfg.read_path == "kvproj"
+        self.bank_q = self.kvproj and cfg.bank_q
+        if self.kvproj:
+            self.bk = nn.Linear(d, d, bias=False)
+            self.bv = nn.Linear(d, d, bias=False)
+            # BIAIS SCALAIRE PAR TÊTE sur les logits de banque, init 0. Avec S'
+            # lignes qui concourent contre une fenêtre entière dans UN SEUL
+            # softmax, la masse allouée à la banque est à la merci du rapport
+            # S'/T — c'est précisément le défaut que `dual_heads` contourne en
+            # séparant les softmax. Ici on le traite de face : un degré de
+            # liberté appris, et sa VALEUR FINALE est une mesure (loggée dans
+            # results.json) — positive = le modèle a dû REMONTER la banque
+            # contre le contexte, négative = il a dû la faire taire.
+            self.bank_bias = nn.Parameter(torch.zeros(h))
+            if self.bank_q:
+                # Les lignes ÉMETTENT aussi : elles attendent sur [banque ∪
+                # contexte] et leur état est porté de couche lectrice en
+                # couche lectrice. W_o' zéro-init ⇒ à l'init les lanes valent
+                # EXACTEMENT les lignes brutes et le bras dégénère proprement
+                # en `kvproj` sans bank-q.
+                self.bq = nn.Linear(d, d, bias=False)
+                self.bo = nn.Linear(d, d, bias=False)
+                nn.init.zeros_(self.bo.weight)
+                self.nb = RMSNorm(d)
 
-    def forward(self, x, pos=None, mem=None, mem_mask=None):
+    def forward(self, x, pos=None, mem=None, mem_mask=None,
+                want_bank_out=False):
         """`pos` [T] : index RoPE EXPLICITES. None = 0..T−1 (chemin par défaut,
         bit-à-bit inchangé). La variante r4 s'en sert pour laisser un TROU de
         position entre le préfixe injecté et le tour réel.
@@ -888,8 +990,55 @@ class CausalSelfAttn(nn.Module):
         # (causalité) ⇒ le masque causal suffit, pas de key-padding mask.
         if mem is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            return self.o(y.transpose(1, 2).reshape(B, T, d))
+            y = self.o(y.transpose(1, 2).reshape(B, T, d))
+            return (y, None) if want_bank_out else y
         S = mem.shape[1]
+        if self.kvproj:
+            # ── SOMMET « DÉDIÉES / UNIFIÉ » ────────────────────────────────
+            # Seule différence avec `kv_append` : les lignes passent par W_k'
+            # et W_v' au lieu d'entrer brutes. C'est LE delta qui isole
+            # l'effet « géométrie de clés » — tout le reste (même softmax,
+            # mêmes têtes, même masque, pas de RoPE sur les lignes) est
+            # identique.
+            hb = self.nb(mem) if self.bank_q else mem
+            km = self.bk(hb).view(B, S, self.h, self.dh).transpose(1, 2)
+            vm = self.bv(hb).view(B, S, self.h, self.dh).transpose(1, 2)
+            k = torch.cat([km, k], dim=2)
+            v = torch.cat([vm, v], dim=2)
+            # masque FLOTTANT : il porte à la fois l'interdiction (−inf) et le
+            # biais par tête sur les colonnes de banque.
+            fm = torch.zeros(B, self.h, T, S + T, device=x.device,
+                             dtype=q.dtype)
+            fm[..., :S] += self.bank_bias.to(q.dtype)[None, :, None, None]
+            neg = torch.finfo(q.dtype).min
+            causal = torch.ones(T, T, dtype=torch.bool,
+                                device=x.device).tril()
+            fm[..., S:] = torch.where(causal, fm.new_zeros(()),
+                                      fm.new_full((), neg))
+            if mem_mask is not None:
+                fm[..., :S] = torch.where(
+                    mem_mask[:, None, None, :].to(torch.bool),
+                    fm[..., :S], fm.new_full((), neg))
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=fm)
+            y = self.o(y.transpose(1, 2).reshape(B, T, d))
+            mem_out = None
+            if self.bank_q and want_bank_out:
+                # LES LIGNES ÉMETTENT : requêtes dédiées, visibilité TOTALE
+                # (elles ne sont pas dans l'ordre du temps — ni causalité, ni
+                # RoPE), sortie résiduelle sur l'état de lane.
+                qb = self.bq(hb).view(B, S, self.h, self.dh).transpose(1, 2)
+                fb = torch.zeros(B, self.h, S, S + T, device=x.device,
+                                 dtype=q.dtype)
+                fb[..., :S] += self.bank_bias.to(q.dtype)[None, :, None, None]
+                if mem_mask is not None:
+                    fb[..., :S] = torch.where(
+                        mem_mask[:, None, None, :].to(torch.bool),
+                        fb[..., :S], fb.new_full((), neg))
+                yb = F.scaled_dot_product_attention(qb, k, v, attn_mask=fb)
+                mem_out = mem + self.bo(
+                    yb.transpose(1, 2).reshape(B, S, d))
+            return (y, mem_out) if want_bank_out else y
+        # ── `kv_append` : chemin HISTORIQUE, inchangé au bit près ──────────
         km = mem.to(q.dtype).view(B, S, self.h, self.dh).transpose(1, 2)
         k = torch.cat([km, k], dim=2)
         v = torch.cat([km, v], dim=2)          # K ET V sont LA MÊME ligne
@@ -901,7 +1050,77 @@ class CausalSelfAttn(nn.Module):
             am = am.clone()
             am[..., :S] &= mem_mask[:, None, None, :].to(torch.bool)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
-        return self.o(y.transpose(1, 2).reshape(B, T, d))
+        y = self.o(y.transpose(1, 2).reshape(B, T, d))
+        return (y, None) if want_bank_out else y
+
+
+class BankHeads(nn.Module):
+    """PHASE 10 — un GROUPE DE TÊTES DÉDIÉ à la banque, à côté des têtes du
+    contexte (design user, après le verdict de la grille).
+
+    POURQUOI, ET CONTRE QUOI. `kv_append` (lecture β) fait entrer les lignes
+    dans les K/V des têtes EXISTANTES : la banque et le contexte se disputent
+    alors la masse softmax DANS la même tête, avec la MÊME requête. Le jouet ne
+    peut pas le voir (fenêtres courtes, 2AFC déjà saturé à 1.000), mais c'est
+    le risque n°1 au 350M à fenêtre longue — plus le contexte est long, plus la
+    banque se fait diluer, sans qu'aucune métrique du jouet ne l'annonce. Les
+    têtes dédiées garantissent la masse : le softmax du groupe 2 porte sur la
+    banque SEULE, il ne peut pas être capté par le contexte.
+
+    CE QUE LA TÊTE BANQUE N'A PAS, ET POURQUOI :
+      * pas de RoPE — les lignes sont un ENSEMBLE, pas une séquence. Leur ordre
+        dans la matrice plate est un artefact du FIFO, pas une information.
+      * pas de masque causal — toute position du tour peut lire toute ligne.
+      * la seule ancienneté qui compte est portée par le CODE D'ÂGE
+        (`code.age_rope`), appliqué aux lignes AVANT d'arriver ici : la tête
+        n'a rien à réinventer.
+
+    RECUL ASSUMÉ. Contrairement à `kv_append`, ce bras a des paramètres
+    dédiés (W_q/W_k/W_v/W_o) : on abandonne « aucune matmul dédiée » pour
+    acheter la masse et une géométrie de clés propre. Le coût est borné —
+    quelques têtes suffisent (cf. cfg.bank_heads / cfg.bank_head_dim).
+
+    ── L'INIT, ET LE PIÈGE r3 ───────────────────────────────────────────────
+    Le labo a déjà payé une fois le prix d'une porte MULTIPLICATIVE zéro-init
+    (r3/r1 : `gate` scalaire à 0 ⇒ le gradient des paramètres INTERNES vaut
+    g·(…) = 0, seule la porte bouge, et elle ne bouge que si quelque chose la
+    tire — tête morte). Ici c'est la PROJECTION DE SORTIE `o` qui est
+    zéro-initialisée, pas un scalaire :
+      * forward au step 0 : la sortie est EXACTEMENT nulle ⇒ le bloc est
+        bit-à-bit le backbone (critère habituel du labo) ;
+      * backward au step 0 : ∂L/∂W_o = (∂L/∂y)·headᵀ avec `head` NON NUL (q/k/v
+        sont initialisés normalement) ⇒ W_o reçoit du gradient DÈS LE PREMIER
+        PAS et quitte zéro. C'est la différence structurelle avec la porte
+        scalaire, et le self-test la mesure (W_o non nul après quelques pas,
+        et le forward qui s'écarte du backbone).
+    """
+
+    def __init__(self, cfg: ToyCfg):
+        super().__init__()
+        d = cfg.d_model
+        self.hb = int(cfg.bank_heads)
+        self.dhb = int(cfg.bank_head_dim or (d // cfg.n_heads))
+        inner = self.hb * self.dhb
+        self.q = nn.Linear(d, inner, bias=False)
+        self.k = nn.Linear(d, inner, bias=False)
+        self.v = nn.Linear(d, inner, bias=False)
+        self.o = nn.Linear(inner, d, bias=False)
+        nn.init.zeros_(self.o.weight)      # cf. docstring : SORTIE, pas porte
+
+    def forward(self, h, mem, mem_mask=None):
+        """h [B,T,d] (déjà pré-normé par le bloc) × mem [B,S,d] → [B,T,d]."""
+        B, T, _ = h.shape
+        S = mem.shape[1]
+        mm = mem.to(h.dtype)
+        q = self.q(h).view(B, T, self.hb, self.dhb).transpose(1, 2)
+        k = self.k(mm).view(B, S, self.hb, self.dhb).transpose(1, 2)
+        v = self.v(mm).view(B, S, self.hb, self.dhb).transpose(1, 2)
+        am = None
+        if mem_mask is not None:
+            am = mem_mask[:, None, None, :].to(torch.bool).expand(B, 1, T, S)
+        # NI causal, NI RoPE : la banque est un ensemble (cf. docstring).
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
+        return self.o(y.transpose(1, 2).reshape(B, T, self.hb * self.dhb))
 
 
 class SwiGLU(nn.Module):
@@ -1336,19 +1555,39 @@ class ToyBlock(nn.Module):
                 self.read = FastWeightRead(cfg)
             elif cfg.uses_xattn:
                 self.read = CrossAttnRead(cfg, project_v=(cfg.variant != "r3"))
+        # `mem` va aux K/V des têtes EXISTANTES (lecture β `kv`) ou à un GROUPE
+        # DE TÊTES DÉDIÉ (`dual`) — jamais aux deux. Construit EN DERNIER : les
+        # chemins existants tirent leurs poids dans le même ordre qu'avant.
+        self.mem_in_attn = cfg.read_path in ("kv", "kvproj")
+        self.bank_q = cfg.read_path == "kvproj" and cfg.bank_q
+        self.bank_heads = (BankHeads(cfg)
+                           if self.read_bank and cfg.read_path == "dual"
+                           else None)
 
     def forward(self, x, bank, bank_mask, pos=None, mem=None, mem_mask=None):
-        # `mem` n'entre QUE dans les couches LECTRICES (`read_layers`) : la
-        # lecture β partage exactement le même budget de couches que les reads
-        # appris de r0/r1/r3, sinon la comparaison porterait aussi sur « à
-        # combien d'étages la banque parle ».
-        x = x + self.attn(self.n1(x), pos,
-                          mem if self.read_bank else None,
-                          mem_mask if self.read_bank else None)
+        # `mem` n'entre QUE dans les couches LECTRICES (`read_layers`) : les
+        # lectures β et « têtes dédiées » partagent exactement le même budget
+        # de couches que les reads appris de r0/r1/r3, sinon la comparaison
+        # porterait aussi sur « à combien d'étages la banque parle ».
+        h1 = self.n1(x)
+        use_mem = self.read_bank and self.mem_in_attn
+        if self.bank_q and use_mem and mem is not None:
+            # LES LANES BANQUE SONT PORTÉES : le bloc rend l'état mis à jour,
+            # ToyReadLM le repasse à la couche lectrice suivante et le JETTE
+            # après la dernière (cf. son forward).
+            a, mem = self.attn(h1, pos, mem, mem_mask, want_bank_out=True)
+        else:
+            a = self.attn(h1, pos, mem if use_mem else None,
+                          mem_mask if use_mem else None)
+        if self.bank_heads is not None and mem is not None:
+            # FUSION AVANT LE FFN : les deux groupes de têtes lisent le MÊME
+            # état pré-normé et leurs sorties se somment dans le résiduel.
+            a = a + self.bank_heads(h1, mem, mem_mask)
+        x = x + a
         if self.read is not None and bank is not None and bank.size(1) > 0:
             x = self.read(x, bank, bank_mask)
         x = x + self.mlp(self.n2(x))
-        return x
+        return (x, mem) if self.bank_q else x
 
 
 def sif_weight_table(stream_cls, tok, gen_kwargs: dict, vocab_size: int,
@@ -1949,7 +2188,7 @@ class ToyReadLM(nn.Module):
                 asn = self.age_sin[ag].to(pre.dtype)[:, :, None]
                 pre = rot_pairs(pre, ac, asn)
             pre = pre + self.inject_type                      # [B,G,k,d]
-            if self.cfg.read_path == "kv":
+            if self.cfg.read_path in ("kv", "dual", "kvproj"):
                 # ── LECTURE β : VUE PLATE + ATTENTION ───────────────────────
                 # Pas de préfixe, pas de séparateur, pas de position RoPE : le
                 # tenseur (G, k, d) est simplement APLATI en (G·k, d) et posé
@@ -1969,8 +2208,13 @@ class ToyReadLM(nn.Module):
                 npre = G * (k + 1)
                 pos = torch.cat([torch.arange(npre, device=ids.device),
                                  torch.arange(T, device=ids.device) + npre + 1])
+        carry = self.cfg.read_path == "kvproj" and self.cfg.bank_q
         for blk in self.blocks:
-            x = blk(x, bank, bank_mask, pos, mem)
+            out = blk(x, bank, bank_mask, pos, mem)
+            # `bank_q` : l'état des lanes banque VIT le temps du stack et est
+            # jeté à la sortie (rien ne le réécrit dans la banque — l'invariant
+            # « seule modification de la banque = l'append d'un write » tient).
+            x, mem = out if (carry and isinstance(out, tuple)) else (out, mem)
         if npre:
             x = x[:, npre:]                    # seul le TOUR RÉEL sort
         x = self.norm_f(x)
@@ -2025,7 +2269,13 @@ def param_report(model: ToyReadLM) -> dict:
             b = "pointer"
         elif n.startswith("inject_type"):
             b = "read"          # r4 : le SEUL paramètre de « read » du bras
-        elif ".read." in n:
+        elif ".read." in n or ".bank_heads." in n or \
+                any(k in n for k in (".attn.bk.", ".attn.bv.", ".attn.bq.",
+                                     ".attn.bo.", ".attn.bank_bias",
+                                     ".attn.nb.")):
+            # `kvproj` pose ses projections dédiées DANS le module d'attention :
+            # sans ça elles seraient comptées comme de l'attention de contexte
+            # et le budget « read » du bras paraîtrait nul.
             b = "read"
         elif ".attn." in n:
             b = "attn"
@@ -3042,7 +3292,8 @@ def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
 
     acc: dict = {}
     for cond_name in ("live", "shuf", "none"):
-        num = den = mnum = mden = 0.0
+        num = den = 0.0
+        marges: list = []          # la MARGE aux marqueurs, tour par tour
         hit = tot = 0
         for i, it in enumerate(items):
             st = (it["state"] if cond_name == "live"
@@ -3055,13 +3306,29 @@ def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
                 num += ia / iw - ca / cw
                 den += 1.0
             if cmw > 0 and imw > 0:
-                mnum += im / imw - cm / cmw
-                mden += 1.0
+                marges.append(im / imw - cm / cmw)
                 hit += int(cm / cmw < im / imw)
                 tot += 1
         acc[f"dnll_{cond_name}"] = num / den if den else float("nan")
-        acc[f"mark_{cond_name}"] = mnum / mden if mden else float("nan")
         acc[f"acc_{cond_name}"] = hit / tot if tot else float("nan")
+        # ── LA MARGE, pas seulement l'ACCURACY ─────────────────────────────
+        # Le 2AFC sature (1.000 dès que le canal est ouvert) et cesse alors de
+        # départager les cellules. La MARGE, elle, garde de la dynamique : elle
+        # dit de COMBIEN le bon rendu est préféré, pas seulement s'il l'est.
+        # `mark_*` EST la marge moyenne (nom conservé — le format ne bouge
+        # pas) ; l'erreur-type et la médiane s'y ajoutent pour la rendre
+        # adjudicable (une moyenne sans dispersion n'arbitre rien à n~45).
+        n_m = len(marges)
+        acc[f"mark_{cond_name}"] = (sum(marges) / n_m) if n_m else float("nan")
+        if n_m > 1:
+            mu = acc[f"mark_{cond_name}"]
+            var = sum((x - mu) ** 2 for x in marges) / (n_m - 1)
+            acc[f"mark_se_{cond_name}"] = math.sqrt(var / n_m)
+        else:
+            acc[f"mark_se_{cond_name}"] = float("nan")
+        acc[f"mark_med_{cond_name}"] = (sorted(marges)[n_m // 2] if n_m
+                                        else float("nan"))
+        acc[f"n_mark_{cond_name}"] = n_m
     acc["n"] = len(items)
     acc["n_convs"] = len({id(x["conv"]) for x in items})
     model.train()
@@ -3075,7 +3342,10 @@ def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
 # qui rend les 36 runs agrégeables sans grepper un seul log.
 GRID_READ = {("r0", "entry"): "seqfw",     ("r3", "entry"): "bankxattn",
              ("r4", "entry"): "injentry",  ("r4", "kv"): "kvappend",
-             ("r5", "entry"): "r5entry",   ("r5", "kv"): "r5kv"}
+             ("r4", "dual"): "dualheads", ("r4", "kvproj"): "kvproj",
+             ("r5", "kvproj"): "r5kvproj",
+             ("r5", "entry"): "r5entry",   ("r5", "kv"): "r5kv",
+             ("r5", "dual"): "r5dual"}
 GRID_TAP = {"toprows": "native", "tophid": "postnorm", "midhid": "mid",
             "mean": "pooled"}
 
@@ -3094,6 +3364,13 @@ def grid_name(cfg: ToyCfg) -> str:
         # Le bras multiplicatif divergent est une DONNÉE de la grille : les
         # cellules additives ne doivent jamais atterrir sur son dossier.
         name += "_fwadd"
+    if cfg.bank_q:
+        name += "_bq"
+    if cfg.read_path == "dual" and (cfg.bank_heads != ToyCfg.bank_heads
+                                    or cfg.bank_head_dim):
+        name += f"_bh{cfg.bank_heads}"
+        if cfg.bank_head_dim:
+            name += f"x{cfg.bank_head_dim}"
     if cfg.cond_arm != ToyCfg.cond_arm:
         name += f"_arm-{cfg.cond_arm}"
     if cfg.cond_decoys != ToyCfg.cond_decoys:
@@ -3105,7 +3382,8 @@ def grid_name(cfg: ToyCfg) -> str:
 
 def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
                 rots=(False, True), taps=("postnorm", "mid"),
-                ms=(1, 4, 8), fw_additive: bool = False) -> list:
+                ms=(1, 4, 8), fw_additive: bool = False,
+                bank_q: bool = False) -> list:
     """La GRILLE COMPLÈTE, en clair. Un dict par combo, dans un ordre stable."""
     out = []
     for rd in reads:
@@ -3119,7 +3397,8 @@ def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
                                 # attention n'aurait aucun sens (et ToyCfg le
                                 # refuse).
                                 "fw_additive": bool(fw_additive)
-                                and rd == "seq_fw"})
+                                and rd == "seq_fw",
+                                "bank_q": bool(bank_q) and rd == "kv_proj"})
     return out
 
 
@@ -3131,6 +3410,12 @@ GRID_SUBSETS = {
     # noms suffixés _fwadd ⇒ elles n'écrasent pas le bras multiplicatif.
     "seqfw-additive": dict(reads=("seq_fw",), fw_additive=True),
     "attn":           dict(reads=("inject_entry", "kv_append")),
+    # LE NOUVEAU BRAS : 12 cellules, mêmes axes rot/tap/m. `all` reste à 36 —
+    # c'est la grille DÉJÀ LANCÉE, on ne redéfinit pas un total en cours de
+    # campagne (36 multiplicatives + 12 _fwadd + 12 dual = 60 au bout).
+    "dual":           dict(reads=("dual_heads",)),
+    "kvproj":         dict(reads=("kv_proj",)),
+    "kvproj-bq":      dict(reads=("kv_proj",), bank_q=True),
 }
 
 
@@ -3141,6 +3426,7 @@ def _grid_cfg(combo: dict, base: dict) -> ToyCfg:
     return ToyCfg(**{**base, "variant": v, "code": code, "read_path": rp,
                      "age_rope": combo["age_rot"], "top_k": int(combo["m"]),
                      "fw_additive": bool(combo.get("fw_additive")),
+                     "bank_q": bool(combo.get("bank_q")),
                      "cond": True})
 
 
@@ -3167,6 +3453,12 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
         if cfg.variant == "r0":
             load = cfg.max_mem * cfg.group_rows
             unit = "sous-slots seq"
+        elif cfg.read_path == "dual":
+            load = G * m
+            unit = f"clés / {cfg.bank_heads} têtes dédiées"
+        elif cfg.read_path == "kvproj":
+            load = G * m
+            unit = "clés projetées (softmax UNIFIÉ)"
         elif cfg.read_path == "kv":
             load = G * m
             unit = "K/V add."
@@ -3176,7 +3468,8 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
         cmd = (f"python -m deepseek_v4_mini.toy_read_lab {config} --cond "
                f"--read {combo['read']} --tap {combo['tap']} --m {m}"
                + (" --age-rot" if combo["age_rot"] else "")
-               + (" --fw-additive" if combo.get("fw_additive") else ""))
+               + (" --fw-additive" if combo.get("fw_additive") else "")
+               + (" --bank-q" if combo.get("bank_q") else ""))
         # COÛT : mesuré, pas deviné. `params` vient de param_report aux dims
         # de la config ; `rel` est le rapport de temps par pas RELEVÉ sur CPU à
         # dims RÉELLES (d512/L6, batch_convs=2, 2 pas) — c'est le RATIO entre
@@ -3191,11 +3484,22 @@ def print_grid_manifest(config: str, base: dict, save_root: str,
         # leur gradient. C'est lui qui décide, pas les poids.
         act_go = (b_convs * cfg.max_seq_len * cfg.vocab_size * 4 * 3) / 2 ** 30
         vram = opt_go + act_go
-        rel = {"seq_fw": 2.0, "inject_entry": 1.0, "kv_append": 1.07}[
-            combo["read"]] * (1.0 + 0.03 * (m - 1))
+        rel = {"seq_fw": 2.0, "inject_entry": 1.0, "kv_append": 1.07,
+               "dual_heads": 1.18, "kv_proj": 1.22}[combo["read"]] * (
+                   1.0 + 0.03 * (m - 1)) * (1.35 if combo.get("bank_q") else 1.0)
         note = ("boucle fast-weight de %d itérations × %d couches : le bras "
                 "LENT (×2.0 relevé)" % (load, cfg.n_layers)
                 if combo["read"] == "seq_fw" else "")
+        if combo["read"] == "kv_proj":
+            note = ("projections DÉDIÉES dans le softmax UNIFIÉ + biais de "
+                    "logits appris par tête (init 0, sa valeur EST une mesure)"
+                    + (" | bank-q : les lignes ÉMETTENT et se contextualisent "
+                       "de couche lectrice en couche lectrice (side-stream, "
+                       "sans MLP)" if combo.get("bank_q") else ""))
+        if combo["read"] == "dual_heads":
+            note = ("groupe de têtes DÉDIÉ : masse softmax garantie (la banque "
+                    "ne se dispute rien avec le contexte), au prix de "
+                    "paramètres — le seul bras de la grille qui en ajoute")
         if combo.get("fw_additive"):
             note += (" | gradient ADDITIF (stop-grad sur l'état porté) : "
                      "forward inchangé, plus de produit de jacobiennes")
@@ -3274,6 +3578,12 @@ def run_name_for(cfg: ToyCfg) -> str:
         name += "_wev"
     if cfg.fw_additive:
         name += "_fwadd"
+    if cfg.bank_q:
+        name += "_bq"
+    if cfg.read_path == "dual" and (cfg.bank_heads != ToyCfg.bank_heads
+                                    or cfg.bank_head_dim):
+        name += f"_bh{cfg.bank_heads}" + (f"x{cfg.bank_head_dim}"
+                                          if cfg.bank_head_dim else "")
     # ── phase 10 : chaque axe de la grille §2.4 entre dans le nom ───────────
     if cfg.read_path != ToyCfg.read_path:
         name += f"_{cfg.read_path}"
@@ -3413,6 +3723,19 @@ def main(argv=None):
     ap.add_argument("--cond-eval-convs", type=int, default=None,
                     dest="cond_eval_convs",
                     help="vies-règle gradées par passe d'éval contrastive")
+    ap.add_argument("--bank-heads", type=int, default=None, dest="bank_heads",
+                    help="--read dual_heads : nombre de têtes du GROUPE BANQUE "
+                         "par couche lectrice (défaut 2)")
+    ap.add_argument("--bank-head-dim", type=int, default=None,
+                    dest="bank_head_dim",
+                    help="--read dual_heads : dim par tête du groupe banque "
+                         "(0 = celle des têtes de contexte)")
+    ap.add_argument("--bank-q", action="store_true", dest="bank_q",
+                    help="--read kv_proj : les lignes de banque ÉMETTENT leurs "
+                         "propres requêtes (W_q' dédié) et se contextualisent "
+                         "de couche lectrice en couche lectrice (side-stream : "
+                         "attention seule, pas de MLP ; état jeté en sortie de "
+                         "stack). Suffixe _bq au save_dir.")
     ap.add_argument("--fw-additive", action="store_true", dest="fw_additive",
                     help="CORRECTIF TERRAIN du bras `--read seq_fw` : rend la "
                          "composition du gradient de la boucle fast-weight "
@@ -3423,12 +3746,13 @@ def main(argv=None):
                          "divergent est une donnée de la grille). Ajoute "
                          "_fwadd au save_dir. Refusé hors variantes à boucle.")
     ap.add_argument("--manifest-subset", default="all",
-                    choices=("all", "seqfw", "seqfw-additive", "attn"),
+                    choices=tuple(GRID_SUBSETS),
                     dest="manifest_subset",
                     help="restreint le manifeste : all (36) | seqfw (les 12 "
                          "cellules fast-weight) | seqfw-additive (les MÊMES 12 "
                          "axes rot/tap/m avec --fw-additive, noms suffixés "
-                         "_fwadd) | attn (les 24 cellules inject/kv)")
+                         "_fwadd) | attn (les 24 cellules inject/kv) | dual "
+                         "(les 12 cellules à TÊTES DÉDIÉES)")
     ap.add_argument("--manifest", choices=("tsv", "json"), default=None,
                     help="n'entraîne RIEN : imprime le MANIFESTE de la grille "
                          "§2.4 (36 combos, commande exacte, save_dir et coût "
@@ -3507,7 +3831,9 @@ def main(argv=None):
     # ── PHASE 10 : knobs YAML puis surcharges CLI ──────────────────────────
     for key, cast in (("hid_tap", float), ("age_rope", bool),
                       ("read_path", str), ("cond_arm", str),
-                      ("cond_decoys", int), ("fw_additive", bool)):
+                      ("cond_decoys", int), ("fw_additive", bool),
+                      ("bank_heads", int), ("bank_head_dim", int),
+                      ("bank_q", bool)):
         if key in cb:
             mc[key] = cast(cb[key])
     if a.read is not None:
@@ -3518,6 +3844,12 @@ def main(argv=None):
         mc["top_k"] = int(a.m_rows)
     if a.fw_additive:
         mc["fw_additive"] = True
+    if a.bank_heads is not None:
+        mc["bank_heads"] = int(a.bank_heads)
+    if a.bank_head_dim is not None:
+        mc["bank_head_dim"] = int(a.bank_head_dim)
+    if a.bank_q:
+        mc["bank_q"] = True
     if a.cond_arm is not None:
         mc["cond_arm"] = a.cond_arm
     if a.cond_decoys is not None:
@@ -4010,7 +4342,8 @@ def main(argv=None):
         fcp = os.path.join(save_dir, "cond_metrics.csv")
         with open(fcp, "w", newline="") as f:
             w = csv.writer(f)
-            cols = [f"{p}_{c}" for p in ("mark", "dnll", "acc")
+            cols = [f"{p}_{c}" for p in ("mark", "mark_se", "mark_med",
+                                         "dnll", "acc")
                     for c in ("live", "shuf", "none")] + ["n", "n_convs"]
             w.writerow(cols)
             w.writerow([f"{fc[c]:.5f}" if fc[c] == fc[c] else "" for c in
@@ -4035,6 +4368,16 @@ def main(argv=None):
                   "hid_tap_layers": cfg.hid_tap_layers,
                   "d_model": cfg.d_model, "n_layers": cfg.n_layers,
                   "max_mem": cfg.max_mem},
+        # ── LE BIAIS DE LOGITS APPRIS (`kv_proj`) : sa valeur EST une
+        # mesure. Positif ⇒ le modèle a dû REMONTER la banque contre le
+        # contexte dans le softmax unifié (le déséquilibre de masse était
+        # réel) ; ~0 ⇒ le softmax unifié n'avait pas besoin d'aide ; négatif
+        # ⇒ il a dû la faire TAIRE.
+        "bank_logit_bias": ([[round(float(v), 5) for v in
+                              b.attn.bank_bias.detach().cpu()]
+                             for b in model.blocks
+                             if getattr(b.attn, "kvproj", False)]
+                            if cfg.read_path == "kvproj" else None),
         "citation": ({"grade_live": fv["grade_live"],
                       "grade_abl": fv["grade_abl"], "dnll": fv["dnll"],
                       "grade_resident": fv["grade_resident"],
@@ -5591,6 +5934,190 @@ def _selftest() -> None:
     assert not torch.equal(k_a[:, 0], k_nu1[:, 0])
     m_kv1 = _mk_inj(read_path="kv", read_layers=[1])
     assert [b.read_bank for b in m_kv1.blocks] == [False, True]
+    # 21d-bis. TÊTES DÉDIÉES (`read_path='dual'`) : masse softmax garantie.
+    m_du = _mk_inj(read_path="dual")
+    assert [b.bank_heads is not None for b in m_du.blocks] == [True, True]
+    assert [b.bank_heads for b in m_noage.blocks] == [None, None], \
+        "les autres chemins de lecture ne doivent PAS gagner de têtes"
+    assert float(m_du.blocks[0].bank_heads.o.weight.abs().max()) == 0.0, \
+        "la projection de SORTIE des têtes banque doit être zéro-init"
+    with torch.no_grad():
+        d_nu = m_du(ids10, None, None)
+        d_inj0 = m_du(ids10, None, None, inject=rows10)
+    # (a) BIT-À-BIT le backbone À L'INIT, banque présente OU non : la sortie
+    #     des têtes est exactement nulle, donc le résiduel est intact.
+    #     ⚠️ La référence ne peut PAS être un autre `_mk_inj` : construire les
+    #     BankHeads consomme du RNG, donc un modèle `entry` de même graine n'a
+    #     pas les mêmes poids à partir du bloc 1. La bonne référence est CE
+    #     modèle, têtes banque RETIRÉES — c'est exactement la propriété qu'on
+    #     veut : présent-mais-nul ≡ absent.
+    import copy as _copy
+    m_du_ref = _copy.deepcopy(m_du)
+    for _b in m_du_ref.blocks:
+        _b.bank_heads = None
+    with torch.no_grad():
+        assert torch.equal(d_inj0, m_du_ref(ids10, None, None, inject=rows10)), \
+            ("read_path dual : à l'init, têtes banque PRÉSENTES ≡ têtes "
+             "ABSENTES, bit-à-bit")
+        assert torch.equal(d_nu, m_du_ref(ids10, None, None))
+    assert torch.equal(d_inj0, d_nu), \
+        "à l'init les têtes banque doivent rendre EXACTEMENT zéro"
+    assert d_inj0.shape == d_nu.shape, "dual ne doit rendre AUCUN préfixe"
+    # (b) LE PIÈGE r3 : une porte MULTIPLICATIVE zéro-init serait morte (le
+    #     gradient de ses paramètres internes vaut g·(…) = 0). Ici c'est la
+    #     SORTIE qui est nulle : W_o reçoit du gradient dès le premier
+    #     backward, donc la tête est VIVANTE. On le mesure, on ne le suppose
+    #     pas.
+    m_du.zero_grad()
+    m_du(ids10, None, None, inject=rows10).float().pow(2).mean().backward()
+    g_o = m_du.blocks[0].bank_heads.o.weight.grad
+    assert g_o is not None and float(g_o.abs().max()) > 0, \
+        "W_o sans gradient au step 0 : la tête banque est MORTE (piège r3)"
+    # (c) et elle apprend VRAIMENT : quelques pas suffisent à la décoller de
+    #     zéro et à écarter le forward du backbone.
+    m_tr = _mk_inj(read_path="dual")
+    opt_du = torch.optim.SGD(m_tr.parameters(), lr=0.5)
+    tgt = torch.tensor([[6, 7, 8]])
+    for _ in range(5):
+        opt_du.zero_grad(set_to_none=True)
+        lg = m_tr(ids10, None, None, inject=rows10)
+        F.cross_entropy(lg.reshape(-1, lg.size(-1)), tgt.reshape(-1)).backward()
+        opt_du.step()
+    assert float(m_tr.blocks[0].bank_heads.o.weight.abs().max()) > 0, \
+        "W_o est resté à zéro après 5 pas : la tête n'apprend pas"
+    with torch.no_grad():
+        assert not torch.equal(m_tr(ids10, None, None, inject=rows10),
+                               m_tr(ids10, None, None)), \
+            "après entraînement la banque doit CHANGER le forward"
+        # le CONTENU compte
+        assert not torch.equal(m_tr(ids10, None, None, inject=rows10),
+                               m_tr(ids10, None, None, inject=rows10 * 0.5))
+        # (d) LA BANQUE EST UN ENSEMBLE, PAS UNE SÉQUENCE : ni RoPE ni masque
+        #     causal ⇒ permuter les lignes ne doit RIEN changer. C'est
+        #     l'invariant qui distingue `dual` de `inject_entry` (dont le
+        #     préfixe est positionné) et la raison pour laquelle l'ancienneté
+        #     doit passer par le code d'âge et par lui seul.
+        perm = rows10[:, :, torch.randperm(rows10.shape[2])]
+        assert torch.allclose(m_tr(ids10, None, None, inject=rows10),
+                              m_tr(ids10, None, None, inject=perm), atol=1e-5)
+        # et la position 0 du tour voit déjà la banque (aucun masque causal)
+        assert not torch.equal(m_tr(ids10, None, None, inject=rows10)[:, 0],
+                               m_tr(ids10, None, None)[:, 0])
+    # (e) budget de couches apparié : hors couches lectrices, pas de têtes
+    m_du1 = _mk_inj(read_path="dual", read_layers=[1])
+    assert [b.bank_heads is not None for b in m_du1.blocks] == [False, True]
+    # (f) NON-RÉGRESSION des trois reads existants : à `mem` absent, le bloc
+    #     `dual` est le MÊME calcul que les autres — et `entry`/`kv` n'ont pas
+    #     bougé d'un bit (cf. d_nu ci-dessus et le self-test 21d).
+    with torch.no_grad():
+        assert torch.equal(_mk_inj(read_path="kv")(ids10, None, None),
+                           _mk_inj()(ids10, None, None))
+    # (g) knobs des têtes REFUSÉS hors dual (pas de no-op silencieux)
+    for bad in ({"bank_heads": 4}, {"bank_head_dim": 16}):
+        try:
+            ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF, top_k=3,
+                   variant="r4", code="tophid", **bad)
+        except AssertionError as e:
+            assert "dual" in str(e), str(e)
+        else:
+            raise AssertionError(f"ToyCfg aurait dû refuser {bad} hors dual")
+
+    # 21d-ter. `kv_proj` — PROJECTIONS DÉDIÉES, SOFTMAX UNIFIÉ (3ᵉ sommet).
+    m_kp = _mk_inj(read_path="kvproj")
+    m_kq = _mk_inj(read_path="kvproj", bank_q=True)
+    assert all(b.attn.kvproj for b in m_kp.blocks)
+    assert not any(getattr(b.attn, "kvproj", False) for b in m_noage.blocks), \
+        "les autres chemins ne doivent pas gagner de projections de banque"
+    assert float(m_kp.blocks[0].attn.bank_bias.abs().max()) == 0.0, \
+        "le biais de logits de banque doit être init 0"
+    assert not hasattr(m_kp.blocks[0].attn, "bq"), \
+        "sans --bank-q, aucune projection de requête de banque"
+    assert float(m_kq.blocks[0].attn.bo.weight.abs().max()) == 0.0, \
+        "W_o' des lanes banque doit être zéro-init"
+    with torch.no_grad():
+        p_nu = m_kp(ids10, None, None)
+        p_inj = m_kp(ids10, None, None, inject=rows10)
+        p_half = m_kp(ids10, None, None, inject=rows10 * 0.5)
+        q_inj = m_kq(ids10, None, None, inject=rows10)
+    # (a) BIT-À-BIT le backbone quand il n'y a PAS de banque. ⚠️ La référence
+    #     ne peut pas être un autre `_mk_inj` : construire bk/bv consomme du
+    #     RNG. La bonne référence est CE modèle, machinerie de banque RETIRÉE —
+    #     c'est la propriété qu'on veut : sans banque, elle n'intervient pas.
+    import copy as _cp0
+    m_kp_ref = _cp0.deepcopy(m_kp)
+    for _b in m_kp_ref.blocks:
+        _b.attn.kvproj = False
+        del _b.attn.bk, _b.attn.bv
+    with torch.no_grad():
+        assert torch.equal(p_nu, m_kp_ref(ids10, None, None)), \
+            "kvproj sans banque doit être le backbone nu, bit-à-bit"
+    assert p_inj.shape == p_nu.shape, "kvproj ne doit rendre AUCUN préfixe"
+    # (b) la banque compte, et son CONTENU aussi. ⚠️ Contrairement à
+    #     `dual_heads`, ce bras n'est PAS neutre à l'init avec banque — W_k'/
+    #     W_v' sont tirés normalement, exactement comme `kv_append` fait entrer
+    #     ses lignes brutes. C'est voulu : les deux sommets du haut du carré
+    #     doivent partir du même régime.
+    assert not torch.equal(p_inj, p_nu) and not torch.equal(p_inj, p_half)
+    assert not torch.equal(p_inj[:, 0], p_nu[:, 0]), \
+        "la position 0 doit déjà voir la banque (softmax unifié, pas de masque)"
+    # (c) LE BIAIS DE LOGITS mord, et il est DÉRIVABLE (sinon la mesure
+    #     annoncée dans results.json serait un zéro décoratif).
+    with torch.no_grad():
+        m_kp.blocks[0].attn.bank_bias.fill_(6.0)
+        p_bias = m_kp(ids10, None, None, inject=rows10)
+        m_kp.blocks[0].attn.bank_bias.zero_()
+    assert not torch.equal(p_bias, p_inj), "le biais par tête ne change rien"
+    m_kp.zero_grad()
+    m_kp(ids10, None, None, inject=rows10).float().pow(2).mean().backward()
+    gb_ = m_kp.blocks[0].attn.bank_bias.grad
+    assert gb_ is not None and float(gb_.abs().max()) > 0, \
+        "bank_bias sans gradient : il n'apprendrait jamais"
+    # (d) BANK-Q : à l'init, W_o' nul ⇒ les lanes valent les lignes brutes ⇒
+    #     le bras dégénère EXACTEMENT en kvproj (poids partagés : m_kq a des
+    #     modules en plus, on compare donc m_kq à lui-même, lanes débranchées).
+    import copy as _cp
+    m_kq_ref = _cp.deepcopy(m_kq)
+    for _b in m_kq_ref.blocks:
+        _b.bank_q = False
+    with torch.no_grad():
+        assert torch.equal(q_inj, m_kq_ref(ids10, None, None,
+                                           inject=rows10)), \
+            "bank_q à l'init doit être bit-à-bit le kvproj nu (W_o' = 0)"
+    # et les lanes APPRENNENT : quelques pas décollent W_o' et écartent le
+    # forward du bras sans portage.
+    opt_kq = torch.optim.SGD(m_kq.parameters(), lr=0.5)
+    for _ in range(5):
+        opt_kq.zero_grad(set_to_none=True)
+        lg = m_kq(ids10, None, None, inject=rows10)
+        F.cross_entropy(lg.reshape(-1, lg.size(-1)),
+                        torch.tensor([[6, 7, 8]]).reshape(-1)).backward()
+        opt_kq.step()
+    assert float(m_kq.blocks[0].attn.bo.weight.abs().max()) > 0, \
+        "W_o' est resté nul : les lanes banque n'apprennent pas"
+    # (e) LA BANQUE RESTE UN ENSEMBLE : ni RoPE ni ordre sur les lignes ⇒
+    #     permuter les lignes ne change pas la sortie du TOUR.
+    with torch.no_grad():
+        pm = rows10[:, :, torch.randperm(rows10.shape[2])]
+        assert torch.allclose(m_kq(ids10, None, None, inject=rows10),
+                              m_kq(ids10, None, None, inject=pm), atol=1e-5)
+    # (f) l'état des lanes est JETÉ en sortie : rien ne le réécrit dans la
+    #     banque (invariant « seule modif de la banque = l'append d'un write »).
+    assert m_kq(ids10, None, None, inject=rows10).shape == p_nu.shape
+    # (g) budget de couches apparié + refus du no-op
+    m_kp1 = _mk_inj(read_path="kvproj", read_layers=[1])
+    assert [b.read_bank for b in m_kp1.blocks] == [False, True]
+    for bad in ({"read_path": "kv"}, {"read_path": "dual"},
+                {"read_path": "entry"}):
+        try:
+            ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF, top_k=3,
+                   variant="r4", code="tophid", bank_q=True, **bad)
+        except AssertionError as e:
+            assert "bank_q" in str(e), str(e)
+        else:
+            raise AssertionError(f"bank_q aurait dû être refusé avec {bad}")
+
     # 21e. LE STREAM : la règle est un seg PORTEUR (donc écrit), son nom
     #      n'apparaît JAMAIS dans une réponse, et la paire contrastive partage
     #      TOUT sauf les marqueurs.
@@ -5724,6 +6251,30 @@ def _selftest() -> None:
     assert not (set(_addn) & {grid_name(_grid_cfg(c, _base10))
                               for c in grid_combos()}), \
         "une cellule additive écraserait une cellule multiplicative"
+    # SOUS-ENSEMBLES `kvproj` / `kvproj-bq` : 12 + 12, tous distincts et sans
+    # collision avec quoi que ce soit de déjà lancé. Le `_bq` doit séparer.
+    _kp = [grid_name(_grid_cfg(c, _base10))
+           for c in grid_combos(**GRID_SUBSETS["kvproj"])]
+    _kq = [grid_name(_grid_cfg(c, _base10))
+           for c in grid_combos(**GRID_SUBSETS["kvproj-bq"])]
+    assert len(set(_kp)) == 12 and len(set(_kq)) == 12
+    assert not (set(_kp) & set(_kq)), "bank_q ne sépare pas les dossiers"
+    assert all(n.endswith("_bq") for n in _kq), _kq
+    assert all("kvproj" in n for n in _kp), _kp
+    # bank_q ne DÉBORDE pas sur les autres bras
+    assert not any(c["bank_q"] for c in grid_combos(bank_q=True)
+                   if c["read"] != "kv_proj")
+    # SOUS-ENSEMBLE `dual` : 12 cellules, 12 noms, aucune collision avec les
+    # 36 de la grille lancée ni avec les 12 additives.
+    _dl = grid_combos(**GRID_SUBSETS["dual"])
+    assert len(_dl) == 12, len(_dl)
+    _dln = [grid_name(_grid_cfg(c, _base10)) for c in _dl]
+    assert len(set(_dln)) == 12 and all("dualheads" in n for n in _dln), _dln
+    _lance = {grid_name(_grid_cfg(c, _base10)) for c in grid_combos()}
+    assert not (set(_dln) & (_lance | set(_addn))), \
+        "une cellule dual écraserait une cellule déjà lancée"
+    assert not ((set(_kp) | set(_kq)) & (_lance | set(_addn) | set(_dln))), \
+        "une cellule kvproj écraserait une cellule déjà lancée"
     # et l'additif ne DÉBORDE PAS sur les bras attention
     assert not any(c["fw_additive"] for c in
                    grid_combos(fw_additive=True) if c["read"] != "seq_fw")
@@ -5891,6 +6442,28 @@ def _selftest() -> None:
           f"boucle), suffixe _fwadd au save_dir, et le sous-ensemble de "
           f"manifeste `seqfw-additive` rend 12 cellules dont AUCUNE ne "
           f"collisionne avec le bras multiplicatif.", flush=True)
+    print(f"  TÊTES DÉDIÉES (--read dual_heads) : groupe de "
+          f"{ToyCfg.bank_heads} têtes par couche LECTRICE, attention sur la "
+          f"banque SEULE (ni RoPE ni masque causal), fusion avec les têtes de "
+          f"contexte AVANT le FFN. Vérifié : présent-mais-nul ≡ ABSENT "
+          f"bit-à-bit à l'init (W_o zéro-init) ; W_o reçoit du gradient DÈS le "
+          f"premier backward — c'est ce qui évite le piège r3 de la porte "
+          f"multiplicative morte — et 5 pas suffisent à décoller la tête ; "
+          f"la banque est un ENSEMBLE (permuter les lignes ne change rien, "
+          f"invariant impossible pour inject_entry) et la position 0 la voit ; "
+          f"têtes limitées aux couches lectrices ; knobs bank_heads/"
+          f"bank_head_dim REFUSÉS hors dual ; 12 cellules `dual` sans "
+          f"collision avec les 36 lancées ni les 12 _fwadd.", flush=True)
+    print(f"  CARRÉ FACTORIEL — 3ᵉ sommet `--read kv_proj` (projections "
+          f"DÉDIÉES / softmax UNIFIÉ) : sans banque ≡ backbone BIT-À-BIT ; la "
+          f"banque et son CONTENU comptent, la position 0 la voit ; le biais "
+          f"de logits par tête est init 0, MORD sur la sortie et reçoit du "
+          f"gradient (donc sa valeur loggée est une vraie mesure) ; --bank-q "
+          f"est bit-à-bit le kvproj nu à l'init (W_o' zéro-init) puis décolle "
+          f"en 5 pas, les lignes restent un ENSEMBLE (permutation neutre) et "
+          f"leur état est JETÉ en sortie de stack ; bank_q REFUSÉ hors kvproj. "
+          f"Nommage : 12 cellules kvproj + 12 _bq, sans collision avec les 36 "
+          f"lancées, les 12 _fwadd ni les 12 dual.", flush=True)
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "
