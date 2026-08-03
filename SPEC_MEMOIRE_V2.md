@@ -271,10 +271,17 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
   la rotation R(t) n'étant pas annulée côté banque. Le produit se faisant dim à
   dim, les plans de métadonnées doivent viser les dims QUASI STATIQUES (ω ≈ 0)
   du RoPE backbone côté requête, sinon le code d'âge se mélange à la position
-  dans la fenêtre (cos(ωt − φ_âge)). Corollaire : les clés banque se dockent
-  naturellement dans la bande lente — HoPE retrouvé par l'implémentation ; le
-  fait que kvproj gagne suggère que W_K' l'apprend seul. À vérifier en ph.11
-  (spectre de W_K' par dim de fréquence). Fallback si contamination avérée :
+  dans la fenêtre (cos(ωt − φ_âge)). Le corollaire espéré — « les clés banque
+  se dockent naturellement dans la bande lente, HoPE retrouvé par
+  l'implémentation, W_K' l'apprend seul » — a été **MESURÉ 08-03 (nuit) et
+  RÉFUTÉ** : sur les 15 ckpts kvproj, l'énergie de W_K' par bande de fréquence
+  est indiscernable de l'uniforme (moitié lente 0,5000 ± 0,0005). À fenêtre
+  courte, la contamination ne coûte rien, donc rien ne pousse le modèle à s'en
+  protéger ⇒ **la prescription se tient PAR CONSTRUCTION**
+  (`slow_rope_planes` + garde de dérive `rot_drift_max`, livrés en ph.11), et
+  la mesure est à refaire en fenêtre LONGUE au 350M
+  ([analysis/kvproj_wk_spectrum.py](deepseek_v4_mini/analysis/kvproj_wk_spectrum.py)).
+  Fallback si contamination avérée :
   DÉ-ROTER q pour les colonnes banque (score banque = qᵀk' nu, deux attentions
   fusionnées par log-sum-exp — exact, prix = perte du SDPA unique). JAMAIS de
   rotation de la banque par position absolue de fenêtre : (R(t)q)ᵀR(p)k' =
@@ -352,9 +359,9 @@ verdict. Rien d'autre n'est ouvert.
 |---|---|---|---|---|
 | S1 | kvproj vs kv_append (coût de la dédicace K/V) | 12 cellules kvproj du carré | **TRANCHÉ 08-03 : kvproj ADOPTÉ** | mieux que la règle (« ≈ suffisait ») : Δcit +0,209 ± 0,115 apparié n=12 (t 6,3), Δmark +0,120 — la dédicace PAIE en plus d'héberger les rotations ; meilleure cellule du carré = kvproj rot-on m8 (cit 2,34) |
 | S2 | ±bank-q (contextualiser la requête par la banque) | 12 cellules bank-q du carré | **EN FILE** (ferme) | positif → se greffe sur kvproj ; nul → abandonné (indépendant de S1) |
-| S3 | rotation d'âge vs rien vs biais scalaire | ph.11 : contrôle θ_âge=0 (HoPE), NON NÉGOCIABLE | à lancer après dépouillement du carré | la rotation doit BATTRE θ_âge=0 sur la citation, sinon âge = biais scalaire de récence |
-| S4 | OOD d'âge (compression) | ph.11 : train ≤A_train, éval 10×/100× ; bras {brut, log-comprimé, brut+augmentation} | à lancer | le bras qui tient l'OOD gagne ; prédiction = log |
-| S5 | tag provenance rotatif vs additif | ph.11 : A/B direct, mesurer r@1 ET taux de copie SÉPARÉMENT | à lancer | si la rotation casse le circuit de copie (câblé layout, ph.8) là où l'additif non → additif sur dims réservées |
+| S3 | rotation d'âge vs rien vs biais scalaire | ph.11 : contrôle θ_âge=0 (HoPE), NON NÉGOCIABLE | **HARNAIS LIVRÉ 08-03 (nuit)** : 8 cellules `zzr1xx` prêtes (agezero/agelog/ageraw/agebias × m4,m8), rotations sur K' APRÈS W_K' et plans dockés sur les paires quasi statiques du RoPE (garde `rot_drift_max`) | la rotation doit BATTRE θ_âge=0 sur la citation, sinon âge = biais scalaire de récence |
+| S4 | OOD d'âge (compression) | ph.11 : train ≤A_train, éval 10×/100× ; bras {brut, log-comprimé, brut+augmentation} | **HARNAIS LIVRÉ 08-03 (nuit)** : 2 cellules `zzr2xx` (raw+aug, log+aug ; les bras non augmentés SONT les cellules m4 de l'examen `age`, appariement exact), chaque run évalué aux échelles 1/10/100 | le bras qui tient l'OOD gagne ; prédiction = log |
+| S5 | tag provenance rotatif vs additif | ph.11 : A/B direct, mesurer r@1 ET taux de copie SÉPARÉMENT | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr3xx` sur l'env `prov` (deux faits du même slot ET attribut — clé oracle IDENTIQUE —, un par canal, ordre tiré au sort) ; r@1 = masse d'attention par groupe, grade = copie, mesurés SÉPARÉMENT | si la rotation casse le circuit de copie (câblé layout, ph.8) là où l'additif non → additif sur dims réservées |
 | S6 | signal de rétention (maintenance) | ph.11 : bakeoff FIFO nue / âge (baseline à battre) / attention-EMA / couverture sémantique / ACT-R — vies longues NY→Austin avec ré-évocation tardive | à lancer | métrique de première classe = temps d'adaptation aux faits nouveaux ET survie des faits anciens utiles |
 | S7 | politique `<think>` (synthèse + salience) | GRPO ph.2 (cliquet SFT/RL) | après phase 11 | suivi = Δnll + toolcall, jamais requote (sonde morte) |
 | S8 | max_mem (dilution vs rappel) | KT8 : courbe Δnll conditionnement vs S = 1/4/16/64 | à lancer | fixe S ; l'écroulement de la plate = baseline d'entrée de la hiérarchie (§2.8) |
@@ -366,7 +373,7 @@ verdict. Rien d'autre n'est ouvert.
 | S14 | copie indue (négatifs copy-head) | KT7 : wrong-slot / slot-périmé, calibration `log_alpha` | avant toute démo de rappel | taux de copie indue = métrique de première classe |
 | S15 | falaise layout | KT9 : varier nombre/ordre de groupes à l'éval sur le ckpt copy | à lancer | fixe la normalisation §4.3 |
 | S16 | mem_dim (taille de slot) | stats atomes/tour sur corpus réel (recall_env + data SOTA) ; masque de vide au softmax | à chiffrer (cheap, CPU) | mem_dim = quantile haut atomes/tour + marge propagation — jamais une fraction de seq_len |
-| S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | à lancer (avec S3-S5) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
+| S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr4xx` sur l'env `span` (longueurs MESURÉES 1..6, grade par strate de longueur) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
 
 ## 4. Corrections pré-run (état)
 
