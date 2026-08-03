@@ -45,10 +45,15 @@ Ce que le claim PORTE, adossé à des mesures :
   modèle, donc elle l'influence — et c'est mesuré : 2AFC 1,000, marqueurs
   +2,5/+3,3 nats, shuf SOUS le hasard (spécifique au contenu) ; persona
   Δnll +0,332 à β=0.
-- **Règle de protocole (KT1)** : le pointeur discret (préfixe + copy-head) gagne
-  le rappel exact mais PERD le nll de valeur (+0,223) — **le Δnll seul ne juge
-  plus la citation** ; le rappel exact se mesure en grade de rappel, le
-  conditionnement en Δnll, jamais l'un pour l'autre.
+- **Règle de protocole (KT1, durcie par l'audit des absolus 08-03)** : le
+  pointeur discret gagne le rappel exact mais perd le nll de valeur — le Δnll
+  ne juge pas la citation ; et l'audit a montré que le **Δnll INTRA-MODÈLE
+  (abl − live) est DÉPRÉCIÉ comme juge tout court** : dans le même carré il a
+  gonflé un gagnant (part bait +0,044 de kvproj) ET masqué un concurrent
+  (dual_heads, meilleur en absolu, puni pour son meilleur plancher).
+  **Adjudication = nll_live ABSOLU apparié + grade décodé + r@1** ; le Δnll
+  reste une sonde de conditionnement (paires contrastives), jamais un juge
+  d'architecture.
 
 Ce qu'on ne revendique **plus ou pas encore** :
 
@@ -230,27 +235,28 @@ l'attention des couches lectrices. Le fast-weight read est retiré du design.
 
 Carré 2×2 : projections {partagées, dédiées} × softmax {unifié, séparé} —
 kv_append (partagées/unifié), dual_heads (dédiées/séparé), kv_proj
-(dédiées/unifié) ± bank-q ; départagé sur Δnll citation + marges de marqueurs
-(le 2AFC sature). **Verdict (08-03 soir, ailes dual_heads ET kvproj
-COMPLÈTES ; bank-q = S2 INVALIDÉ pour fuite non-causale, voir §3-S2)** :
+(dédiées/unifié) ± bank-q. **Verdict (08-03, ailes COMPLÈTES + AUDIT DES
+ABSOLUS ; bank-q = S2 INVALIDÉ pour fuite non-causale, voir §3-S2)** — le
+départage initial au Δnll citation a été RE-JUGÉ en nll_live absolu apparié
+(règle §1, l'audit ayant montré que le delta gonfle ET masque) :
 
-- **dual_heads ≈ kv_append** : Δmark apparié +0,118 (sd 0,198, n=12), Δnll
-  citation nul (−0,046). Les têtes dédiées à softmax séparé n'achètent RIEN à
-  max_mem=8 — et à m=8 le softmax PARTAGÉ exploite mieux le budget (Δnll
-  citation 1,79 vs 1,45) : l'arbitrage de masse appris bat la séparation
-  structurelle. **dual_heads est ÉLIMINÉ** (gain nul, coût double : projections
-  dédiées + seconde passe d'attention).
+- **kvproj ADOPTÉ (S1 tranché, confirmé en absolu)** : nll_live −0,165 ± SE
+  0,053 (t 3,1) vs kv_append, part bait du delta +0,044 non significative ;
+  l'exploitation du budget m est réelle en absolu (3,86 → 3,35 de m1 à m8).
+  Double justification : performance mesurée ET hébergement des rotations
+  (§2.5 — une rotation appliquée avant W_k ne survit pas à la projection ; les
+  dims partagées sont occupées par la sémantique du backbone). Prix : ~2d² par
+  couche lectrice. Fallback dims-étendues retiré.
+- **dual_heads : DOMINÉ COÛT-AJUSTÉ (verdict corrigé par l'audit)**. Le delta
+  le disait nul — artefact : son plancher ablaté plus bas le punissait. En
+  ABSOLU il est le meilleur à chaque m (m8 : 3,298 vs kvproj 3,346), mais
+  l'avance sur kvproj est dans le bruit (+0,048, SE ~0,05), le coût est double
+  (4 matrices dédiées + seconde passe d'attention) et les paramètres ne sont
+  pas appariés. kvproj reste le choix ; dual_heads redevient un candidat
+  seulement si un jour le softmax unifié plafonne à grande banque (KT8).
 - **La compétition de masse softmax n'est pas une contrainte réelle** : le
   `bank_logit_bias` appris de kvproj reste ≈ 0 (moy +0,004 à m1, léger
   amortissement −0,012/−0,019 à m4/m8).
-- **kvproj ADOPTÉ (S1 tranché)** : Δcit apparié **+0,209 ± 0,115 (n=12,
-  t=6,3)**, Δmark +0,120 ± 0,106 — la dédicace ne coûte pas, elle PAIE, et
-  l'écart croît avec m (cit m8 : 2,13-2,34 vs 1,79). Double justification
-  désormais : performance mesurée ET hébergement des rotations (§2.5 — une
-  rotation appliquée avant W_k ne survit pas à la projection ; les dims
-  partagées sont occupées par la sémantique du backbone). Prix : ~2d² par
-  couche lectrice. Le fallback dims-étendues est retiré. Meilleure cellule du
-  carré : kvproj rot-on m8 (cit 2,336).
 - L'age-rot du jouet (DFT brute) reste ~neutre dans kvproj (Δcit +0,055,
   Δmark −0,144, n=6) — le design réel (log + fréquences apprises) se juge en
   ph.11 (S3-S4), pas ici.
@@ -383,7 +389,7 @@ verdict. Rien d'autre n'est ouvert.
 
 | # | Décision | Test | État | Règle de décision |
 |---|---|---|---|---|
-| S1 | kvproj vs kv_append (coût de la dédicace K/V) | 12 cellules kvproj du carré | **TRANCHÉ 08-03 : kvproj ADOPTÉ** | mieux que la règle (« ≈ suffisait ») : Δcit +0,209 ± 0,115 apparié n=12 (t 6,3), Δmark +0,120 — la dédicace PAIE en plus d'héberger les rotations ; meilleure cellule du carré = kvproj rot-on m8 (cit 2,34) |
+| S1 | kvproj vs kv_append (coût de la dédicace K/V) | 12 cellules kvproj du carré + audit des absolus (`p10_abs_nll.py`, 42/42 harnais OK) | **TRANCHÉ 08-03 : kvproj ADOPTÉ, confirmé en ABSOLU** | nll_live −0,165 (t 3,1) apparié vs kv_append, part bait +0,044 ns ; exploitation de m réelle (3,86→3,35) ; dual_heads re-jugé : meilleur absolu mais DOMINÉ COÛT-AJUSTÉ (+0,048 sur kvproj à m8 = bruit, double coût, params non appariés) ; règle durcie : adjudication = nll_live absolu + grade + r@1, plus jamais le Δnll intra-modèle |
 | S2 | ±bank-q (les lignes se contextualisent au read) | 12 cellules bank-q du carré | **MESURE INVALIDÉE 08-03** (7/12 suffisent) | fuite NON-CAUSALE : les lanes voient tout le segment teacher-forcé (futur compris) et le réinjectent aux K/V des couches suivantes — citation +1,45 (fuite, pas lecture) ET conditionnement effondré 2AFC 0,89→0,52 avec m (le vrai circuit s'atrophie, cousin du bug boundary_step GRPO 07-27). Verdict de design : la contextualisation banque-lit-banque appartient à l'étage WRITE (frontière de tour, passé seul) — bank-q au read est retiré ; re-test éventuel = lanes mises à jour aux frontières de tour uniquement |
 | S3 | rotation d'âge vs rien vs biais scalaire | ph.11 : contrôle θ_âge=0 (HoPE), NON NÉGOCIABLE | **HARNAIS LIVRÉ 08-03 (nuit)** : 8 cellules `zzr1xx` prêtes (agezero/agelog/ageraw/agebias × m4,m8), rotations sur K' APRÈS W_K' et plans dockés sur les paires quasi statiques du RoPE (garde `rot_drift_max`) | la rotation doit BATTRE θ_âge=0 sur la citation, sinon âge = biais scalaire de récence |
 | S4 | OOD d'âge (compression) | ph.11 : train ≤A_train, éval 10×/100× ; bras {brut, log-comprimé, brut+augmentation} | **HARNAIS LIVRÉ 08-03 (nuit)** : 2 cellules `zzr2xx` (raw+aug, log+aug ; les bras non augmentés SONT les cellules m4 de l'examen `age`, appariement exact), chaque run évalué aux échelles 1/10/100 | le bras qui tient l'OOD gagne ; prédiction = log |

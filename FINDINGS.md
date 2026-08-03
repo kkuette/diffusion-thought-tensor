@@ -78,6 +78,44 @@ Repro : `python -m deepseek_v4_mini.analysis.kvproj_wk_spectrum` (CPU, quelques
 secondes ; `--ckpts` pour un autre glob, JSON déposé à côté de chaque ckpt si le
 partage est inscriptible).
 
+## 2026-08-03 (nuit) — AUDIT DES ABSOLUS du Δnll citation (42 ckpts, harnais 42/42 OK) : S1 confirmé (~79 % du delta est réel), dual_heads était MASQUÉ par le delta (meilleur absolu, dominé coût-ajusté), le Δnll intra-modèle est DÉPRÉCIÉ comme juge
+
+**Question (user)** : « le Δnll est-il un bait ? » — Δ = nll_abl − nll_live peut
+grandir parce que le plancher ablaté monte (backbone dépendant de la banque),
+sans que le live soit meilleur. Audit : `analysis/p10_abs_nll.py` recharge les
+42 ckpts (kvappend/kvproj/dualheads × rot × tap × m), rejoue l'éval citation à
+l'identique (seed 1234) en interceptant les DEUX termes ; auto-contrôle Δ
+recalculé vs stocké : 42/42 OK.
+
+```
+apparié vs kvappend n=12   Δnll_LIVE (réel)      Δnll_ABL (part bait)
+kv_proj                    −0,165 ± 0,183 (t 3,1) +0,044 ± 0,096 (ns)
+dual_heads                 −0,297 ± 0,144 (t 7,1) −0,342 ± 0,323
+
+nll_LIVE absolu par m      m1      m4      m8
+kv_append                  3,798   3,835   3,690
+kv_proj                    3,858   3,625   3,346
+dual_heads                 3,675   3,460   3,298
+```
+
+1. **S1 SURVIT** : kvproj bat kvappend en ABSOLU (−0,165, t 3,1) ; la part
+   bait du +0,209 n'est que +0,044, non significative. L'exploitation du
+   budget m est réelle en absolu (3,86→3,35).
+2. **dual_heads était MASQUÉ, pas nul** : meilleur nll_live absolu à CHAQUE m.
+   Son « gain nul » au delta venait de son plancher ablaté plus bas — le delta
+   le punissait d'avoir un meilleur backbone ; « le softmax partagé exploite
+   mieux m » était le même artefact. Correction du verdict : dual_heads =
+   DOMINÉ COÛT-AJUSTÉ (avance sur kvproj à m8 +0,048 = dans le bruit, pour un
+   double coût 4-matrices + seconde passe, et un confound de paramètres non
+   apparié). kvproj reste le choix — pour les bonnes raisons.
+3. **RÈGLE DE PROTOCOLE (rétroactive et définitive)** : le Δnll intra-modèle
+   (abl − live) est DÉPRÉCIÉ comme métrique d'adjudication — il a gonflé ET
+   masqué dans le même carré. Adjudication = nll_live ABSOLU apparié + grade
+   décodé + r@1. Les examens ph.11 (grade + r@1) sont déjà conformes ; l'audit
+   des absolus est scriptable sur tout ckpt (`--root`, `--glob`).
+
+Repro : job `00_audit_p10_absnll` ; log `runs/toy_read_lab_p10/audit_abs_nll.log`.
+
 ## 2026-08-03 (soir) — Carré factoriel des lectures attention (36/48, ailes dual_heads + kvproj COMPLÈTES) : dual_heads ÉLIMINÉ, kvproj ADOPTÉ (+0,209 citation, t=6,3), la compétition de masse softmax n'existait pas
 
 **Question (SPEC_MEMOIRE_V2 §2.4)** : dans le carré {projections partagées vs
