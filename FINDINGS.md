@@ -473,6 +473,42 @@ a aucun.
 
 ---
 
+## 2026-08-01 (soir) — Sonde de localisation gist (SPEC_MEMOIRE_V2 §2.4) : le goulot est le POOLING appris à une tête, pas la largeur du store
+
+Question : dans la chaîne du write gist (T×768 → pooling attentionnel → projection
+768→512 → banque → read fast-weight r=8), où l'information meurt-elle ? Sondes
+linéaires (ridge) sur 3 attributs × 4 étages, ckpt persona_sif_repass_rearm
+step_550 (banque pleinement entraînée), N=300 CPU, stable seed 0/1 et couche 6/11.
+Script : `analysis/gist_local_probe.py` (~2 min CPU).
+
+Rétention de l'IDENTITÉ DE LA VALEUR (récupération top-1 parmi 8 candidats,
+valeurs jamais vues au train, au-dessus de la chance, réf. = pooling moyenne
+uniforme des mêmes états) : **1.00 → 0.47 (pooling appris) → 0.45 (projection)
+→ 0.37 (read)**. Les attributs catégoriels (slot 19 classes, strate 4) traversent
+quasi intacts (0.88-1.00 partout).
+
+Verdicts :
+1. **Le pooling appris à UNE tête est le goulot** — il jette plus de la moitié du
+   signal valeur (0.675 → 0.383). Le contrôle décisif : la MOYENNE UNIFORME des
+   mêmes états de dernière couche retient 0.675 — l'information est encore là,
+   c'est le pooling entraîné (spécialisé persona) qui la détruit.
+2. **La projection 768→512 ne coûte RIEN** (0.383 → 0.372) — la largeur du store
+   n'était pas le problème ; « élargir mem_dim » ne rapporterait rien seul.
+3. **Le read r=8 coûte un supplément réel mais de second ordre** (0.372 → 0.327,
+   borne optimiste : slot isolé, M=1) — élever r vient après.
+4. Le gist actuel SUFFIT pour moduler (slot/strate intacts) — cohérent avec le
+   principe de séparation : la perte ne touche que ce que le gist n'a pas
+   vocation à porter seul (l'identité fine de la valeur).
+
+Décision §2.4 : le cadran désigné est **m têtes de pooling par write** (la matrice
+(m, d) du design user) — pas mem_dim, pas r. Nuance sur le « tap trop bas » : la
+dernière couche CONTIENT encore la valeur linéairement (mean768 0.675) — le tap
+mi-stack reste à sonder (extension naturelle du script), mais le correctif
+prioritaire est le nombre de têtes, pas la profondeur.
+
+Repro :
+    PYTHONPATH=. python deepseek_v4_mini/analysis/gist_local_probe.py --n 300
+
 ## 2026-08-01 — Kill-test 3 (SPEC_MEMOIRE_V2 §4) : la prédiction « biais chiffres » est RENVERSÉE — le vrai bug est k fixe vs longueur de tour (code : inclusion pleine 0.000)
 
 Contexte : la critique adversariale du 07-31 prédisait que le biais SIF

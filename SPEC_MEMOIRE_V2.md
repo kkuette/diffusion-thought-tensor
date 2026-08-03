@@ -87,7 +87,79 @@ Ajouter et oublier sont le même geste : écrire sur un slot détruit son conten
   devra désapprendre (dsv4mini switch task : ces politiques ne s'apprennent pas « en
   passant »). D'où la sonde anti-récence obligatoire (§5.3).
 
-### 2.4 Deux lectures sur un seul store
+### 2.4 Budget de la banque et points de prélèvement (ancrages 08-01 soir)
+
+**Ancrage cross-modal** : la banque est une modalité — cible long-terme = vision/son/
+texte écrivant dans le même mem_dim via des encodeurs de write par modalité. Pas un
+chantier courant, mais aucun choix ne doit fermer cette voie (l'injection-comme-
+modalité y est compatible ; seule la voie surface/pointeur est spécifique au texte,
+la seule modalité où le verbatim existe).
+
+**Budget** : trois cadrans, à ne tourner qu'après localisation de la perte —
+mem_dim (512→d_model, déjà ranké phase 1), rang r du read fast-weight (l'expressivité
+de la lecture peut plafonner avant la capacité du stockage), et **une MATRICE par write**
+(précision user 08-01, affinée) : le write rend G ∈ R^{m×d} — m vecteurs de PLEINE
+largeur d_model, la projection 768→512 disparaît. « mem_dim » se réinterprète : la
+largeur est fixée à d (l'intégrité du vecteur de base est conservée), le cadran de
+budget devient m (combien de vecteurs par write) — la seule compression restante est
+la SÉLECTION/le pooling en m têtes, plus aucune perte en largeur. Conséquences :
+(a) le slot devient HOMOGÈNE avec la surface — les deux composantes sont des listes
+de vecteurs d-dim, seule change leur provenance (embeddings couche 0 vs états
+mi-tardifs) — un seul format de slot, et les lignes de gist deviennent elles-mêmes
+injectables comme pseudo-tokens — **l'INJECTION-COMME-MODALITÉ, À TESTER (user
+08-01)** : une seule lecture (tout passe par le préfixe, le fast-weight devient
+optionnel) serait la banque-comme-modalité au sens plein. Échelle de test :
+(1) labo jouet d'abord — la ph.9 a montré que l'injection d'états post-norm CITE
+à 0.434 from-scratch (vs 0.708 natif) ; la mesure manquante est le
+CONDITIONNEMENT (Δnll contrastif avec lignes de gist injectées vs fast-weight vs
+sans mémoire, from-scratch) ; (2) si le jouet passe : bras SFT 350M avec un
+type-vec dédié « gist » (comme rti_type.vec) injectant m lignes mi-tardives à
+côté des groupes surface, sonde persona Δnll ; (3) verdict phase 1. Piège connu :
+les états mi-stack au préfixe couche 0 sont OOD pour un modèle gelé — le test
+n'a de sens qu'entraîné (jouet from-scratch ou SFT avec type-vec).
+(b) côté read fast-weight, chaque ligne = un sous-slot d'entrée d (hypernet
+fw_A/fw_B passe de mem_dim→… à d→…) — trois agrégations candidates :
+séquentielle m×S (l'actuelle, coût ×m), sélection au read, et **VUE PLATE +
+ATTENTION (user 08-01, design retenu à tester — mécanique précisée)** :
+le stockage reste le tenseur **(max_mem, mem_dim, d)** (mem_dim = lignes par
+slot, pleine largeur d) ; à la lecture, une simple **VUE (max_mem·mem_dim, d)**
+— reshape zéro-copie, l'axe slot étendu sur l'axe lignes, **AUCUNE
+multiplication de matrices dédiée au read** (pas d'hypernet, pas de projection ;
+la rotation par âge est élémentaire type RoPE, recalculée au write, cohérente
+avec l'écrasement). Les lignes entrent dans l'attention telles quelles — seules
+les projections K/V propres de la couche s'appliquent, comme à n'importe quel
+token. Lignes séparées : zéro interférence, récence portée par la rotation.
+Sous-choix d'implémentation à trancher (ph.10 / bras SFT) : (α) lignes en
+pseudo-tokens à l'ENTRÉE (traversent le stack — requis pour la SURFACE, dont le
+pointeur copy-head a besoin des positions au préfixe) vs (β) lignes appondues
+en K/V aux couches lectrices (pas de ré-encodage — naturel pour le GIST, dont
+les lignes sont déjà des états mi-tardifs) ; le mapping surface→(α), gist→(β)
+recoupe exactement le principe de séparation. Coût honnête : max_mem·mem_dim
+lignes dans l'attention = LE cadran de coût du gist, à budgéter comme le
+préfixe surface. Garde-fou restant : autre classe de fonctions que le
+fast-weight ⇒ A/B apparié (jouet ph.10, rotation par âge en variante) avant
+d'adopter ;
+(c) la sonde de localisation reste utile : si elle montre que la projection 768→512
+tuait déjà l'information, ce design est directement vindiqué ; si c'était le pooling,
+m est le cadran ; si c'était le rang r, élargir les lignes n'aurait rien rendu. **SONDE FAITE (08-01 soir, FINDINGS)** : verdict = le goulot est le POOLING appris
+à une tête (rétention valeur 1.00 → 0.47 au pooling ; la moyenne uniforme des mêmes
+états retient 0.675 — l'information était là, le pooling la jette) ; la projection
+768→512 ne coûte rien (0.47 → 0.45) ; le read r=8 = second ordre (0.45 → 0.37) ;
+slot/strate traversent intacts (le gist actuel suffit pour moduler). **Cadran
+désigné : m têtes de pooling par write** — la matrice (m, d) est vindiquée sur
+l'axe du NOMBRE de lignes ; la pleine largeur est gratuite mais n'était pas le
+goulot ; r vient après. Le tap mi-stack reste à sonder (la dernière couche contient
+encore la valeur linéairement). Contre-pression : la dilution ambiante (kill-test 8).
+
+**Point de prélèvement du write (gist)** : le pooling actuel prend la DERNIÈRE couche
+— l'étage le plus aligné output (logit-lens ; jouet ph.9 : canal post-norm 0.434 vs
+0.708 pour l'embedding d'entrée, mort sous readout appris). La surface est déjà
+prélevée couche 0 (ce qui la sauve) ; le gist veut les CONCLUSIONS (mi-tardif, ~2/3
+de profondeur), pas la rotation vocabulaire. Correctif ranké : tap à ~2/3, ou
+scalar-mix appris sur les couches (n_layers scalaires — le mix appris est lui-même
+un diagnostic). Knob phase 1.
+
+### 2.5 Deux lectures sur un seul store
 
 | | Lecture ambiante | Lecture ciblée |
 |---|---|---|
