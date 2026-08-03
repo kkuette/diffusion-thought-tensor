@@ -252,6 +252,15 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
 - **Jamais dans la bande RoPE du backbone** — les plans vivent dans les
   projections K dédiées de kvproj : la dédicace est un MOYEN d'hébergement, pas
   une fin (§2.4).
+- **Contrainte côté REQUÊTE (08-03, lue dans le code)** : kvproj partage le q
+  du backbone, ROPE COMPRIS — le score banque est (R(t)·W_Q x_t)ᵀ(W_K' g_r),
+  la rotation R(t) n'étant pas annulée côté banque. Le produit se faisant dim à
+  dim, les plans de métadonnées doivent viser les dims QUASI STATIQUES (ω ≈ 0)
+  du RoPE backbone côté requête, sinon le code d'âge se mélange à la position
+  dans la fenêtre (cos(ωt − φ_âge)). Corollaire : les clés banque se dockent
+  naturellement dans la bande lente — HoPE retrouvé par l'implémentation ; le
+  fait que kvproj gagne suggère que W_K' l'apprend seul. À vérifier en ph.11
+  (spectre de W_K' par dim de fréquence).
 - Trois examens EN SUSPENS avant d'acter (§3-S3/S4/S5) : le contrôle θ_âge=0
   (HoPE : la rotation nulle sur l'axe long maximise le rappel — si l'âge rotatif
   ne le bat pas, l'âge passe en biais scalaire de récence), l'OOD d'âge, et le
