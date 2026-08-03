@@ -905,8 +905,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if getattr(model, "rti_copy", None) is not None:
             want |= {"rti_copy.wc.weight", "rti_copy.w_g", "rti_copy.b_g",
                      "rti_copy.log_temp"}
+        # (08-01) init depuis un ckpt qui a DÉJÀ des modules rti (le run copy
+        # part du ckpt rti : retriever entraîné, copy-head neuve) : on n'attend
+        # manquantes que les clés voulues que le ckpt de base ne porte pas.
+        want -= set(ck0["model"].keys())
         assert set(miss) == want, \
-            f"init_from: clés manquantes inattendues {sorted(set(miss) - want)}"
+            f"init_from: clés manquantes inattendues {sorted(set(miss) ^ want)}"
         assert not unexp, f"init_from: clés en trop {sorted(unexp)[:8]}"
         print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})"
               + (f" | rti neuf : {sorted(want)} (zéro-init)" if want else ""),

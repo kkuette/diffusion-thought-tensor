@@ -238,7 +238,9 @@ training:
   # rti ait ouvert), le vecteur de type, et le format ChatML du bras préfixe.
   # Ce qui démarre à zéro : la tête de copie (clés rti_copy.* absentes du ckpt,
   # tolérées par le `want` du strict=False).
-  init_from: ${TB_ROOT}/checkpoints/v350_sft_recall_rti/final.pt
+  # (08-01) le run rti a été ARRÊTÉ au step 1000 (recentrage SPEC_MEMOIRE_V2) :
+  # final.pt n'existera jamais, le dernier ckpt réel est step_1000.pt.
+  init_from: ${TB_ROOT}/checkpoints/v350_sft_recall_rti/step_1000.pt
   lr: 0.0001
   muon_lr: 0.00024
   muon_ref_mem_dim: 64
