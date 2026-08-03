@@ -37,6 +37,73 @@ test this — before scale.
 
 ---
 
+## 2026-08-03 — Grille jouet phase 10 (35/38 cellules) : l'injection-comme-modalité CONDITIONNE (2AFC 1,000 vs 0,35/0,50), kv_append ≈ inject_entry, et le fast-weight perd l'A/B dans les deux régimes
+
+**Question (SPEC_MEMOIRE_V2 §2.4)** : quelle lecture porte le gist au 350M —
+fast-weight séquentiel (l'existant), pseudo-tokens à l'entrée (α), ou K/V
+appondus aux couches lectrices (β, « vue plate + attention ») ? Grille
+complète 3 reads × rot × tap × m sur la ferme (3000 steps, seed 0, d512/L6),
+tâche vie-règle : une consigne de registre écrite UNE fois en banque, jamais
+dans la fenêtre du tour conditionné ; mesure = 2AFC contrastif + Δnll aux
+marqueurs sous trois lectures (live / banque d'une autre vie / sans banque).
+
+```
+read          add rot tap      m | 2AFC live shuf none | mark live  shuf | dnll citation
+inject_entry      *   *        4+|  1.000    0.36 0.50 |  +2.6/+3.3 -1.0 | +1.0→+2.2 (croît en m)
+inject_entry      *   *        1 |  0.96-97  0.33 0.50 |  +2.3/+2.5 -0.8 | +0.9/+1.1
+kv_append         *   *        4+|  1.000    0.35 0.50 |  +2.6/+3.1 -1.0 | +1.0→+2.0 (croît en m)
+kv_append         *   *        1 |  0.96     0.33 0.49 |  +2.2/+2.6 -0.8 | +0.7/+0.8
+seq_fw (mult)     on  mid      1 |  0.957    0.36 0.48 |  +1.20     -0.4 | +0.24   [seule survivante]
+seq_fw (mult)     off postnorm 1 |  0.553    0.50 0.54 |  +0.05     +0.0 | -0.93   [divergée]
+seq_fw        +   *   *        1 |  0.94-97  0.35 0.48 |  +1.1/+1.3 -0.4 | +0.3/+0.4
+seq_fw        +   *   *        4 |  0.68-0.99 0.4 0.50 |  +0.3/+1.1 -0.2 | +0.1/+0.2
+seq_fw        +   *   *        8 |  0.60-0.71 0.5 0.50 |  +0.2/+0.4 -0.1 | +0.1
+```
+(* = les deux valeurs de l'axe, plage min/max ; 4 cellules m4/m8
+multiplicatives tuées en cours de divergence, sans json ; 3 cellules additives
+encore en run à l'écriture — z09/z11/z12, même famille que les plages ci-dessus.)
+
+**Verdicts** :
+1. **Barreau 1 de l'échelle §2.4 FRANCHI, massivement** : dans les bras
+   attention, live ≫ shuf ≈ none partout (2AFC 1,000 dès m=4 ; marqueurs
+   +2,5 à +3,3 nats). Le conditionnement passe PAR LA BANQUE. Bonus de
+   contrôle : shuf est SOUS le hasard (0,33-0,38) — la mauvaise banque
+   trompe activement, la lecture est bien contenu-spécifique.
+2. **kv_append ≈ inject_entry** à toutes les cellules : la « vue plate +
+   attention » (β) tient SANS coût de longueur de séquence — c'est la
+   lecture à porter au 350M pour le gist. Le sous-choix α reste requis pour
+   la SURFACE (le pointeur de copie a besoin des positions de préfixe).
+3. **Le fast-weight perd l'A/B dans les DEUX régimes** : multiplicatif il
+   diverge dès m>1 (gnorm pré-clip 1e4→7,4e14, seule rot-on/mid/m1 survit à
+   0,957) ; additif (`--fw-additive`, 9215ddb) il est stable mais son
+   conditionnement S'EFFONDRE avec m (0,97 → ~0,75 → ~0,65) là où
+   l'attention SATURE à 1,000 — le signe de m s'inverse entre les classes.
+   La rétrogradation du fast-weight (§2.4) est actée par les chiffres.
+4. **m est le cadran, pour l'attention seulement** : 2AFC sature dès m=4,
+   mais le Δnll citation continue de croître m4→m8 (+1,0→+2,2) — plus de
+   lignes = plus d'information retenue, exactement la prédiction de la
+   sonde de localisation (m têtes de pooling, pas mem_dim).
+5. **age-rot : aucun gain mesurable** (cellules on ≈ off partout, légère
+   érosion des marqueurs sous rotation) — le cadran s'économise ; la
+   provenance/récence reviendra par un autre canal si le 350M la réclame.
+6. **tap mid ≈ postnorm dans le jouet** — l'argument « prélever trop bas »
+   ne se voit pas à L6 ; le tap mi-stack reste un knob à trancher au 350M
+   (la sonde de localisation avait déjà montré que la dernière couche
+   contient encore la valeur linéairement).
+7. **La citation exacte reste à 0,000 dans TOUTE la grille** (Δnll positif
+   mais grade nul) : les lignes stockées ici sont des états tophid/midhid,
+   pas des embeddings natifs — c'est le verdict ph.7/ph.9 qui se répète et
+   la CONFIRMATION du principe de séparation : ce qui doit être DIT passe
+   par la surface (RTI natif + copy-head, prouvé au 350M par le run copy),
+   ce qui doit MODULER passe par le gist (attention-read, prouvé ici).
+
+Repro : `python -m deepseek_v4_mini.toy_read_lab
+deepseek_v4_mini/configs/toy_read_lab_d512_p10.yaml --manifest tsv` puis les
+36 commandes ; résultats agrégés depuis
+`/mnt/tb/checkpoints/toy_read_lab_p10/*/results.json`.
+
+---
+
 ## 2026-08-03 — Kill-tests 1 & 2 : la voie surface BAT la compaction textuelle au RAPPEL (0,343 vs 0,227) et le PERD en nll — la dissociation est le résultat
 
 **TL;DR.** 563 sondes, cinq bras appariés sur les mêmes vies, même checkpoint
