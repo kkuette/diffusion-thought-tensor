@@ -120,8 +120,20 @@ se juge en ph.11.
 4. **S1 TRANCHÉ (spec §3) : kvproj ADOPTÉ** — la règle était « ≈ suffit »
    (l'espace des rotations gratuit) ; on est au-dessus : la dédicace paie en
    plus d'héberger les plans. Le fallback dims-étendues est retiré. kvproj =
-   le read du 350M ; reste S2 (±bank-q, 12 cellules) qui se greffe dessus si
-   positif.
+   le read du 350M.
+6. **S2 (±bank-q) : MESURE INVALIDÉE — fuite non-causale (7/12 cellules
+   suffisent à trancher).** Profil : citation +1,446 ± 0,126 apparié (trop
+   beau) ET conditionnement EFFONDRÉ (mark 0,00 partout vs ~2,7 nu ; 2AFC
+   0,887→0,523 quand m monte). Mécanisme lu dans le code : le masque des
+   lanes laisse les colonnes contexte libres — les requêtes de lignes voient
+   TOUT le segment teacher-forcé (futur compris), et les K/V banque des
+   couches lectrices suivantes sont recalculés depuis ces lanes contaminées ⇒
+   toute position lit la réponse (≥2 couches lectrices ouvrent le canal). Le
+   modèle exploite la fuite au train et le vrai circuit de lecture s'atrophie
+   (d'autant plus que m élargit le canal) — cousin exact du bug boundary_step
+   du GRPO (07-27). Verdict de design : la contextualisation banque-lit-banque
+   appartient à l'étage WRITE (frontière de tour, passé seul) ; bank-q au read
+   est RETIRÉ du design.
 5. Lecture de code au passage (spec §2.5) : le q partagé porte R(t) non annulé
    côté banque ⇒ les clés banque se dockent dans la bande lente du RoPE
    backbone (HoPE retrouvé par l'implémentation) ; les plans de métadonnées

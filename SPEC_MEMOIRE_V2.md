@@ -207,7 +207,7 @@ Carré 2×2 : projections {partagées, dédiées} × softmax {unifié, séparé}
 kv_append (partagées/unifié), dual_heads (dédiées/séparé), kv_proj
 (dédiées/unifié) ± bank-q ; départagé sur Δnll citation + marges de marqueurs
 (le 2AFC sature). **Verdict (08-03 soir, ailes dual_heads ET kvproj
-COMPLÈTES — 36/48, reste bank-q = S2)** :
+COMPLÈTES ; bank-q = S2 INVALIDÉ pour fuite non-causale, voir §3-S2)** :
 
 - **dual_heads ≈ kv_append** : Δmark apparié +0,118 (sd 0,198, n=12), Δnll
   citation nul (−0,046). Les têtes dédiées à softmax séparé n'achètent RIEN à
@@ -261,8 +261,9 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
   opérateur CONSTANT R_loc(1), indépendant du contenu — exactement le geste
   d'un circuit de copie (induction heads sur RoPE, précédent backbone). C'est
   l'argument structurel contre l'index ADDITIF (S17) : l'additif donne des
-  signatures, jamais l'opérateur successeur. bank-q en hérite gratuitement
-  (q_b aussi roté ⇒ scores ligne-ligne pleinement relatifs R(j_a − j_b)).
+  signatures, jamais l'opérateur successeur. (Les scores ligne-ligne pleinement
+  relatifs R(j_a − j_b) restent disponibles pour la contextualisation au WRITE
+  — le bank-q au read est retiré, verdict S2 : fuite non-causale.)
 - **Jamais dans la bande RoPE du backbone** — les plans vivent dans les
   projections K dédiées de kvproj : la dédicace est un MOYEN d'hébergement, pas
   une fin (§2.4).
@@ -358,7 +359,7 @@ verdict. Rien d'autre n'est ouvert.
 | # | Décision | Test | État | Règle de décision |
 |---|---|---|---|---|
 | S1 | kvproj vs kv_append (coût de la dédicace K/V) | 12 cellules kvproj du carré | **TRANCHÉ 08-03 : kvproj ADOPTÉ** | mieux que la règle (« ≈ suffisait ») : Δcit +0,209 ± 0,115 apparié n=12 (t 6,3), Δmark +0,120 — la dédicace PAIE en plus d'héberger les rotations ; meilleure cellule du carré = kvproj rot-on m8 (cit 2,34) |
-| S2 | ±bank-q (contextualiser la requête par la banque) | 12 cellules bank-q du carré | **EN FILE** (ferme) | positif → se greffe sur kvproj ; nul → abandonné (indépendant de S1) |
+| S2 | ±bank-q (les lignes se contextualisent au read) | 12 cellules bank-q du carré | **MESURE INVALIDÉE 08-03** (7/12 suffisent) | fuite NON-CAUSALE : les lanes voient tout le segment teacher-forcé (futur compris) et le réinjectent aux K/V des couches suivantes — citation +1,45 (fuite, pas lecture) ET conditionnement effondré 2AFC 0,89→0,52 avec m (le vrai circuit s'atrophie, cousin du bug boundary_step GRPO 07-27). Verdict de design : la contextualisation banque-lit-banque appartient à l'étage WRITE (frontière de tour, passé seul) — bank-q au read est retiré ; re-test éventuel = lanes mises à jour aux frontières de tour uniquement |
 | S3 | rotation d'âge vs rien vs biais scalaire | ph.11 : contrôle θ_âge=0 (HoPE), NON NÉGOCIABLE | **HARNAIS LIVRÉ 08-03 (nuit)** : 8 cellules `zzr1xx` prêtes (agezero/agelog/ageraw/agebias × m4,m8), rotations sur K' APRÈS W_K' et plans dockés sur les paires quasi statiques du RoPE (garde `rot_drift_max`) | la rotation doit BATTRE θ_âge=0 sur la citation, sinon âge = biais scalaire de récence |
 | S4 | OOD d'âge (compression) | ph.11 : train ≤A_train, éval 10×/100× ; bras {brut, log-comprimé, brut+augmentation} | **HARNAIS LIVRÉ 08-03 (nuit)** : 2 cellules `zzr2xx` (raw+aug, log+aug ; les bras non augmentés SONT les cellules m4 de l'examen `age`, appariement exact), chaque run évalué aux échelles 1/10/100 | le bras qui tient l'OOD gagne ; prédiction = log |
 | S5 | tag provenance rotatif vs additif | ph.11 : A/B direct, mesurer r@1 ET taux de copie SÉPARÉMENT | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr3xx` sur l'env `prov` (deux faits du même slot ET attribut — clé oracle IDENTIQUE —, un par canal, ordre tiré au sort) ; r@1 = masse d'attention par groupe, grade = copie, mesurés SÉPARÉMENT | si la rotation casse le circuit de copie (câblé layout, ph.8) là où l'additif non → additif sur dims réservées |
