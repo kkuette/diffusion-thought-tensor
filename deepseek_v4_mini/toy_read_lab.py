@@ -252,6 +252,18 @@ WRITE_MODES = ("fact", "every")
 COND_ARMS = ("true", "shuffle", "none")
 # phase 10 — OÙ les lignes entrent dans le stack (cf. ToyCfg.read_path).
 READ_PATHS = ("entry", "kv", "dual", "kvproj")
+# ── phase 11 (spec §2.5) : les TROIS FAMILLES de métadonnées, sur les clés
+# banque PROJETÉES de kvproj. Chaque famille a son bras de contrôle (`none`)
+# et son steelman non-rotatif (biais scalaire pour l'âge, vecteur additif pour
+# le tag et l'index local) — c'est ce qui rend S3/S5/S17 adjudicables.
+BANK_ROTS = ("none", "age-log", "age-raw", "age-bias")
+TAG_MODES = ("none", "rot", "add")
+LOC_MODES = ("none", "rot", "add")
+# environnements de la phase 11 (cf. ToyCfg.p11_env).
+P11_ENVS = ("rule", "prov", "span")
+# canaux de PROVENANCE de l'env `prov` : qui a dit la ligne. Ordre FIGÉ — il
+# indexe les plans de rotation (un plan 0/π par canal) et les vecteurs additifs.
+CHANNELS = ("user", "self")
 # phase 10 — les QUATRE chemins de lecture exposés par `--read`, traduits en
 # (variant, code|None, read_path). C'est la table qui rend la grille de la spec
 # §2.4 lançable par un seul flag ; les axes `--tap`, `--age-rot` et `--m` sont
@@ -591,6 +603,96 @@ class ToyCfg:
                               # quelque chose à coder. 0 = un seul groupe (tous
                               # les âges valent 0 : `age_rope` devient un no-op
                               # mesurable, c'est le contrôle de la sonde).
+    # ══ PHASE 11 — MÉTADONNÉES PAR ROTATION SUR LES CLÉS BANQUE PROJETÉES ══
+    # (spec §2.5 ; registre §3 S3/S4/S5/S17). TOUT ce bloc est OFF par défaut
+    # et le forward est alors bit-à-bit celui de la phase 10.
+    #
+    # OÙ. Les trois familles s'appliquent à K' = W_K'·g — les clés DÉDIÉES de
+    # `kvproj`, APRÈS la projection. C'est la différence de fond avec
+    # `age_rope` (ph.10), qui rotait la LIGNE avant l'injection : une rotation
+    # posée avant W_k ne survit pas à la projection (elle se fait mélanger par
+    # une matrice apprise qui n'a aucune raison de commuter avec elle). Le
+    # ph.10 `age_rope` est CONSERVÉ tel quel — c'est le bras historique de la
+    # grille §2.4, il ne se réécrit pas.
+    #
+    # SUR QUELLES DIMS. Contrainte côté requête (§2.5) : kvproj partage le q du
+    # backbone, RoPE compris, donc le score banque est (R(t)·W_Q x)ᵀ K'. Le
+    # produit se fait paire à paire ⇒ les plans de métadonnées doivent viser
+    # les paires QUASI STATIQUES du RoPE de tête (ω ≈ 0), sinon le code se
+    # mélange à la position dans la fenêtre. `slow_rope_planes` fait le choix
+    # EXPLICITEMENT (tri par fréquence) et `rot_drift_max` le refuse s'il ne
+    # tient pas. Les trois familles occupent des plans DISJOINTS.
+    bank_rot: str = "none"    # famille ÂGE (S3/S4) :
+                              #   none     — AUCUNE rotation d'âge. C'est le
+                              #              bras HoPE θ_âge=0, la baseline
+                              #              NON NÉGOCIABLE à battre.
+                              #   age-log  — φ(a) = A_ref·log(1+a)/log(1+A_ref)
+                              #              puis rot(ω_p·φ(a)) sur age_planes
+                              #              plans, ω APPRIS (init géométrique
+                              #              entrelacé, sans bande haute).
+                              #   age-raw  — idem mais φ(a) = a (le bras qui
+                              #              doit s'effondrer en OOD, S4).
+                              #   age-bias — AUCUNE rotation : un biais
+                              #              scalaire de récence b(a) = w·a
+                              #              (UN paramètre) sur le logit des
+                              #              colonnes banque. Le fallback de la
+                              #              règle S3 si la rotation perd.
+    age_planes: int = 4       # plans de la famille âge (jouet : 4 ; le design
+                              # 350M en prévoit 8, cf. veille). Échelles
+                              # GÉOMÉTRIQUES entrelacées, jamais de bande
+                              # haute fréquence.
+    age_ref: int = 8          # A_cible de la compression log — l'horizon
+                              # « normal » en writes (= max_mem au jouet).
+    age_aug: bool = False     # S4 : à l'ENTRAÎNEMENT, l'âge de chaque lot est
+                              # multiplié par un facteur log-uniforme dans
+                              # [1, age_aug_max]. L'ORDRE des âges est
+                              # préservé (c'est lui qui porte l'information),
+                              # seule l'ÉCHELLE varie ⇒ le bras `raw` peut
+                              # apprendre l'invariance qu'il n'a pas par
+                              # construction. C'est le steelman du brut.
+    age_aug_max: float = 8.0  # borne haute de l'augmentation. STRICTEMENT
+                              # INFÉRIEURE aux échelles d'éval (10, 100) : une
+                              # augmentation qui couvrirait l'éval ne
+                              # mesurerait plus l'OOD.
+    age_eval_scales: str = "1,10,100"   # S4 : l'éval contrastive est répétée
+                              # avec les âges MULTIPLIÉS par chaque échelle
+                              # (vies longues synthétiques : le fait ancien est
+                              # toujours en banque, le compteur de writes a
+                              # grandi). L'échelle 1 est le régime vu au train.
+    tag_mode: str = "none"    # famille PROVENANCE (S5) : `none` (contrôle) |
+                              # `rot` (UN PLAN 0/π PAR CANAL — jamais n angles
+                              # sur un plan, cf. veille : la métrique cyclique
+                              # inventerait des similarités entre canaux) |
+                              # `add` (STEELMAN ADDITIF : un vecteur appris par
+                              # canal AJOUTÉ sur les MÊMES dims réservées, donc
+                              # à budget de dims identique).
+    n_channels: int = 2       # canaux de provenance (user, self). Un plan
+                              # 0/π par canal ⇒ n_channels plans réservés.
+    loc_mode: str = "none"    # famille INDEX LOCAL intra-span (S17) : `none` |
+                              # `rot` (R_loc(j) sur loc_planes plans, j =
+                              # index de la ligne DANS son write — borné par
+                              # construction, donc aucun risque d'OOD) |
+                              # `add` (embedding de position locale appris,
+                              # additif, sur les mêmes dims réservées).
+    loc_planes: int = 2       # plans de la famille index local.
+    rot_drift_max: float = 0.5   # GARDE-FOU DE L'APPARIEMENT (radians) : dérive
+                              # maximale tolérée de R(t) du RoPE backbone sur
+                              # les plans choisis, sur toute la fenêtre
+                              # (ω_max·(max_seq_len−1)). Au-delà, la
+                              # construction ÉCHOUE : demander trop de plans
+                              # fait déborder les métadonnées dans la bande
+                              # rapide, où le code d'âge se mélangerait à la
+                              # position du lecteur.
+    p11_env: str = "rule"     # environnement de la phase 11 :
+                              #   rule — la vie-règle de la ph.10 (S3/S4 :
+                              #          conditionnement contrastif, appariable
+                              #          aux 12 cellules kvproj du carré)
+                              #   prov — vies à LOCUTEUR (S5) : deux faits du
+                              #          MÊME attribut, l'un dit par l'user
+                              #          l'autre par le modèle ; la question
+                              #          cible le locuteur
+                              #   span — valeurs multi-tokens de longueur
+                              #          GRADUÉE 1..4 (S17), citation ORDONNÉE
     # ── axe RÉGIME DE WRITE (`--write`) ─────────────────────────────────────
     write_mode: str = "fact"  # `fact` (DÉFAUT) : l'oracle n'écrit qu'après les
                               # segs PORTEURS — il sait lesquels portent un
@@ -747,6 +849,61 @@ class ToyCfg:
                 f"cond_arm {self.cond_arm!r} pilote ce que l'INJECTION dépose "
                 f"à l'entraînement : il exige --cond et une variante "
                 f"{INJECT_VARIANTS}")
+        # ── phase 11 : les trois familles de rotations (spec §2.5) ─────────
+        assert self.bank_rot in BANK_ROTS, (
+            f"bank_rot inconnu {self.bank_rot!r} (∈ {BANK_ROTS})")
+        assert self.tag_mode in TAG_MODES, (
+            f"tag_mode inconnu {self.tag_mode!r} (∈ {TAG_MODES})")
+        assert self.loc_mode in LOC_MODES, (
+            f"loc_mode inconnu {self.loc_mode!r} (∈ {LOC_MODES})")
+        assert self.p11_env in P11_ENVS, (
+            f"p11_env inconnu {self.p11_env!r} (∈ {P11_ENVS})")
+        if self.uses_p11_meta:
+            # Les métadonnées vivent dans les projections K DÉDIÉES (§2.5 :
+            # « jamais dans la bande RoPE du backbone ») et sur des lignes
+            # INJECTÉES (c'est là que le tenseur de métadonnées existe).
+            assert self.read_path == "kvproj", (
+                f"les rotations de métadonnées (bank_rot/tag_mode/loc_mode) "
+                f"s'appliquent à K' = W_K'·g, les clés DÉDIÉES de `kvproj` : "
+                f"elles exigent --read kv_proj (reçu read_path="
+                f"{self.read_path!r}) — ailleurs il n'y a pas de projection "
+                f"dédiée où les héberger, et une rotation posée avant W_k ne "
+                f"survit pas à la projection")
+            assert self.variant in INJECT_VARIANTS, (
+                f"les métadonnées de la phase 11 voyagent avec les lignes "
+                f"INJECTÉES : variante {INJECT_VARIANTS} exigée (reçu "
+                f"{self.variant})")
+        assert self.age_planes >= 1 and self.loc_planes >= 1
+        assert self.age_ref >= 1, self.age_ref
+        assert self.age_aug_max > 1.0, self.age_aug_max
+        assert self.n_channels >= 2, self.n_channels
+        assert self.rot_drift_max > 0.0, self.rot_drift_max
+        if self.age_aug:
+            assert self.bank_rot in ("age-log", "age-raw"), (
+                f"age_aug tire l'ÉCHELLE des âges au train : il n'a de sens "
+                f"que pour une famille qui ROTE par l'âge (reçu bank_rot="
+                f"{self.bank_rot!r}) — sur `none`/`age-bias` il serait un "
+                f"no-op silencieux (le biais est linéaire en a, donc invariant "
+                f"d'échelle à un facteur près appris)")
+        if self.tag_mode != "none":
+            assert self.p11_env == "prov", (
+                f"le tag de PROVENANCE code un canal user/self : hors de l'env "
+                f"`prov` toutes les lignes ont le canal 0 et le tag serait un "
+                f"no-op silencieux (reçu p11_env={self.p11_env!r})")
+        if self.loc_mode != "none":
+            assert self.top_k >= 2, (
+                f"l'index LOCAL distingue les lignes DANS un write : à "
+                f"top_k={self.top_k} il n'y a qu'une ligne de contenu par "
+                f"groupe, le code serait un no-op silencieux")
+        if self.p11_env != "rule":
+            assert self.variant in INJECT_VARIANTS and \
+                self.code in GROUP_CODES, (
+                f"les envs `prov`/`span` sont des envs de CITATION à "
+                f"injection de tous les résidents : variante "
+                f"{INJECT_VARIANTS} + code {GROUP_CODES} exigés")
+            assert not self.cond, (
+                "`prov`/`span` remplacent la vie-règle : --cond n'a pas de "
+                "sens avec eux (deux tâches, deux évals, un seul stream)")
         # ── write_mode ─────────────────────────────────────────────────────
         assert self.write_mode in WRITE_MODES, (
             f"write inconnu {self.write_mode!r} (∈ {WRITE_MODES})")
@@ -798,6 +955,38 @@ class ToyCfg:
     def pools_segment(self) -> bool:
         """Le code poole-t-il le SEG ENTIER (phase 3) au lieu du span valeur ?"""
         return self.code in SEG_CODES
+
+    # ── phase 11 : les familles actives, et les plans qu'elles réservent ────
+
+    @property
+    def uses_p11_meta(self) -> bool:
+        """Une famille de métadonnées (§2.5) est-elle active ?
+
+        `age-bias` en fait partie : il ne rote rien, mais il consomme le MÊME
+        tenseur de métadonnées (l'âge par ligne) et le même chemin de code.
+        """
+        return (self.bank_rot != "none" or self.tag_mode != "none"
+                or self.loc_mode != "none")
+
+    @property
+    def uses_bank_rot(self) -> bool:
+        """Une famille tourne-t-elle VRAIMENT des plans de K' ?"""
+        return (self.bank_rot in ("age-log", "age-raw")
+                or self.tag_mode != "none" or self.loc_mode != "none")
+
+    @property
+    def rot_plane_budget(self) -> tuple:
+        """(n_âge, n_canal, n_local) — plans RÉSERVÉS par famille, DISJOINTS.
+
+        Le budget de dims est le MÊME pour un bras rotatif et son steelman
+        additif (`add` réserve les mêmes plans qu'il n'aurait rotés) : sans
+        ça l'A/B mesurerait la taille de la bande réservée, pas la forme du
+        code.
+        """
+        na = self.age_planes if self.bank_rot in ("age-log", "age-raw") else 0
+        nc = self.n_channels if self.tag_mode != "none" else 0
+        nl = self.loc_planes if self.loc_mode != "none" else 0
+        return na, nc, nl
 
     @property
     def uses_fw(self) -> bool:
@@ -935,6 +1124,10 @@ class CausalSelfAttn(nn.Module):
         # poids des chemins existants ne bougent pas d'un bit.
         self.kvproj = cfg.read_path == "kvproj"
         self.bank_q = self.kvproj and cfg.bank_q
+        # SONDE d'attention banque (phase 11, S5) : OFF par défaut et sans
+        # aucun effet sur le forward — cf. `bank_attn_probe`.
+        self.want_bank_attn = False
+        self.last_bank_attn = None
         if self.kvproj:
             self.bk = nn.Linear(d, d, bias=False)
             self.bv = nn.Linear(d, d, bias=False)
@@ -947,6 +1140,11 @@ class CausalSelfAttn(nn.Module):
             # results.json) — positive = le modèle a dû REMONTER la banque
             # contre le contexte, négative = il a dû la faire taire.
             self.bank_bias = nn.Parameter(torch.zeros(h))
+            # ── PHASE 11 : les métadonnées de ligne, sur K' (spec §2.5) ────
+            # Construit APRÈS bank_bias et AVANT bq/bo : les configs de la
+            # ph.10 (rot=none) ne créent rien et ne déplacent aucun tirage.
+            self.rot = BankRot(cfg, h, self.dh, self.theta) \
+                if cfg.uses_p11_meta else None
             if self.bank_q:
                 # Les lignes ÉMETTENT aussi : elles attendent sur [banque ∪
                 # contexte] et leur état est porté de couche lectrice en
@@ -959,7 +1157,7 @@ class CausalSelfAttn(nn.Module):
                 self.nb = RMSNorm(d)
 
     def forward(self, x, pos=None, mem=None, mem_mask=None,
-                want_bank_out=False):
+                want_bank_out=False, mem_meta=None):
         """`pos` [T] : index RoPE EXPLICITES. None = 0..T−1 (chemin par défaut,
         bit-à-bit inchangé). La variante r4 s'en sert pour laisser un TROU de
         position entre le préfixe injecté et le tour réel.
@@ -1003,6 +1201,13 @@ class CausalSelfAttn(nn.Module):
             hb = self.nb(mem) if self.bank_q else mem
             km = self.bk(hb).view(B, S, self.h, self.dh).transpose(1, 2)
             vm = self.bv(hb).view(B, S, self.h, self.dh).transpose(1, 2)
+            # ── PHASE 11 : le codage des métadonnées frappe ICI, sur K' —
+            # APRÈS W_K' (une rotation posée avant ne survit pas à la
+            # projection) et JAMAIS sur V' (le contenu doit sortir intact).
+            rbias = None
+            if self.rot is not None and mem_meta is not None:
+                km = self.rot(km, mem_meta)
+                rbias = self.rot.logit_bias(mem_meta, q.dtype)
             k = torch.cat([km, k], dim=2)
             v = torch.cat([vm, v], dim=2)
             # masque FLOTTANT : il porte à la fois l'interdiction (−inf) et le
@@ -1010,6 +1215,11 @@ class CausalSelfAttn(nn.Module):
             fm = torch.zeros(B, self.h, T, S + T, device=x.device,
                              dtype=q.dtype)
             fm[..., :S] += self.bank_bias.to(q.dtype)[None, :, None, None]
+            if rbias is not None:
+                # `age-bias` : le BIAIS SCALAIRE DE RÉCENCE, b(a) = w·a, sur
+                # les colonnes banque. Un paramètre, aucune rotation — c'est le
+                # fallback de la règle S3.
+                fm[..., :S] += rbias[:, None, None, :]
             neg = torch.finfo(q.dtype).min
             causal = torch.ones(T, T, dtype=torch.bool,
                                 device=x.device).tril()
@@ -1019,6 +1229,17 @@ class CausalSelfAttn(nn.Module):
                 fm[..., :S] = torch.where(
                     mem_mask[:, None, None, :].to(torch.bool),
                     fm[..., :S], fm.new_full((), neg))
+            if self.want_bank_attn:
+                # ── SONDE (S5) : la MASSE D'ATTENTION par ligne de banque ──
+                # `scaled_dot_product_attention` ne rend pas ses poids. On
+                # recalcule le softmax EXPLICITEMENT — même logits, même
+                # masque flottant — et on ne garde que les S colonnes de
+                # banque. Ce chemin ne touche PAS `y` : la sortie du modèle
+                # reste celle du SDPA, la sonde n'est qu'un observateur.
+                sc = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(
+                    self.dh) + fm.float()
+                self.last_bank_attn = torch.softmax(
+                    sc, -1)[..., :S].detach()          # [B, h, T, S]
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=fm)
             y = self.o(y.transpose(1, 2).reshape(B, T, d))
             mem_out = None
@@ -1030,6 +1251,8 @@ class CausalSelfAttn(nn.Module):
                 fb = torch.zeros(B, self.h, S, S + T, device=x.device,
                                  dtype=q.dtype)
                 fb[..., :S] += self.bank_bias.to(q.dtype)[None, :, None, None]
+                if rbias is not None:
+                    fb[..., :S] += rbias[:, None, None, :]
                 if mem_mask is not None:
                     fb[..., :S] = torch.where(
                         mem_mask[:, None, None, :].to(torch.bool),
@@ -1121,6 +1344,198 @@ class BankHeads(nn.Module):
         # NI causal, NI RoPE : la banque est un ensemble (cf. docstring).
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
         return self.o(y.transpose(1, 2).reshape(B, T, self.hb * self.dhb))
+
+
+def slow_rope_planes(d_head: int, theta: float, n_planes: int, T: int
+                     ) -> tuple:
+    """(index des n_planes paires les PLUS LENTES du RoPE de tête, dérive).
+
+    L'APPARIEMENT DE LA SPEC §2.5, rendu explicite. Le score banque de `kvproj`
+    vaut (R(t)·W_Q x_t)ᵀ K' : la requête porte le RoPE du backbone, la clé
+    banque ne l'annule pas. Le produit se faisant PAIRE À PAIRE, une
+    métadonnée posée sur la paire i se lit à travers cos(ω_i·t − φ_méta) — le
+    code se mélange à la position du lecteur dans la fenêtre, exactement ce que
+    la spec interdit. La parade est de DOCKER les plans de métadonnées sur les
+    paires quasi statiques (ω ≈ 0), où R(t) ne bouge pratiquement pas sur toute
+    la fenêtre.
+
+    Les fréquences RoPE ω_i = θ^(−2i/d_head) sont décroissantes en i : les
+    paires lentes sont les DERNIÈRES. On ne s'appuie pas sur cette monotonie —
+    on TRIE, pour que le choix reste correct si la forme des fréquences change.
+
+    `dérive` = ω_max·(T−1) radians, la variation totale de l'angle de requête
+    sur la plus rapide des paires retenues, sur toute la fenêtre. C'est le
+    chiffre que `rot_drift_max` borne et que le self-test vérifie.
+    """
+    inv = 1.0 / (theta ** (torch.arange(0, d_head, 2).float() / d_head))
+    assert n_planes <= inv.numel(), (
+        f"{n_planes} plans demandés pour {inv.numel()} paires de dims de tête")
+    order = torch.argsort(inv)                     # du plus LENT au plus rapide
+    idx = order[:n_planes].sort().values           # ordre de dim, stable
+    drift = float(inv[idx].max()) * max(T - 1, 0)
+    return idx, drift
+
+
+class BankRot(nn.Module):
+    """PHASE 11 — les métadonnées de ligne, sur les CLÉS BANQUE PROJETÉES.
+
+    Applique à K' = W_K'·g (dans `CausalSelfAttn`, chemin `kvproj`) les trois
+    familles de la spec §2.5, sur des plans DISJOINTS et QUASI STATIQUES :
+
+      ÂGE (S3/S4)          rot(ω_p·φ(a)) sur `age_planes` plans, ω_p APPRIS
+                           (init géométrique entrelacé, sans bande haute —
+                           veille LieRE/VideoRoPE). φ = log-comprimé
+                           (`age-log`) ou brut (`age-raw`).
+      PROVENANCE (S5)      UN PLAN 0/π PAR CANAL. Jamais n angles sur un seul
+                           plan : à n=4, tag0·tag2 = −1 et tag0·tag1 = 0 — une
+                           métrique cyclique parasite entre canaux qui n'ont
+                           aucun ordre. `add` remplace la rotation par un
+                           vecteur appris sur les MÊMES dims (steelman).
+      INDEX LOCAL (S17)    R_loc(j) sur `loc_planes` plans, fréquences DFT
+                           fixes (l'index est borné par top_k+1 ⇒ aucun OOD
+                           possible). Argument structurel : entre deux lignes
+                           d'un même span, « avancer d'un token » devient
+                           l'opérateur CONSTANT R_loc(1) — le geste du circuit
+                           de copie. `add` ne donne que des signatures.
+
+    CE QUI N'EST PAS ROTÉ, ET POURQUOI : V' (le contenu doit sortir intact — la
+    citation copie la valeur, pas une valeur tournée) et les requêtes de
+    `bank_q` (S2 est un axe séparé ; le combiner ici mélangerait deux tests).
+
+    INIT : rotations à angle non nul dès le pas 0 (une rotation N'EST PAS une
+    porte — elle préserve la norme et le gradient des fréquences est non nul),
+    vecteurs additifs à ZÉRO (le bras `add` démarre donc exactement sur le
+    kvproj nu, comme le `rot` démarre sur des plans dont le code est déjà
+    présent : les deux sont comparables et aucun n'a de gradient interne mort,
+    cf. le piège de la porte scalaire).
+    """
+
+    def __init__(self, cfg: ToyCfg, n_heads: int, d_head: int, theta: float):
+        super().__init__()
+        na, nc, nl = cfg.rot_plane_budget
+        self.na, self.nc, self.nl = na, nc, nl
+        self.mode = cfg.bank_rot
+        self.tag_mode, self.loc_mode = cfg.tag_mode, cfg.loc_mode
+        self.age_ref = float(cfg.age_ref)
+        self.n_loc = int(cfg.group_rows)          # index locaux possibles
+        total = na + nc + nl
+        # `age-bias` seul ne réserve AUCUN plan (il ne tourne rien) : pas
+        # d'appariement à vérifier, et la garde ne doit pas s'inventer une
+        # dérive sur un ensemble vide.
+        idx = (slow_rope_planes(d_head, theta, total, cfg.max_seq_len)[0]
+               if total else torch.zeros(0, dtype=torch.long))
+        drift = (float(slow_rope_planes(d_head, theta, total,
+                                        cfg.max_seq_len)[1]) if total else 0.0)
+        assert drift <= cfg.rot_drift_max, (
+            f"APPARIEMENT REFUSÉ (§2.5) : {total} plans de métadonnées "
+            f"débordent de la bande quasi statique — la requête tourne de "
+            f"{drift:.3f} rad sur la fenêtre (max toléré "
+            f"{cfg.rot_drift_max}). Le code de métadonnée se mélangerait à la "
+            f"position du lecteur. Réduire age_planes/loc_planes, ou assumer "
+            f"le fallback « dé-roter q pour les colonnes banque ».")
+        self.drift = drift
+        # ATTRIBUTION : l'âge prend les plans LES PLUS LENTS (c'est lui qui a
+        # la plus grande dynamique et le plus à perdre à une contamination),
+        # puis le canal, puis l'index local (borné et à faible dynamique).
+        self.register_buffer("age_idx", idx[:na])
+        self.register_buffer("tag_idx", idx[na:na + nc])
+        self.register_buffer("loc_idx", idx[na + nc:])
+        self.n_pairs = d_head // 2
+        if na:
+            # ÉCHELLES GÉOMÉTRIQUES ENTRELACÉES, SANS BANDE HAUTE : λ_p de
+            # ~4 tours à ~4·A_ref (veille). ω = 2π/λ, appris en LOG (donc
+            # toujours > 0 et paramétré multiplicativement).
+            lam = 4.0 * (cfg.age_ref ** (torch.arange(na).float()
+                                         / max(na - 1, 1)))
+            self.age_log_omega = nn.Parameter(
+                torch.log(2.0 * math.pi / lam))
+        if cfg.bank_rot == "age-bias":
+            # LE FALLBACK DE LA RÈGLE S3 : b(a) = w·a sur le logit banque, UN
+            # paramètre. Init 0 ⇒ bit-à-bit le kvproj nu au pas 0, et son
+            # gradient est non nul dès le premier backward (c'est un terme
+            # ADDITIF au logit, pas une porte multiplicative).
+            self.age_bias_w = nn.Parameter(torch.zeros(1))
+        if nc and cfg.tag_mode == "add":
+            # STEELMAN ADDITIF : un vecteur appris PAR CANAL, sur les 2·nc dims
+            # exactement réservées par le bras rotatif. Par TÊTE (le rotatif
+            # agit lui aussi sur chaque tête).
+            self.tag_add = nn.Parameter(torch.zeros(n_heads, cfg.n_channels,
+                                                    2 * nc))
+        if nl and cfg.loc_mode == "add":
+            self.loc_add = nn.Parameter(torch.zeros(n_heads, self.n_loc,
+                                                    2 * nl))
+
+    def extra_repr(self) -> str:
+        return (f"age={self.mode}({self.na}p) tag={self.tag_mode}({self.nc}p) "
+                f"loc={self.loc_mode}({self.nl}p) drift={self.drift:.4f}rad")
+
+    def phi_age(self, a: torch.Tensor) -> torch.Tensor:
+        """Compression de l'âge AVANT rotation (§2.5).
+
+        `age-log` : φ(a) = A_ref·log(1+a)/log(1+A_ref) — φ(A_ref) = A_ref, donc
+        les deux bras coïncident dans la plage vue au train et ne divergent
+        QU'EN OOD. C'est ce qui rend S4 lisible : à échelle 1 les deux bras
+        sont dans le même régime, à ×100 seul le log tient.
+        """
+        if self.mode == "age-log":
+            return (self.age_ref * torch.log1p(a)
+                    / math.log1p(self.age_ref))
+        return a
+
+    def forward(self, km: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        """km [B, H, S, dh] (clés banque projetées) × meta [B, S, 3] long
+        (âge en writes, canal, index local dans le write) → clés codées."""
+        B, H, S, dh = km.shape
+        cos = km.new_ones(B, S, self.n_pairs)
+        sin = km.new_zeros(B, S, self.n_pairs)
+        ang = km.new_zeros(B, S, self.n_pairs)
+        touched = False
+        if self.na:
+            phi = self.phi_age(meta[..., 0].to(km.dtype))          # [B,S]
+            ang[..., self.age_idx] = (phi[..., None]
+                                      * torch.exp(self.age_log_omega)
+                                      .to(km.dtype)[None, None])
+            touched = True
+        if self.nc and self.tag_mode == "rot":
+            # UN PLAN PAR CANAL, ANGLE 0 OU π. R(π)² = I ⇒ le code n'est pas
+            # orienté (il ne distingue pas « self lit user » de l'inverse) —
+            # assumé : le canal est un attribut de la ligne, pas une relation.
+            ch = meta[..., 1].long()                               # [B,S]
+            for c in range(self.nc):
+                ang[..., self.tag_idx[c]] = math.pi * (ch == c).to(km.dtype)
+            touched = True
+        if self.nl and self.loc_mode == "rot":
+            # FRÉQUENCES DFT sur l'index local : θ_p = 2π(p+1)/n_loc. Le
+            # successeur est alors l'opérateur CONSTANT R_loc(1) sur chaque
+            # plan, indépendamment du contenu — l'argument de la spec.
+            j = meta[..., 2].to(km.dtype)
+            w = (2.0 * math.pi
+                 * (torch.arange(self.nl, device=km.device).to(km.dtype) + 1.0)
+                 / float(self.n_loc))
+            ang[..., self.loc_idx] = j[..., None] * w[None, None]
+            touched = True
+        if touched:
+            cos, sin = torch.cos(ang), torch.sin(ang)
+            # les plans NON touchés ont ang = 0 ⇒ cos 1 / sin 0 = identité
+            km = rot_pairs(km, cos[:, None], sin[:, None])
+        if self.nc and self.tag_mode == "add":
+            dims = torch.stack([2 * self.tag_idx, 2 * self.tag_idx + 1],
+                               -1).reshape(-1)                     # [2·nc]
+            v = self.tag_add[:, meta[..., 1].long()]      # [H,B,S,2nc]
+            km = km.index_add(-1, dims, v.permute(1, 0, 2, 3).to(km.dtype))
+        if self.nl and self.loc_mode == "add":
+            dims = torch.stack([2 * self.loc_idx, 2 * self.loc_idx + 1],
+                               -1).reshape(-1)
+            v = self.loc_add[:, meta[..., 2].long().clamp(0, self.n_loc - 1)]
+            km = km.index_add(-1, dims, v.permute(1, 0, 2, 3).to(km.dtype))
+        return km
+
+    def logit_bias(self, meta: torch.Tensor, dtype) -> torch.Tensor | None:
+        """b(a) = w·a sur les colonnes banque (`age-bias`) — [B, S] ou None."""
+        if self.mode != "age-bias":
+            return None
+        return (self.age_bias_w.to(dtype)
+                * meta[..., 0].to(dtype))
 
 
 class SwiGLU(nn.Module):
@@ -1564,7 +1979,8 @@ class ToyBlock(nn.Module):
                            if self.read_bank and cfg.read_path == "dual"
                            else None)
 
-    def forward(self, x, bank, bank_mask, pos=None, mem=None, mem_mask=None):
+    def forward(self, x, bank, bank_mask, pos=None, mem=None, mem_mask=None,
+                mem_meta=None):
         # `mem` n'entre QUE dans les couches LECTRICES (`read_layers`) : les
         # lectures β et « têtes dédiées » partagent exactement le même budget
         # de couches que les reads appris de r0/r1/r3, sinon la comparaison
@@ -1575,10 +1991,12 @@ class ToyBlock(nn.Module):
             # LES LANES BANQUE SONT PORTÉES : le bloc rend l'état mis à jour,
             # ToyReadLM le repasse à la couche lectrice suivante et le JETTE
             # après la dernière (cf. son forward).
-            a, mem = self.attn(h1, pos, mem, mem_mask, want_bank_out=True)
+            a, mem = self.attn(h1, pos, mem, mem_mask, want_bank_out=True,
+                               mem_meta=mem_meta)
         else:
             a = self.attn(h1, pos, mem if use_mem else None,
-                          mem_mask if use_mem else None)
+                          mem_mask if use_mem else None,
+                          mem_meta=mem_meta if use_mem else None)
         if self.bank_heads is not None and mem is not None:
             # FUSION AVANT LE FFN : les deux groupes de têtes lisent le MÊME
             # état pré-normé et leurs sorties se somment dans le résiduel.
@@ -2129,7 +2547,8 @@ class ToyReadLM(nn.Module):
 
     # ── forward ─────────────────────────────────────────────────────────────
     def forward(self, ids, bank=None, bank_mask=None, inject=None,
-                return_hidden=False, inject_age=None, bank_age=None):
+                return_hidden=False, inject_age=None, bank_age=None,
+                inject_chan=None):
         """`inject` [B, k] (UN groupe, r4) ou [B, G, k] (G groupes, r5) : les
         tokens des groupes toprows injectés en PRÉFIXE de pseudo-tokens.
 
@@ -2154,6 +2573,7 @@ class ToyReadLM(nn.Module):
         pos = None
         npre = 0
         mem = None
+        mem_meta = None
         if self.cfg.age_rope and bank_age is not None and bank is not None \
                 and bank.size(1) > 0:
             # PHASE 10, pendant BANQUE de la rotation d'âge : la matrice plate
@@ -2200,6 +2620,24 @@ class ToyReadLM(nn.Module):
                 # aucune conséquence géométrique — ce qui porte la provenance,
                 # c'est la rotation d'âge, et rien d'autre.
                 mem = pre.reshape(B, G * k, -1)
+                if self.cfg.uses_p11_meta:
+                    # ── PHASE 11 : LE TENSEUR DE MÉTADONNÉES [B, G·k, 3] ───
+                    # (âge en writes, canal, index local dans le write). Les
+                    # trois sont des propriétés DE LA LIGNE — jamais de la
+                    # position du lecteur (principe §2.5). L'âge et le canal
+                    # sont des propriétés du SLOT (partagées par les lignes du
+                    # groupe), l'index local est le rang de la ligne DANS son
+                    # groupe, donc il se lit dans le layout lui-même.
+                    dev = ids.device
+                    ag = (inject_age.to(dev).long() if inject_age is not None
+                          else torch.zeros(B, G, dtype=torch.long, device=dev))
+                    ch = (inject_chan.to(dev).long() if inject_chan is not None
+                          else torch.zeros(B, G, dtype=torch.long, device=dev))
+                    lo = torch.arange(k, device=dev)[None, None].expand(B, G, k)
+                    mem_meta = torch.stack(
+                        [ag[..., None].expand(B, G, k),
+                         ch[..., None].expand(B, G, k), lo], -1
+                    ).reshape(B, G * k, 3)
             else:
                 sep = self.embed(torch.full((B, G, 1),
                                             int(self.cfg.inject_sep_id),
@@ -2214,7 +2652,7 @@ class ToyReadLM(nn.Module):
                                  torch.arange(T, device=ids.device) + npre + 1])
         carry = self.cfg.read_path == "kvproj" and self.cfg.bank_q
         for blk in self.blocks:
-            out = blk(x, bank, bank_mask, pos, mem)
+            out = blk(x, bank, bank_mask, pos, mem, mem_meta=mem_meta)
             # `bank_q` : l'état des lanes banque VIT le temps du stack et est
             # jeté à la sortie (rien ne le réécrit dans la banque — l'invariant
             # « seule modification de la banque = l'append d'un write » tient).
@@ -2246,19 +2684,60 @@ class ToyReadLM(nn.Module):
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
     @torch.no_grad()
     def greedy(self, prefix, bank, bank_mask, max_new: int, stop_id: int,
-               inject=None, inject_age=None, bank_age=None):
+               inject=None, inject_age=None, bank_age=None, inject_chan=None):
         ids = prefix
         out = []
         for _ in range(max_new):
             lg = self.forward(ids[:, -self.cfg.max_seq_len:], bank, bank_mask,
                               inject=inject, inject_age=inject_age,
-                              bank_age=bank_age)
+                              bank_age=bank_age, inject_chan=inject_chan)
             nxt = int(lg[0, -1].argmax())
             if nxt == stop_id:
                 break
             out.append(nxt)
             ids = torch.cat([ids, torch.tensor([[nxt]], device=ids.device)], 1)
         return out
+
+
+class bank_attn_probe:
+    """Contexte : allume la sonde de masse d'attention banque (phase 11, S5).
+
+    Elle ne change RIEN au forward (cf. `CausalSelfAttn.forward`) — elle
+    recalcule le softmax en clair pour l'observer. À la sortie du contexte,
+    tout est éteint et les tampons libérés.
+
+    Pourquoi une sonde plutôt qu'un score de retriever : dans `kvproj` il n'y a
+    PAS de module de sélection — la sélection EST l'attention. Mesurer un
+    « r@1 » sur autre chose que ses poids mesurerait un autre système.
+    """
+
+    def __init__(self, model):
+        self.mods = [b.attn for b in model.blocks
+                     if getattr(b.attn, "kvproj", False)]
+
+    def __enter__(self):
+        for m in self.mods:
+            m.want_bank_attn, m.last_bank_attn = True, None
+        return self
+
+    def __exit__(self, *a):
+        for m in self.mods:
+            m.want_bank_attn, m.last_bank_attn = False, None
+        return False
+
+    def mass(self, tok_slice=slice(None)) -> torch.Tensor | None:
+        """Masse d'attention MOYENNE par ligne de banque, [B, S].
+
+        Moyennée sur les couches lectrices, les têtes et les positions
+        demandées : c'est la lecture la plus neutre possible, aucune couche ni
+        aucune tête n'étant privilégiée a priori.
+        """
+        got = [m.last_bank_attn for m in self.mods
+               if m.last_bank_attn is not None]
+        if not got:
+            return None
+        return torch.stack([a[:, :, tok_slice].mean((1, 2))
+                            for a in got]).mean(0)
 
 
 # ── comptage de paramètres par bloc ──────────────────────────────────────────
