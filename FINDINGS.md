@@ -37,6 +37,58 @@ test this — before scale.
 
 ---
 
+## 2026-08-03 (soir) — Carré factoriel des lectures attention (PARTIEL 33/48) : dual_heads ÉLIMINÉ, kvproj BAT kv_append en citation (+0,227), la compétition de masse softmax n'existait pas
+
+**Question (SPEC_MEMOIRE_V2 §2.4)** : dans le carré {projections partagées vs
+dédiées} × {softmax unifié vs séparé} — kv_append (partagées/unifié),
+dual_heads (dédiées/séparé), kv_proj (dédiées/unifié) ± bank-q — quelle forme
+de lecture attention adopter ? Départage sur Δnll citation + marges de
+marqueurs (le 2AFC sature à 1,000 dès m=4 partout). Mêmes 3000 steps / seed 0 /
+d512-L6 / max_mem 8 que la grille ph.10 ; appariement exact (rot, tap, m).
+
+État : dual_heads 12/12, kvproj 9/12, bank-q 0/12 (en file). Verdicts déjà
+stables :
+
+```
+Δ apparié vs kv_append   n     Δmark          Δnll citation
+dual_heads               12    +0,118 ±0,198  −0,046 ±0,252   (nul)
+kv_proj                   9    +0,103 ±0,108  +0,227 ±0,125   (t ≈ 5,4)
+
+cit_dnll par m           m=1     m=4     m=8
+kv_append                0,755   1,049   1,790
+dual_heads               0,879   1,131   1,447
+kv_proj                  0,843   1,307   2,130
+```
+
+1. **dual_heads est ÉLIMINÉ** : gain nul sur les deux métriques, coût double
+   (projections dédiées + seconde passe d'attention + merge), et il perd
+   l'exploitation du budget m (cit 1,45 vs 1,79 à m=8) — l'arbitrage de masse
+   APPRIS du softmax partagé bat la séparation structurelle. Réserve d'init
+   honorée (W_o zero-init = plateau early, mais 3000 steps tranchent).
+2. **kvproj gagne la citation, et l'écart CROÎT avec m** (m1 +0,09 → m8
+   +0,34) : les projections dédiées laissent le modèle façonner une géométrie
+   de clés propre aux lignes — c'est la citation (retrouver LA bonne ligne)
+   qui en profite, le conditionnement sature déjà.
+3. **La compétition de masse softmax n'était pas réelle** : le
+   `bank_logit_bias` appris par tête reste ≈ 0 (moy +0,004 à m1, −0,012/−0,019
+   à m4/m8 — un amortissement fin, pas une compensation). Le modèle n'a jamais
+   eu besoin de gonfler la masse banque.
+4. **Conséquence S1 (spec §3)** : la règle était « kvproj ≈ kv_append →
+   adopté (l'espace des rotations est gratuit) » ; on est AU-DESSUS de ≈ — la
+   dédicace paie en plus d'héberger les plans de métadonnées. kvproj = le read
+   pressenti du 350M, verdict final au dépouillement des 48 (3 kvproj rot-on
+   + 12 bank-q restants).
+5. Lecture de code au passage (spec §2.5) : le q partagé porte R(t) non annulé
+   côté banque ⇒ les clés banque se dockent dans la bande lente du RoPE
+   backbone (HoPE retrouvé par l'implémentation) ; les plans de métadonnées
+   devront viser les dims quasi statiques côté requête. Sonde spectre W_K'
+   à faire sur ces mêmes ckpts, rien à réentraîner.
+
+Repro : `python -m deepseek_v4_mini.toy_read_lab configs/toy_read_lab_d512_p10.yaml
+--cond --read {kv_append,dual_heads,kv_proj} [--bank-q] [--age-rot] --tap
+{postnorm,mid} --m {1,4,8}` (jobs zzq1NN/zzq2NN/zzq3NN sur la ferme) ; agrégat =
+glob `checkpoints/toy_read_lab_p10/*/results.json`, deltas appariés (rot,tap,m).
+
 ## 2026-08-03 — Grille jouet phase 10 (35/38 cellules) : l'injection-comme-modalité CONDITIONNE (2AFC 1,000 vs 0,35/0,50), kv_append ≈ inject_entry, et le fast-weight perd l'A/B dans les deux régimes
 
 **Question (SPEC_MEMOIRE_V2 §2.4)** : quelle lecture porte le gist au 350M —
