@@ -159,6 +159,16 @@ top-k (copy_mask, §4.1) — 0 forward, aucune politique. Argument décisif = le
 RESET : sans self-writes, amnésie asymétrique de ses propres engagements
 post-reset.
 
+Le sélecteur mécanique N'EST PAS le SIF seul (précision 08-03, sur objection
+user) : le biais SIF contre les chiffres est mesuré (w̄ chiffres 0,02 vs médian
+0,156 ; KT3 : inclusion code 0,000 avant fix) et les tokens numériques sont
+précisément les plus citables. En env synthétique le fix est le copy_mask
+d'oracle (§4.1) ; en déploiement réel, son transport = un **copy_mask
+PROCÉDURAL** : sélection = SIF top-k ∪ détecteur de spans (chiffres,
+identifiants, chaînes citées), zéro paramètre. Mesure S16 : sur ultrachat
+(pauvre en chiffres) la part numérique hors-SIF n'est que ~2 % — le biais
+porte sur les domaines numériques/code/outils, pas sur le chat-essai.
+
 Mécanique du curseur Δn (précision 08-03) : la matrice d'états `(n, d)` grandit
 pendant le décodage, et on conserve une COPIE de n (le curseur du dernier
 write). La provenance se lit dans le PAS de croissance — un saut Δn > 1 = un
@@ -373,7 +383,7 @@ verdict. Rien d'autre n'est ouvert.
 | S13 | self-writes : boucle fermée maîtrisable | horizon de divergence self-writes ON/OFF (+ KT10 scheduled sampling comme levier) | à lancer | si OFF >> ON, la capture self recule vers `<think>`-seul |
 | S14 | copie indue (négatifs copy-head) | KT7 : wrong-slot / slot-périmé, calibration `log_alpha` | avant toute démo de rappel | taux de copie indue = métrique de première classe |
 | S15 | falaise layout | KT9 : varier nombre/ordre de groupes à l'éval sur le ckpt copy | à lancer | fixe la normalisation §4.3 |
-| S16 | mem_dim (taille de slot) | `analysis/s16_memdim_stats.py` (recall_env exact + ultrachat proxy SIF) | **FAIT 08-03** | recall_env : ≤10 tokens/tour (mem_dim 16 confirmé, seq_len/2 réfuté), write 0,234 ⇒ horizon ×4,27 ; ultrachat : assistant p50 37 candidats ≫ k=13 (les tours longs saturent la sélection ⇒ rôle du `<think>`-synthèse), write 0,944 ⇒ en chat dense la dédup n'étire pas l'horizon — la charge est sur la propagation (S6) |
+| S16 | mem_dim (taille de slot) | `analysis/s16_memdim_stats.py` (recall_env exact + ultrachat proxy SIF∪numérique v2) | **FAIT 08-03** | recall_env : ≤10 tokens/tour (mem_dim 16 confirmé, seq_len/2 réfuté), write 0,234 ⇒ horizon ×4,27 ; ultrachat : assistant p50 38 candidats ≫ k=13 (les tours longs saturent la sélection ⇒ rôle du `<think>`-synthèse), write 0,944 ⇒ en chat dense la dédup n'étire pas l'horizon — la charge est sur la propagation (S6) ; part numérique hors-SIF ~2 % sur ultrachat MAIS le biais chiffres porte sur code/outils (KT3) ⇒ sélecteur déployé = SIF ∪ copy_mask procédural (§2.3), à re-mesurer sur corpus agentique |
 | S17 | position locale intra-span nécessaire ? | ph.11 : citation de valeurs multi-tokens avec/sans rotation d'index local | **HARNAIS LIVRÉ 08-03 (nuit)** : 6 cellules `zzr4xx` sur l'env `span` (longueurs MESURÉES 1..6, grade par strate de longueur) | si le sans-ordre casse les spans multi-tokens → la troisième famille entre ; sinon économisée |
 
 ## 4. Corrections pré-run (état)

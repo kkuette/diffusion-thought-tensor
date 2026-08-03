@@ -119,17 +119,37 @@ def stats_ultrachat(n_convs, sif_a, thresh, seed=0):
         p = counts[tid] / total
         return sif_a / (sif_a + p)
 
+    # BIAIS SIF CONNU (350M : w̄ chiffres 0,02 vs médian 0,156 ; KT3) : les
+    # tokens numériques sont FRÉQUENTS un à un ⇒ le SIF les jette, alors que
+    # ce sont les atomes les plus citables. Proxy v2 : atome = SIF-rare ∪
+    # NUMÉRIQUE (le « copy_mask procédural » minimal), les deux comptés
+    # séparément pour voir la part que le SIF pur perdait.
+    is_num = {}
+
+    def numeric(tid):
+        if tid not in is_num:
+            s = tok.convert_ids_to_tokens(int(tid)) or ""
+            is_num[tid] = any(c.isdigit() for c in s)
+        return is_num[tid]
+
     per_turn, wf, dd = [], [], []
     by_role = {"user": [], "assistant": []}
+    num_share = []                   # part numérique des atomes d'un tour
     tok_lens = []
     for enc in enc_convs:
         seen: set = set()
         for role, ids in enc:
             tok_lens.append(len(ids))
-            rare = [t for t in set(ids) if sif_w(t) >= thresh]
-            new = [t for t in rare if t not in seen]
-            dd.append((len(rare), len(rare) - len(new)))
-            seen.update(rare)
+            uniq = set(ids)
+            rare = {t for t in uniq if sif_w(t) >= thresh}
+            nums = {t for t in uniq if numeric(t)}
+            atoms = rare | nums
+            new = [t for t in atoms if t not in seen]
+            new_num_only = [t for t in new if t in nums and t not in rare]
+            if new:
+                num_share.append(len(new_num_only) / len(new))
+            dd.append((len(atoms), len(atoms) - len(new)))
+            seen.update(atoms)
             per_turn.append(len(new))
             by_role.setdefault(role, []).append(len(new))
             wf.append(len(new) > 0)
@@ -139,6 +159,10 @@ def stats_ultrachat(n_convs, sif_a, thresh, seed=0):
                        for r, v in by_role.items() if v}
     for r, v in out["par_role"].items():
         print(f"  {r:9s} : p50 {v['p50']}  p90 {v['p90']}  p99 {v['p99']}")
+    out["part_numerique_hors_sif"] = round(st.mean(num_share), 3) \
+        if num_share else 0.0
+    print(f"  part des atomes NUMÉRIQUES que le SIF pur aurait JETÉS : "
+          f"{out['part_numerique_hors_sif']:.1%} (moyenne par tour)")
     out["tokens_par_tour"] = {"p50": q(tok_lens, .5), "p90": q(tok_lens, .9),
                               "max": max(tok_lens, default=0)}
     print(f"  (tokens/tour : p50 {out['tokens_par_tour']['p50']}  "
