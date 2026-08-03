@@ -176,6 +176,121 @@ Appuis empiriques du couple : conditionnement passe (persona Δnll +0.332 à β=
 citation passe uniquement par l'injection native (jouet ph.7-8) + copy-head
 (CE valeur 0.201 ON vs 2.212 OFF).
 
+## 2bis. Mise à plat 2026-08-03 — l'architecture consolidée
+
+Cette section intègre la journée du 08-03 : verdicts du run copy (chaîne
+retrieve-then-inject-then-copy fermée au 350M), des kill-tests 1-2 (la banque bat
+la compaction texte au rappel ; le mur = la sélection), de la grille jouet ph.10
+(l'attention-read gagne, le fast-weight perd dans les deux régimes), du carré
+factoriel (en cours), de la veille rotations (FINDINGS + fiche
+ref-rotations-metadonnees-sota-2026), et de cinq itérations de design user sur le
+write. Là où elle contredit §2.3-2.5, ELLE fait foi.
+
+### 2bis.1 Le store : UN tenseur, des conventions
+
+Banque = un seul tenseur `(max_mem, mem_dim, d)` + compteurs par slot (naissance,
+usage). Aucune structure annexe. Les « régions » sont des conventions de position :
+
+| région | où | règle |
+|---|---|---|
+| épinglée | slots exempts du décalage FIFO (budget propre) | lignes taguées system : jamais évincées — le prompt système devient banque-résident, survit au RESET à coût fenêtre nul |
+| active | tête | la session vivante |
+| froide | queue (vers max_mem−1) | évincée du slot de tête, pas encore sortie ; lisible, sauvable |
+| morte | au-delà du bord | perdue définitivement |
+
+Le gradient de température EST la position FIFO. La fenêtre de résurrection est
+bornée par max_mem : capacité et sursis sont le même cadran.
+
+### 2bis.2 Trois étages, trois natures
+
+**Acquisition (frontière de tour, mécanique + une déviation apprise).**
+Capture par défaut SYMÉTRIQUE user/self : chaque tour écrit sa sélection SIF
+top-k (copy_mask, §3.1) — 0 forward, aucune politique. Argument décisif = le
+RESET : sans self-writes, amnésie asymétrique de ses propres engagements
+post-reset. Risque assumé = boucle fermée (le serve divergeait en ~5-10 tours) ;
+défenses : tag de provenance (le read pondère « j'ai dit » ≠ « on m'a dit »),
+rétention par usage (le junk s'affame), kill-test = horizon de divergence
+self-writes ON/OFF. Le `<think>` ne porte plus la capture : il porte la SYNTHÈSE
+(ce qui n'est verbatim dans aucun tour) et le marquage de salience — appris,
+au-dessus du défaut mécanique.
+
+**Maintenance (procédurale, zéro paramètre, zéro forward).**
+Une seule primitive : append en tête + décalage + chute au bord. La survie est un
+acte : PROPAGATION des lignes utiles de la queue vers la tête (budget par write,
+compteur de naissance préservé). Le poids-par-ancienneté est RÉPUDIÉ (proxy
+auto-renforçant) ; le signal de rétention est choisi par bakeoff ph.11 :
+attention-EMA (le lecteur vote — gratuit dans les reads à projections dédiées) /
+couverture sémantique (évincer la ligne au plus proche voisin) / activation
+ACT-R (usage à décroissance) / baseline âge (à battre). Résurrection = propagation
+depuis la queue avant le bord, ancienneté reprise.
+
+**Lecture (apprise, attention — la seule classe de fonctions du design).**
+Convergence de quatre lignes : l'empirique (grille ph.10 : 2AFC 1,000 attention
+vs effondrement fast-weight), le codage (les rotations ne se décodent que dans un
+produit q·k), la maintenance (la masse d'attention par ligne = le signal de
+rétention, sous-produit gratuit), le cross-modal (l'attention sur un ensemble est
+modality-agnostic). Deux ailes inchangées (§2.5) : surface = RTI α + copy-head
+(prouvé 350M : grade 0,28 vs 0,00, p_copy val-only) ; gist = attention sur la vue
+plate — le POINT dans le carré factoriel : {kv_append, kv_proj, dual_heads}
+± bank-q, départagé sur Δnll citation + marges (le 2AFC sature).
+
+### 2bis.3 Métadonnées = rotations sur plans réservés (K/V dédiées)
+
+Tout ce qui décrit une ligne — quand, qui, quel canal — est une rotation
+élémentaire ; le contenu reste le vecteur natif intact (norme préservée).
+Contraintes actées par la veille (ref-rotations-metadonnees-sota-2026) :
+
+- **Âge : LOG-COMPRIMÉ avant rotation** (φ(a) ∝ log(1+a)) — un âge non borné à
+  fréquences fixes = le problème d'extension de contexte déguisé (Base of RoPE) ;
+  8 plans, échelle géométrique, entrelacés, SANS bande haute fréquence
+  (collisions VideoRoPE ; dims précoces inutilisables 2502.11276), fréquences
+  apprises (LieRE). Résolution décroissante avec l'âge = la sémantique voulue.
+- **Provenance/canal : UN PLAN 0/π PAR CANAL** (user, self, system ; puis
+  modalités) — jamais n angles sur un plan (métrique cyclique parasite). π/2 si
+  l'orientation « qui lit qui » doit compter. La rotation de provenance =
+  réimplémentation du chat template dans l'espace où il n'existe plus (la
+  sélection détruit les balises de rôle ; précédent : TS-RoPE, locuteur).
+- **Jamais dans la bande RoPE du backbone** (guideline « textual priors ») —
+  les plans vivent dans les projections K/V dédiées du read.
+- **Contrôle NON NÉGOCIABLE (ph.11) : θ_âge = 0** — HoPE prouve que la rotation
+  nulle sur l'axe long maximise le rappel ; si notre rotation d'âge ne bat pas ce
+  bras sur la citation, l'âge passe en biais scalaire de récence.
+
+### 2bis.4 Sélection : le mur, et ses trois réponses en couches
+
+KT1 a localisé le mur : grade 0,717 quand le vrai groupe sort en tête, 0,000 sur
+les miss, r@1 0,480 en banque multi-vies. Réponses, du court au long terme :
+1. **GRPO retrieve** (cliquet prévu) — le crédit Plackett-Luce existe déjà ;
+2. **Les métadonnées comme filtres de descente** : la requête choisit son axe —
+   « qu'a dit l'utilisateur sur X » descend par le plan provenance, « qu'ai-je
+   dit hier » par les plans d'âge ;
+3. **La hiérarchie CSA/HCA sur la banque** (§2bis.5) : le niveau grossier est un
+   retriever SOFT différentiable — le remplaçant candidat du top-k dur.
+
+### 2bis.5 Trajectoire de scaling : la même attention, hiérarchique
+
+Reprendre la structure CSA/HCA du backbone SUR la banque. La hiérarchie a DEUX
+axes de localité — quand (blocs d'âge : récent ligne à ligne, passé résumé par
+blocs, même geste que le log-âge) et qui (plans de canal) — et une requête choisit
+sa descente. Coût de read sous-linéaire en S ⇒ max_mem de ~8 à ~10³ : la banque
+passe de mémoire de travail à mémoire de session longue. Ordre des preuves :
+le carré tranche l'attention PLATE à max_mem=8 → KT8 (courbe de dilution
+S=1/4/16/64) dit où la plate s'écroule → la hiérarchie entre avec l'écroulement
+comme baseline. Pitch : le backbone lit son contexte et sa mémoire avec la MÊME
+structure — « attention is all you need », à condition de lui donner un deuxième
+corpus qui survive à la fenêtre.
+
+### 2bis.6 Ce qui apprend, ce qui n'apprend pas
+
+| apprend (dans le graphe) | n'apprend pas (procédural, hors graphe) |
+|---|---|
+| le read (projections, biais de logits banque) | sélection SIF top-k + copy_mask |
+| la copy-head | FIFO, propagation, résurrection, épinglage |
+| le `<think>` (synthèse, salience) — GRPO | rotations (âge log, plans de canal) |
+| le retrieve (GRPO, puis hiérarchie soft) | compteurs de naissance/usage |
+
+Tout le neuf est procédural ; tout ce qui apprend est du transformer standard.
+
 ## 3. Corrections pré-run obligatoires (dettes identifiées par la critique)
 
 ### 3.1 Sélection de surface à priorité de span — RÉVISÉ par le kill-test 3 (08-01)
