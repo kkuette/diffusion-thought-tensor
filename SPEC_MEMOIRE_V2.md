@@ -206,7 +206,8 @@ l'attention des couches lectrices. Le fast-weight read est retiré du design.
 Carré 2×2 : projections {partagées, dédiées} × softmax {unifié, séparé} —
 kv_append (partagées/unifié), dual_heads (dédiées/séparé), kv_proj
 (dédiées/unifié) ± bank-q ; départagé sur Δnll citation + marges de marqueurs
-(le 2AFC sature). **Verdict partiel (08-03 soir, aile dual_heads COMPLÈTE)** :
+(le 2AFC sature). **Verdict (08-03 soir, ailes dual_heads ET kvproj
+COMPLÈTES — 36/48, reste bank-q = S2)** :
 
 - **dual_heads ≈ kv_append** : Δmark apparié +0,118 (sd 0,198, n=12), Δnll
   citation nul (−0,046). Les têtes dédiées à softmax séparé n'achètent RIEN à
@@ -215,14 +216,19 @@ kv_append (partagées/unifié), dual_heads (dédiées/séparé), kv_proj
   structurelle. **dual_heads est ÉLIMINÉ** (gain nul, coût double : projections
   dédiées + seconde passe d'attention).
 - **La compétition de masse softmax n'est pas une contrainte réelle** : le
-  `bank_logit_bias` appris de kvproj reste ≈ 0 (moy +0,004, max +0,022).
-- **Candidat retenu : kvproj** (projections K/V dédiées, softmax unifié) — non
-  pour la performance mais parce que les rotations (§2.5) EXIGENT un espace K
-  dédié. Une rotation appliquée avant W_k ne survit pas à la projection ; les
-  dims partagées sont occupées par la sémantique du backbone (« textual
-  priors »). kvproj donne l'espace au prix de ~2d² par couche lectrice ; les
-  cellules restantes mesurent si ce prix est nul (§3-S1). Fallback si coût
-  avéré : dims K/V étendues sur projections partagées (plus intrusif).
+  `bank_logit_bias` appris de kvproj reste ≈ 0 (moy +0,004 à m1, léger
+  amortissement −0,012/−0,019 à m4/m8).
+- **kvproj ADOPTÉ (S1 tranché)** : Δcit apparié **+0,209 ± 0,115 (n=12,
+  t=6,3)**, Δmark +0,120 ± 0,106 — la dédicace ne coûte pas, elle PAIE, et
+  l'écart croît avec m (cit m8 : 2,13-2,34 vs 1,79). Double justification
+  désormais : performance mesurée ET hébergement des rotations (§2.5 — une
+  rotation appliquée avant W_k ne survit pas à la projection ; les dims
+  partagées sont occupées par la sémantique du backbone). Prix : ~2d² par
+  couche lectrice. Le fallback dims-étendues est retiré. Meilleure cellule du
+  carré : kvproj rot-on m8 (cit 2,336).
+- L'age-rot du jouet (DFT brute) reste ~neutre dans kvproj (Δcit +0,055,
+  Δmark −0,144, n=6) — le design réel (log + fréquences apprises) se juge en
+  ph.11 (S3-S4), pas ici.
 - Réserve : verdict à max_mem=8 — KT8 dira s'il tient quand la banque grandit.
 
 ### 2.5 Métadonnées = rotations sur plans réservés (K/V dédiées)
@@ -344,7 +350,7 @@ verdict. Rien d'autre n'est ouvert.
 
 | # | Décision | Test | État | Règle de décision |
 |---|---|---|---|---|
-| S1 | kvproj vs kv_append (coût de la dédicace K/V) | 11 cellules kvproj du carré | **EN COURS** (ferme) | kvproj ≈ kv_append → kvproj adopté (l'espace des rotations est gratuit) ; kvproj nettement < → arbitrer prix vs fallback dims étendues |
+| S1 | kvproj vs kv_append (coût de la dédicace K/V) | 12 cellules kvproj du carré | **TRANCHÉ 08-03 : kvproj ADOPTÉ** | mieux que la règle (« ≈ suffisait ») : Δcit +0,209 ± 0,115 apparié n=12 (t 6,3), Δmark +0,120 — la dédicace PAIE en plus d'héberger les rotations ; meilleure cellule du carré = kvproj rot-on m8 (cit 2,34) |
 | S2 | ±bank-q (contextualiser la requête par la banque) | 12 cellules bank-q du carré | **EN FILE** (ferme) | positif → se greffe sur kvproj ; nul → abandonné (indépendant de S1) |
 | S3 | rotation d'âge vs rien vs biais scalaire | ph.11 : contrôle θ_âge=0 (HoPE), NON NÉGOCIABLE | à lancer après dépouillement du carré | la rotation doit BATTRE θ_âge=0 sur la citation, sinon âge = biais scalaire de récence |
 | S4 | OOD d'âge (compression) | ph.11 : train ≤A_train, éval 10×/100× ; bras {brut, log-comprimé, brut+augmentation} | à lancer | le bras qui tient l'OOD gagne ; prédiction = log |

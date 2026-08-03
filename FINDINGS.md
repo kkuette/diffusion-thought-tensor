@@ -37,7 +37,7 @@ test this — before scale.
 
 ---
 
-## 2026-08-03 (soir) — Carré factoriel des lectures attention (PARTIEL 33/48) : dual_heads ÉLIMINÉ, kvproj BAT kv_append en citation (+0,227), la compétition de masse softmax n'existait pas
+## 2026-08-03 (soir) — Carré factoriel des lectures attention (36/48, ailes dual_heads + kvproj COMPLÈTES) : dual_heads ÉLIMINÉ, kvproj ADOPTÉ (+0,209 citation, t=6,3), la compétition de masse softmax n'existait pas
 
 **Question (SPEC_MEMOIRE_V2 §2.4)** : dans le carré {projections partagées vs
 dédiées} × {softmax unifié vs séparé} — kv_append (partagées/unifié),
@@ -46,19 +46,22 @@ de lecture attention adopter ? Départage sur Δnll citation + marges de
 marqueurs (le 2AFC sature à 1,000 dès m=4 partout). Mêmes 3000 steps / seed 0 /
 d512-L6 / max_mem 8 que la grille ph.10 ; appariement exact (rot, tap, m).
 
-État : dual_heads 12/12, kvproj 9/12, bank-q 0/12 (en file). Verdicts déjà
-stables :
+État : dual_heads 12/12, kvproj 12/12, bank-q 0/12 (6 en cours). Verdicts :
 
 ```
 Δ apparié vs kv_append   n     Δmark          Δnll citation
 dual_heads               12    +0,118 ±0,198  −0,046 ±0,252   (nul)
-kv_proj                   9    +0,103 ±0,108  +0,227 ±0,125   (t ≈ 5,4)
+kv_proj                  12    +0,120 ±0,106  +0,209 ±0,115   (t = 6,3)
 
 cit_dnll par m           m=1     m=4     m=8
 kv_append                0,755   1,049   1,790
 dual_heads               0,879   1,131   1,447
-kv_proj                  0,843   1,307   2,130
+kv_proj                  0,868   1,289   2,088   (meilleure cellule : rot-on m8 = 2,336)
 ```
+
+Dans kvproj, l'age-rot du jouet (DFT brute) reste ~neutre (ON−OFF apparié
+n=6 : Δcit +0,055, Δmark −0,144) — le design réel (log + fréquences apprises)
+se juge en ph.11.
 
 1. **dual_heads est ÉLIMINÉ** : gain nul sur les deux métriques, coût double
    (projections dédiées + seconde passe d'attention + merge), et il perd
@@ -73,11 +76,11 @@ kv_proj                  0,843   1,307   2,130
    `bank_logit_bias` appris par tête reste ≈ 0 (moy +0,004 à m1, −0,012/−0,019
    à m4/m8 — un amortissement fin, pas une compensation). Le modèle n'a jamais
    eu besoin de gonfler la masse banque.
-4. **Conséquence S1 (spec §3)** : la règle était « kvproj ≈ kv_append →
-   adopté (l'espace des rotations est gratuit) » ; on est AU-DESSUS de ≈ — la
-   dédicace paie en plus d'héberger les plans de métadonnées. kvproj = le read
-   pressenti du 350M, verdict final au dépouillement des 48 (3 kvproj rot-on
-   + 12 bank-q restants).
+4. **S1 TRANCHÉ (spec §3) : kvproj ADOPTÉ** — la règle était « ≈ suffit »
+   (l'espace des rotations gratuit) ; on est au-dessus : la dédicace paie en
+   plus d'héberger les plans. Le fallback dims-étendues est retiré. kvproj =
+   le read du 350M ; reste S2 (±bank-q, 12 cellules) qui se greffe dessus si
+   positif.
 5. Lecture de code au passage (spec §2.5) : le q partagé porte R(t) non annulé
    côté banque ⇒ les clés banque se dockent dans la bande lente du RoPE
    backbone (HoPE retrouvé par l'implémentation) ; les plans de métadonnées
