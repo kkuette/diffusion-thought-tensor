@@ -29,48 +29,76 @@ Comptabilité — règles non négociables :
   banque est le seul état qui traverse. Invariant conservé : la seule modification de la
   banque est l'écriture d'un write (désormais : sur un slot, avec écrasement).
 
-Ce qu'on ne revendique **plus** (dégonflages actés) :
+**Révision 08-03 des revendications** — ce que le claim PORTE désormais, adossé
+à des mesures :
 
-- ~~« Le modèle pense dans le latent »~~ — horizon, pas claim. Le curriculum Coconut est
-  **abandonné** pour cette phase : (a) Coconut perd contre la CoT explicite à compute
-  apparié (précédent publié), (b) il affame la sélection de surface en supprimant les
-  tokens qu'elle échantillonne (contradiction interne relevée par la critique).
-  Le bloc `<think>` reste **verbalisé**.
-- ~~« Le gist encode un état de pensée »~~ — le contenu du gist n'a pas de canal
-  d'apprentissage praticable à notre échelle (TBPTT inter-tours infaisable sur 24 Go ;
-  un scalaire RL ne façonne pas un vecteur mem_dim). Le gist est une **compression SIF
-  assumée comme telle**. Le RL apprend *quand* écrire et *quel slot* écraser — jamais
-  *quoi* mettre dans le vecteur.
-- ~~Le rappel exact comme claim de *performance* contre le RAG~~ — le RAG résout le
-  verbatim mieux et moins cher en régime fenêtre non bornée. Le rappel est un claim de
-  **mécanisme unifié sous fenêtre bornée** (même store qui conditionne et cite à travers
-  les resets), démontré à budget total incluant les tokens de retrieval du RAG.
+- **Le rappel exact FAIT PARTIE du claim.** Il est mesuré : la banque bat la
+  compaction textuelle au rappel à travers reset (KT1 : 0,343 vs 0,227, Δ apparié
+  +0,115), et la chaîne retrieve-then-inject-then-copy est fermée au 350M (run
+  copy : grade 0,28 vs 0,00 ablaté, p_copy val-only). La réserve d'origine reste :
+  claim de **mécanisme unifié sous fenêtre bornée**, pas de performance contre le
+  RAG en fenêtre non bornée (le RAG y résout le verbatim mieux et moins cher) —
+  démontré à budget total incluant les tokens de retrieval du RAG.
+- **Le conditionnement PAR CONSTRUCTION est claimé** — le modèle est forcément
+  influencé par la banque puisqu'elle entre dans son attention, et c'est mesuré
+  (2AFC 1,000, marqueurs +2,5/+3,3 nats, shuf sous le hasard = spécifique au
+  contenu ; persona Δnll +0,332 à β=0).
+
+Ce qu'on ne revendique **plus ou pas encore** (dégonflages actés) :
+
+- ~~« Le modèle pense dans le latent »~~ — horizon, pas claim ; à distinguer du
+  conditionnement-par-construction ci-dessus (influencé par la banque ≠ pense
+  dedans). Le curriculum Coconut est **abandonné** pour cette phase : (a) Coconut
+  perd contre la CoT explicite à compute apparié (précédent publié), (b) il
+  affame la sélection de surface en supprimant les tokens qu'elle échantillonne
+  (contradiction interne relevée par la critique). Le bloc `<think>` reste
+  **verbalisé**.
+- ~~« Le gist encode un état de pensée »~~ — le contenu des lignes n'a pas de
+  canal d'apprentissage praticable à notre échelle (TBPTT inter-tours infaisable
+  sur 24 Go ; un scalaire RL ne façonne pas un vecteur). Les lignes sont une
+  **sélection/compression SIF assumée comme telle**. Le RL apprend *quand*
+  écrire et *quoi propager* — jamais *quoi* mettre dans le vecteur.
 
 ## 2. Le mécanisme
 
 Un seul store, un seul geste d'écriture, deux régimes de lecture.
 
-### 2.1 Store : espace fixe de S slots
-
-- S fixe (cohérent avec `mem_seed_slots = max_mem` décidé sur perf/decode-dispatch ;
-  le rebind CUDA-graphs suppose une banque de taille constante).
-- S est un hyperparamètre **à sonder** (kill-test 8 : courbe de dilution S = 1/4/16/64) —
-  deux pressions opposées : le rappel veut S grand, la lecture ambiante se dilue.
-
-### 2.2 Slot structuré
+### 2.1 Store : UN tenseur constant (max_mem, mem_dim, d) — RÉVISÉ 08-03
 
 ```
-slot = (clé, surface, gist)
+banque = tenseur (max_mem, mem_dim, d), taille CONSTANTE
+         profondeur = max_mem slots (FIFO), hauteur = mem_dim lignes par slot,
+         largeur = d (= d_model, pleine largeur)
 ```
 
-- **clé** : pooling SIF procédural du segment (existant, `build_group` dans
-  [rti.py](deepseek_v4_mini/rti.py)) — avec la **correction de pondération** du §3.1.
-- **surface** : sélection top-k d'**embeddings natifs** de tokens réellement émis
-  (jamais transformés par un réseau — labo jouet ph.7 : tout readout appris est mort,
-  seule l'injection native cite). Matière première = le bloc `<think>` verbalisé.
-- **gist** : compression SIF des états cachés du segment. Consommé par la lecture
-  ambiante uniquement. Aucune promesse sur son contenu au-delà de ce que le teacher
-  SIF a=1e-4 y met.
+- Taille constante (cohérent avec `mem_seed_slots = max_mem` décidé sur
+  perf/decode-dispatch ; le rebind CUDA-graphs suppose une banque de taille
+  constante).
+- max_mem est un hyperparamètre **à sonder** (kill-test 8 : courbe de dilution
+  S = 1/4/16/64) — deux pressions opposées : le rappel veut S grand, la lecture
+  ambiante se dilue.
+
+### 2.2 Slot UNIFIÉ : des lignes de d, rien d'autre — RÉVISÉ 08-03
+
+~~slot = (clé, surface, gist)~~ — le slot structuré est REMPLACÉ. Chaque ligne
+de largeur d est **littéralement un vecteur du modèle** — embedding natif
+(couche 0) ou état caché côté sortie (mi-tardif/logit) — sélectionné par SIF
+top-k, jamais transformé par un réseau (labo jouet ph.7 : tout readout appris
+est mort, seule l'injection native cite). **Tout est unifié sur d** :
+
+- **Plus de clé stockée.** La clé est une FONCTION, pas une donnée : elle se
+  calcule à la lecture par les projections K dédiées (kvproj) depuis le contenu
+  de la ligne. Le pooling SIF de `build_group` survit uniquement comme score de
+  sélection au write, plus comme champ du slot.
+- **Plus de dichotomie surface/gist dans le FORMAT.** Les deux natures
+  subsistent comme *provenance du prélèvement* (embeddings couche 0 vs états
+  mi-tardifs) et *régime de lecture* (§2.5 : ce qui doit être DIT vs ce qui doit
+  MODULER) — mais toutes les lignes ont le même type, le même store, la même
+  largeur. Une ligne de gist est injectable comme pseudo-token au même titre
+  qu'une ligne de surface (l'injection-comme-modalité, validée ph.10 :
+  2AFC 1,000).
+- **Les métadonnées ne sont pas des champs** : quand/qui/quel canal = rotations
+  sur plans réservés des K/V dédiées (§2bis.3), le contenu reste intact.
 
 ### 2.3 Écriture = choix de slot + écrasement
 
@@ -438,7 +466,9 @@ recette TF+distill+anneal β→0 pour l'amorçage des lectures.
 **Se modifie** : append → écrasement de slot (+ tête de choix de slot, init FIFO) ;
 pondération de sélection clé/surface (§3.1) ; harnais + leave-one-overwrite (§3.2) ;
 layout normalisé (§3.3) ; copy-head ré-entraîné avec négatifs (§3.4) ; slot devient
-(clé, surface, gist) — le write actuel ne produit que l'équivalent du gist.
+des lignes UNIFIÉES de largeur d (§2.2 révisé — plus de triplet clé/surface/gist :
+la clé se calcule à la lecture, le write actuel produit des lignes de nature gist,
+il lui manque la sélection d'embeddings natifs couche 0).
 
 **Se gèle** : curriculum Coconut / CoT latente (horizon post-claim) ; GRPO recall
 (déjà en pause @17) ; claim « budget visible » ; tout claim sur le *contenu* du gist.
