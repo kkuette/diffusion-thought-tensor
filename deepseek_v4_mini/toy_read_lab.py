@@ -211,7 +211,7 @@ import torch.nn.functional as F
 
 from .math_school_data import A_OPEN
 from .paths import load_yaml
-from .persona_chat_data import fact_id_maps, grade_recall
+from .persona_chat_data import PersonaChatStream, fact_id_maps, grade_recall
 from .streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3", "r4", "r5")
@@ -234,7 +234,7 @@ BANK_VARIANTS = ("r0", "r1", "r2", "r3")
 #   mos    = une distribution PAR LIGNE, puis mixture des DISTRIBUTIONS
 READOUT_MIXES = ("linear", "mos")
 CODES = ("mean", "chunk", "phase", "rows", "segmean", "segphase", "segsif",
-         "pack", "segpack", "toprows", "tophid")
+         "pack", "segpack", "toprows", "tophid", "midhid")
 # formats de la PHASE 3 : le code poole le SEGMENT ENTIER (pas de privilège
 # d'oracle sur le span valeur). Ils indexent la position DANS LE SEGMENT, donc
 # ils utilisent `seg_n_pos` et non `n_pos`.
@@ -246,13 +246,46 @@ SEG_PHASE_CODES = ("segphase", "segsif")
 PHASE_CODES = ("phase",) + SEG_PHASE_CODES
 # régimes de write de l'oracle (cf. ToyCfg.write_mode).
 WRITE_MODES = ("fact", "every")
+# phase 10 : ce que l'injection dépose À L'ENTRAÎNEMENT devant un tour
+# conditionné (cf. ToyCfg.cond_arm). Les TROIS conditions de LECTURE sont, elles,
+# mesurées à l'éval sur CHAQUE run (cf. evaluate_cond) : live / shuf / none.
+COND_ARMS = ("true", "shuffle", "none")
+# phase 10 — OÙ les lignes entrent dans le stack (cf. ToyCfg.read_path).
+READ_PATHS = ("entry", "kv")
+# phase 10 — les QUATRE chemins de lecture exposés par `--read`, traduits en
+# (variant, code|None, read_path). C'est la table qui rend la grille de la spec
+# §2.4 lançable par un seul flag ; les axes `--tap`, `--age-rot` et `--m` sont
+# ORTHOGONAUX à celui-ci.
+#   seq_fw       lecture fast-weight SÉQUENTIELLE (r0) sur la MÊME banque de
+#                groupes que les autres bras : la matrice plate
+#                (max_mem·(1+m), d) est lue LIGNE À LIGNE, chaque ligne
+#                engendrant sa transformation low-rank appliquée en série.
+#                C'est littéralement le §2.4(b) (« chaque ligne = un sous-slot
+#                d'entrée d, application séquentielle sur m×S sous-slots »).
+#                ⚠️ COÛT : la boucle fait max_mem·(1+m) itérations PAR COUCHE —
+#                à m=8 et max_mem=8 c'est 72 itérations × n_layers. C'est le
+#                bras lent de la grille, et c'est intrinsèque au design.
+#                Il n'a PAS de readout pointer (r0 n'en porte pas) : ce bras
+#                mesure la lecture fast-weight NUE.
+#   bank_xattn   lecture APPRISE sur la MÊME banque de groupes que l'injection
+#                (r3 : cross-attn contenu + GroupReadout). C'est LUI le
+#                comparateur non-injectif propre.
+#   inject_entry pseudo-tokens en préfixe (r4, lecture α) — le bras de la ph.7-9.
+#   kv_append    lignes appondues aux K/V des couches lectrices (r4 + kv,
+#                lecture β) — sans ré-encodage, sans RoPE.
+READ_MODES = {
+    "seq_fw":       ("r0", None,   "entry"),
+    "bank_xattn":   ("r3", None,   "entry"),
+    "inject_entry": ("r4", None,   "entry"),
+    "kv_append":    ("r4", None,   "kv"),
+}
 # formats PARTITIONNÉS (phase 5) : la ligne est un PACK de blocs disjoints —
 # bloc 0 = clé dédiée, blocs 1..B−1 = un token chacun. Readout = PackReadout.
 PACK_CODES = ("pack", "segpack")
 # formats à BANQUE DE GROUPES (phase 6) : un write dépose 1+top_k LIGNES
 # NATIVES — ligne 0 = clé dédiée, lignes 1.. = les embeddings BRUTS des tokens
 # sélectionnés. Principe : NE JAMAIS TRANSFORMER. Le FIFO compte les GROUPES.
-GROUP_CODES = ("toprows", "tophid")
+GROUP_CODES = ("toprows", "tophid", "midhid")
 # ── phase 9 : la ligne stockée n'est plus un EMBEDDING D'ENTRÉE ─────────────
 # `tophid` est `toprows` avec UNE différence, et une seule : la ligne de contenu
 # est l'état caché APRÈS `norm_f` (l'espace que consomme `lm_head`, tying
@@ -271,9 +304,18 @@ GROUP_CODES = ("toprows", "tophid")
 # Entraîné DEPUIS ZÉRO, le modèle peut au contraire façonner cet espace pour
 # qu'il porte la surface. C'est cette question-là, et elle seule, que la paire
 # toprows/tophid tranche.
-HID_CODES = ("tophid",)
+#
+# ── phase 10 : `midhid` — le POINT DE PRÉLÈVEMENT descend à ~2/3 de profondeur
+# `midhid` est `tophid` avec, encore une fois, UNE seule différence : la ligne
+# de contenu est l'état du flux résiduel APRÈS `hid_tap_layers` blocs (défaut
+# round(2/3·n_layers)), donc AVANT `norm_f` et avant la rotation vocabulaire
+# que le tying impose au dernier étage. C'est le correctif ranké de la spec
+# §2.4 (« le gist veut les CONCLUSIONS, pas la rotation vocabulaire ») et
+# l'autre moitié du débat « prélever trop bas » : `toprows` prélève à la
+# couche 0 (embedding d'entrée), `tophid` à la sortie, `midhid` entre les deux.
+HID_CODES = ("tophid", "midhid")
 # codes qui exigent la table SIF (pondération/sélection des tokens du segment).
-SIF_CODES = ("segsif", "segpack", "toprows", "tophid")
+SIF_CODES = ("segsif", "segpack", "toprows", "tophid", "midhid")
 # seed des tables ORACLE du pack (frames R_j ET clés par paire). FIGÉ : il est
 # celui de la campagne de mesure oracle (scratchpad/oracle_pack.py), garder la
 # continuité des chiffres.
@@ -417,6 +459,61 @@ class ToyCfg:
                               # plus rot(0)=identité, donc son token ne se
                               # superpose plus à K/A (qui, eux, ne sont jamais
                               # tournés). Cf. phase_tables pour le wrap.
+    # ── axe CHEMIN DE LECTURE (phase 10, spec §2.4 « VUE PLATE + ATTENTION »)
+    read_path: str = "entry"  # OÙ les lignes entrent, pour les variantes
+                              # d'injection :
+                              #   `entry` (DÉFAUT, rétro-compat bit-à-bit de la
+                              #     phase 7-9) = pseudo-tokens en PRÉFIXE, à
+                              #     l'entrée du stack (lecture α). Les lignes
+                              #     traversent TOUTES les couches et prennent
+                              #     des positions RoPE.
+                              #   `kv` = lignes appondues aux K/V des couches
+                              #     LECTRICES, SANS ré-encodage ni RoPE
+                              #     (lecture β). La ligne est découpée en
+                              #     n_heads morceaux et sert de clé ET de
+                              #     valeur. Zéro paramètre ajouté (le vecteur
+                              #     de type reste le seul).
+    # ── axe POINT DE PRÉLÈVEMENT (phase 10, `midhid`) ───────────────────────
+    hid_tap: float = 2.0 / 3.0   # fraction de profondeur où `midhid` prélève
+                              # l'état de la ligne. Le nombre de blocs traversés
+                              # est round(hid_tap · n_layers), borné à
+                              # [1, n_layers] (cf. hid_tap_layers). 1.0 = juste
+                              # AVANT norm_f (le contrôle qui isole norm_f de la
+                              # profondeur), le défaut 2/3 = le correctif ranké
+                              # de la spec §2.4. Ignoré hors `midhid`.
+    # ── axe ÂGE (phase 10, design ROTATION-PUIS-APLATISSEMENT) ──────────────
+    age_rope: bool = False    # rote chaque LIGNE injectée par l'ÂGE EN WRITES
+                              # de son slot (rot(θ·âge), même binding DFT que
+                              # `phase`, table de max_mem entrées) AVANT
+                              # d'ajouter le vecteur de type. La banque cible
+                              # est (max_mem, m, d) VUE comme la matrice plate
+                              # (max_mem·m, d) : aucune somme, aucune réduction
+                              # — les lignes restent séparées et la rotation
+                              # porte la provenance/récence. False (DÉFAUT) =
+                              # rétro-compat bit-à-bit : le chemin d'injection
+                              # ne voit pas une opération de plus.
+    # ── axe CONDITIONNEMENT (phase 10) ──────────────────────────────────────
+    cond: bool = False        # tâche de RÈGLE : le stream devient
+                              # PersonaRuleStream et l'éval contrastive
+                              # `evaluate_cond` s'ajoute (Δnll d'une
+                              # continuation COHÉRENTE avec la règle contre une
+                              # continuation INCOHÉRENTE). Ne retire RIEN : les
+                              # convs de rappel restent dans le flux, donc la
+                              # citation de la phase 9 continue d'être mesurée
+                              # par `evaluate` sur le même run.
+    cond_arm: str = "true"    # ce qui est injecté À L'ENTRAÎNEMENT devant les
+                              # tours conditionnés (r4 seulement) :
+                              #   true    = les groupes RÉSIDENTS de la vie
+                              #   shuffle = ceux d'une AUTRE vie du lot
+                              #             (contrôle « banque MÉLANGÉE »)
+                              #   none    = rien (BORNE BASSE : backbone nu)
+    cond_decoys: int = 1      # faits LEURRES plantés dans une vie-règle, en
+                              # plus de la règle : le préfixe injecté fait donc
+                              # 1 + cond_decoys groupes, la règle n'est pas
+                              # toujours la plus récente, et le code d'âge a
+                              # quelque chose à coder. 0 = un seul groupe (tous
+                              # les âges valent 0 : `age_rope` devient un no-op
+                              # mesurable, c'est le contrôle de la sonde).
     # ── axe RÉGIME DE WRITE (`--write`) ─────────────────────────────────────
     write_mode: str = "fact"  # `fact` (DÉFAUT) : l'oracle n'écrit qu'après les
                               # segs PORTEURS — il sait lesquels portent un
@@ -429,10 +526,14 @@ class ToyCfg:
                               # c'est le régime réel.
 
     def __post_init__(self):
-        if self.variant in ("r3",) + INJECT_VARIANTS:
+        if self.variant in ("r3",) + INJECT_VARIANTS or \
+                self.code in GROUP_CODES:
             # R3 : la banque VIT dans l'espace d'embedding — pas de projection.
             # R4 : pas de banque du tout, mais les tokens injectés vivent eux
             # aussi dans l'espace d'embedding.
+            # CODES DE GROUPES (phase 10) : la banque est la matrice PLATE
+            # (max_mem·group_rows, d) de la spec §2.4 — ses lignes sont des
+            # vecteurs de pleine largeur, quel que soit le read qui la lit.
             self.mem_dim = self.d_model
         if not self.x_dim:
             self.x_dim = self.d_model
@@ -471,10 +572,15 @@ class ToyCfg:
             # pointer nu : c'est la définition de r3, on ne les porte pas
             # ailleurs (r0/r1/r2 restent le contrôle de la phase 1). r4 les
             # consomme autrement (injection), il est admis pour `toprows`.
-            assert self.variant in ("r3",) + INJECT_VARIANTS, (
+            assert self.variant in ("r3",) + INJECT_VARIANTS or (
+                self.variant == "r0" and self.code in GROUP_CODES), (
                 f"--code {self.code} n'est supporté QUE par --variant r3 "
-                f"(banque en espace d'embedding + pointer nu) ; reçu "
-                f"--variant {self.variant}. Phase 1 = --code mean.")
+                f"(banque en espace d'embedding + pointer nu), les variantes "
+                f"d'injection {INJECT_VARIANTS}, et — phase 10 — r0 sur les "
+                f"codes de GROUPES (spec §2.4(b) : le hypernet fast-weight "
+                f"applique une transformation par LIGNE de la matrice plate, "
+                f"donc mem_dim = d et M = max_mem·group_rows sous-slots) ; "
+                f"reçu --variant {self.variant}. Phase 1 = --code mean.")
             assert self.mem_dim == self.d_model
             assert self.n_pos >= 1
             if self.code in SEG_CODES:
@@ -505,6 +611,44 @@ class ToyCfg:
             assert self.pos_offset < npos, (
                 f"pos_offset {self.pos_offset} >= n_pos {npos} : TOUTES les "
                 f"positions wrappent sur l'identité")
+        # ── phase 10 : prélèvement, âge, conditionnement ────────────────────
+        assert self.read_path in READ_PATHS, (
+            f"read_path inconnu {self.read_path!r} (∈ {READ_PATHS})")
+        if self.read_path != "entry":
+            assert self.variant in INJECT_VARIANTS, (
+                f"read_path {self.read_path!r} décrit OÙ entrent les lignes "
+                f"INJECTÉES : il exige une variante {INJECT_VARIANTS} (reçu "
+                f"--variant {self.variant})")
+        assert 0.0 < self.hid_tap <= 1.0, (
+            f"hid_tap est une FRACTION de profondeur ∈ ]0, 1] "
+            f"({self.hid_tap!r})")
+        assert self.cond_arm in COND_ARMS, (
+            f"cond_arm inconnu {self.cond_arm!r} (∈ {COND_ARMS})")
+        assert self.cond_decoys >= 0, self.cond_decoys
+        if self.age_rope:
+            assert self.variant in INJECT_VARIANTS or \
+                self.code in GROUP_CODES, (
+                f"code.age_rope rote les LIGNES par l'âge de leur slot : il "
+                f"exige soit une variante d'injection {INJECT_VARIANTS}, soit "
+                f"un code de GROUPES lu depuis la banque {GROUP_CODES} (reçu "
+                f"--variant {self.variant} --code {self.code}) — ailleurs il "
+                f"serait silencieusement ignoré")
+        if self.cond:
+            assert self.variant in ("r0", "r3") + INJECT_VARIANTS, (
+                f"--cond exige un bras qui LIT la banque de groupes : r0 "
+                f"(fast-weight séquentiel), r3 (cross-attn + readout) ou "
+                f"{INJECT_VARIANTS} (injection) ; reçu --variant "
+                f"{self.variant}")
+            assert self.code in GROUP_CODES, (
+                f"--cond exige --code ∈ {GROUP_CODES} (reçu {self.code})")
+            assert self.write_mode == "fact", (
+                "--cond est un régime fact-only (le seg de RÈGLE est le seul "
+                "porteur qu'il faut retenir)")
+        if self.cond_arm != "true":
+            assert self.cond and self.variant in INJECT_VARIANTS, (
+                f"cond_arm {self.cond_arm!r} pilote ce que l'INJECTION dépose "
+                f"à l'entraînement : il exige --cond et une variante "
+                f"{INJECT_VARIANTS}")
         # ── write_mode ─────────────────────────────────────────────────────
         assert self.write_mode in WRITE_MODES, (
             f"write inconnu {self.write_mode!r} (∈ {WRITE_MODES})")
@@ -534,6 +678,23 @@ class ToyCfg:
         group_rows, un groupe court casserait le layout (cf. toprows_rows).
         """
         return 1 + self.top_k
+
+    @property
+    def hid_tap_layers(self) -> int:
+        """Blocs traversés avant le prélèvement de la ligne (`midhid`).
+
+        `tophid` prélève APRÈS `norm_f` (donc après les n_layers blocs ET la
+        norme finale) ; `midhid` s'arrête à hid_tap_layers blocs, dans le flux
+        RÉSIDUEL brut. hid_tap = 1.0 donne n_layers blocs SANS norm_f : c'est
+        le contrôle qui sépare « la profondeur » de « la norme finale ».
+        """
+        return max(1, min(self.n_layers, int(round(self.hid_tap
+                                                   * self.n_layers))))
+
+    @property
+    def cond_groups(self) -> int:
+        """Groupes injectés devant un tour conditionné (règle + leurres)."""
+        return 1 + self.cond_decoys
 
     @property
     def pools_segment(self) -> bool:
@@ -671,10 +832,21 @@ class CausalSelfAttn(nn.Module):
         self.o = nn.Linear(d, d, bias=False)
         self.theta = cfg.rope_theta
 
-    def forward(self, x, pos=None):
+    def forward(self, x, pos=None, mem=None, mem_mask=None):
         """`pos` [T] : index RoPE EXPLICITES. None = 0..T−1 (chemin par défaut,
         bit-à-bit inchangé). La variante r4 s'en sert pour laisser un TROU de
-        position entre le préfixe injecté et le tour réel."""
+        position entre le préfixe injecté et le tour réel.
+
+        `mem` [B, S, d] (PHASE 10, `read_path='kv'`) : des LIGNES DE BANQUE
+        appondues directement aux K et V de cette couche, SANS ré-encodage —
+        pas de W_k, pas de W_v, pas de RoPE. La ligne est simplement découpée
+        en n_heads morceaux de d_head, exactement comme un état de token le
+        serait après projection. C'est la lecture β de la spec §2.4 : la banque
+        entre là où l'attention la consomme, pas par l'entrée du stack.
+        Le masque devient EXPLICITE (les S colonnes de mémoire sont visibles de
+        TOUTES les positions, la partie T×T reste triangulaire) : `is_causal`
+        ne sait pas exprimer « préfixe non causal + suffixe causal ».
+        """
         B, T, d = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.h, self.dh).transpose(1, 2)
@@ -689,7 +861,21 @@ class CausalSelfAttn(nn.Module):
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         # right-pad uniquement : une query non-pad n'attend que des clés non-pad
         # (causalité) ⇒ le masque causal suffit, pas de key-padding mask.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if mem is None:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            return self.o(y.transpose(1, 2).reshape(B, T, d))
+        S = mem.shape[1]
+        km = mem.to(q.dtype).view(B, S, self.h, self.dh).transpose(1, 2)
+        k = torch.cat([km, k], dim=2)
+        v = torch.cat([km, v], dim=2)          # K ET V sont LA MÊME ligne
+        am = torch.ones(T, S + T, dtype=torch.bool, device=x.device)
+        am[:, S:] = torch.ones(T, T, dtype=torch.bool,
+                               device=x.device).tril()
+        am = am[None, None].expand(B, 1, T, S + T)
+        if mem_mask is not None:
+            am = am.clone()
+            am[..., :S] &= mem_mask[:, None, None, :].to(torch.bool)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
         return self.o(y.transpose(1, 2).reshape(B, T, d))
 
 
@@ -1083,8 +1269,14 @@ class ToyBlock(nn.Module):
             elif cfg.uses_xattn:
                 self.read = CrossAttnRead(cfg, project_v=(cfg.variant != "r3"))
 
-    def forward(self, x, bank, bank_mask, pos=None):
-        x = x + self.attn(self.n1(x), pos)
+    def forward(self, x, bank, bank_mask, pos=None, mem=None, mem_mask=None):
+        # `mem` n'entre QUE dans les couches LECTRICES (`read_layers`) : la
+        # lecture β partage exactement le même budget de couches que les reads
+        # appris de r0/r1/r3, sinon la comparaison porterait aussi sur « à
+        # combien d'étages la banque parle ».
+        x = x + self.attn(self.n1(x), pos,
+                          mem if self.read_bank else None,
+                          mem_mask if self.read_bank else None)
         if self.read is not None and bank is not None and bank.size(1) > 0:
             x = self.read(x, bank, bank_mask)
         x = x + self.mlp(self.n2(x))
@@ -1244,6 +1436,17 @@ class ToyReadLM(nn.Module):
             assert sif_w.numel() == cfg.vocab_size, (sif_w.numel(),
                                                      cfg.vocab_size)
             self.register_buffer("sif_w", sif_w.float().clone())
+        # ── phase 10 : table de rotation par ÂGE ────────────────────────────
+        # Même binding DFT que `phase` (base ≤ 0 ⇒ θ_i = 2π·(i mod n)/n), mais
+        # indexé sur l'âge EN WRITES du slot (0 = write le plus récent). Elle
+        # ne s'applique QU'AUX LIGNES INJECTÉES et ne touche jamais la banque
+        # stockée : la matrice plate (max_mem·m, d) reste telle quelle, la
+        # rotation est posée au moment où on l'aplatit dans le préfixe.
+        # Buffers créés seulement si age_rope ⇒ state_dict inchangé sinon.
+        if cfg.age_rope:
+            c, s = phase_tables(max(cfg.max_mem, 1), cfg.d_model, cfg.rope_base)
+            self.register_buffer("age_cos", c)                 # [max_mem, d/2]
+            self.register_buffer("age_sin", s)
 
     # ── write ORACLE ────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -1464,8 +1667,21 @@ class ToyReadLM(nn.Module):
         tour que le forward vient déjà de calculer.
         """
         st = seg_tok.to(self.embed.weight.device).reshape(1, -1)
-        _, h = self.forward(st, bank=None, bank_mask=None, return_hidden=True)
-        return h[0].float().detach()
+        if self.cfg.code != "midhid":
+            _, h = self.forward(st, bank=None, bank_mask=None,
+                                return_hidden=True)
+            return h[0].float().detach()
+        # ── phase 10 (`midhid`) : on s'arrête à hid_tap_layers blocs ────────
+        # Le flux résiduel BRUT, avant `norm_f` : c'est là que vivent les
+        # « conclusions » du segment, avant la rotation vocabulaire que le
+        # tying impose au dernier étage. Les trois lignes ci-dessous sont
+        # EXACTEMENT le préambule de `forward` sans banque ni injection (x =
+        # embed(ids) puis la boucle de blocs) — le self-test 21b le vérifie
+        # contre `forward(..., return_hidden=True)` à hid_tap = 1.0.
+        x = self.embed(st)
+        for blk in self.blocks[:self.cfg.hid_tap_layers]:
+            x = blk(x, None, None, None)
+        return x[0].float().detach()
 
     @torch.no_grad()
     def toprows_sel_fixed(self, seg_tok: torch.Tensor) -> torch.Tensor:
@@ -1602,7 +1818,7 @@ class ToyReadLM(nn.Module):
 
     # ── forward ─────────────────────────────────────────────────────────────
     def forward(self, ids, bank=None, bank_mask=None, inject=None,
-                return_hidden=False):
+                return_hidden=False, inject_age=None, bank_age=None):
         """`inject` [B, k] (UN groupe, r4) ou [B, G, k] (G groupes, r5) : les
         tokens des groupes toprows injectés en PRÉFIXE de pseudo-tokens.
 
@@ -1626,6 +1842,18 @@ class ToyReadLM(nn.Module):
         x = self.embed(ids)
         pos = None
         npre = 0
+        mem = None
+        if self.cfg.age_rope and bank_age is not None and bank is not None \
+                and bank.size(1) > 0:
+            # PHASE 10, pendant BANQUE de la rotation d'âge : la matrice plate
+            # (max_mem·m, d) est rotée ligne à ligne AVANT que le moindre read
+            # ne la touche — fast-weight, cross-attn et readout voient tous la
+            # MÊME banque rotée. La banque STOCKÉE, elle, n'est jamais modifiée
+            # (invariant : le write est oracle et immuable).
+            ag = bank_age.to(bank.device).long().clamp(
+                0, self.age_cos.shape[0] - 1)                  # [B,M]
+            bank = rot_pairs(bank, self.age_cos[ag].to(bank.dtype),
+                             self.age_sin[ag].to(bank.dtype))
         if inject is not None:
             assert self.cfg.variant in INJECT_VARIANTS, self.cfg.variant
             B, T = ids.shape
@@ -1638,17 +1866,43 @@ class ToyReadLM(nn.Module):
             inj = inject if inject.dim() == want else inject.unsqueeze(1)
             G, k = inj.shape[1], inj.shape[2]
             pre = ((inj.to(x.dtype) * self.hid_scale) if hid
-                   else self.embed(inj)) + self.inject_type   # [B,G,k,d]
-            sep = self.embed(torch.full((B, G, 1), int(self.cfg.inject_sep_id),
-                                        dtype=torch.long, device=ids.device))
-            # [groupe0 | sép | groupe1 | sép | …] puis le tour, un cran plus loin
-            x = torch.cat([torch.cat([pre, sep], dim=2).reshape(B, G * (k + 1),
-                                                               -1), x], dim=1)
-            npre = G * (k + 1)
-            pos = torch.cat([torch.arange(npre, device=ids.device),
-                             torch.arange(T, device=ids.device) + npre + 1])
+                   else self.embed(inj))                      # [B,G,k,d]
+            if self.cfg.age_rope and inject_age is not None:
+                # ROTATION-PUIS-APLATISSEMENT : chaque ligne du groupe g est
+                # tournée de rot(θ·âge_g) AVANT d'être posée à plat dans le
+                # préfixe. Toutes les lignes d'un groupe partagent l'âge de
+                # leur slot (c'est une propriété du SLOT, pas de la ligne), et
+                # la rotation est appliquée AVANT le vecteur de type — le type
+                # dit « je suis une ligne de banque », l'âge dit « d'où je
+                # viens » : les deux ne doivent pas se mélanger.
+                ag = inject_age.to(ids.device).long().clamp_(
+                    0, self.age_cos.shape[0] - 1)              # [B,G]
+                ac = self.age_cos[ag].to(pre.dtype)[:, :, None]   # [B,G,1,d/2]
+                asn = self.age_sin[ag].to(pre.dtype)[:, :, None]
+                pre = rot_pairs(pre, ac, asn)
+            pre = pre + self.inject_type                      # [B,G,k,d]
+            if self.cfg.read_path == "kv":
+                # ── LECTURE β : VUE PLATE + ATTENTION ───────────────────────
+                # Pas de préfixe, pas de séparateur, pas de position RoPE : le
+                # tenseur (G, k, d) est simplement APLATI en (G·k, d) et posé
+                # aux K/V des couches lectrices. L'ordre des lignes n'a plus
+                # aucune conséquence géométrique — ce qui porte la provenance,
+                # c'est la rotation d'âge, et rien d'autre.
+                mem = pre.reshape(B, G * k, -1)
+            else:
+                sep = self.embed(torch.full((B, G, 1),
+                                            int(self.cfg.inject_sep_id),
+                                            dtype=torch.long,
+                                            device=ids.device))
+                # [groupe0 | sép | groupe1 | sép | …] puis le tour, un cran plus
+                # loin
+                x = torch.cat([torch.cat([pre, sep], dim=2).reshape(
+                    B, G * (k + 1), -1), x], dim=1)
+                npre = G * (k + 1)
+                pos = torch.cat([torch.arange(npre, device=ids.device),
+                                 torch.arange(T, device=ids.device) + npre + 1])
         for blk in self.blocks:
-            x = blk(x, bank, bank_mask, pos)
+            x = blk(x, bank, bank_mask, pos, mem)
         if npre:
             x = x[:, npre:]                    # seul le TOUR RÉEL sort
         x = self.norm_f(x)
@@ -1676,12 +1930,13 @@ class ToyReadLM(nn.Module):
     # ── décodage greedy (sans cache : préfixes courts) ──────────────────────
     @torch.no_grad()
     def greedy(self, prefix, bank, bank_mask, max_new: int, stop_id: int,
-               inject=None):
+               inject=None, inject_age=None, bank_age=None):
         ids = prefix
         out = []
         for _ in range(max_new):
             lg = self.forward(ids[:, -self.cfg.max_seq_len:], bank, bank_mask,
-                              inject=inject)
+                              inject=inject, inject_age=inject_age,
+                              bank_age=bank_age)
             nxt = int(lg[0, -1].argmax())
             if nxt == stop_id:
                 break
@@ -1716,6 +1971,170 @@ def param_report(model: ToyReadLM) -> dict:
 
 
 # ── environnement : replay de conversations + write oracle ───────────────────
+
+# ── phase 10 : la tâche de CONDITIONNEMENT (règle en banque) ────────────────
+#
+# LA QUESTION. La phase 9 a mesuré la CITATION depuis des lignes d'états cachés
+# injectées (0.434 from-scratch contre 0.708 pour l'embedding natif). Ce que
+# personne n'a mesuré, c'est le CONDITIONNEMENT : des lignes d'états cachés
+# injectées comme pseudo-tokens modulent-elles la DISTRIBUTION du modèle sans
+# qu'il ait rien à citer ? C'est le test « une seule lecture, tout par le
+# préfixe » de la spec §2.4 — s'il passe, le fast-weight read devient optionnel
+# et la banque est une modalité au sens plein.
+#
+# LE DESIGN. Une vie-règle énonce UNE fois, tôt, une consigne de REGISTRE
+# (« garde chaque réponse dans le registre {v} ») ; le seg de règle est le seg
+# porteur, donc c'est LUI que le write oracle met en banque. Du filler pousse
+# la règle hors de la fenêtre — et comme le labo forwarde SEG PAR SEG, la
+# fenêtre du tour conditionné ne contient RIEN d'autre que le tour lui-même :
+# la règle ne peut venir que de la banque. Les tours conditionnés posent
+# ensuite une question quelconque et la réponse est rendue DANS le registre :
+# même corps de phrase pour tous les registres, seuls changent un MARQUEUR
+# d'ouverture et un marqueur de clôture.
+#
+# POURQUOI CE N'EST PAS DE LA CITATION. Le nom du registre n'apparaît JAMAIS
+# dans la réponse. Le seul chemin de la banque à la loss passe par la
+# distribution sur deux mots de template. Un modèle qui « copie » la ligne ne
+# gagne rien ; un modèle qui la LIT gagne les marqueurs.
+#
+# LA MESURE. Paires contrastives : nll(réponse rendue dans le registre VRAI)
+# contre nll(la MÊME réponse, même corps, même sujet, rendue dans un AUTRE
+# registre). Le Δ ne peut venir que de la banque. Comme chaque registre est
+# tiré uniformément et son concurrent aussi, la difficulté intrinsèque des
+# gabarits se compense en espérance sur le jeu — et la borne basse `none`
+# (aucune mémoire) mesure ce qu'il en reste.
+COND_RULE_SLOT = "color"      # slot d'ACCUEIL de la règle : ses valeurs ont
+                              # déjà un id dans `fact_id_maps()`, donc le write
+                              # oracle et `pack_key[slot, attr]` marchent sans
+                              # toucher aux maps d'identité (invariant du labo :
+                              # une seule source, persona_chat_data).
+COND_REGISTERS = ("crimson", "turquoise", "vermilion", "chartreuse")
+# La clé du groupe est `pack_key[color, 0]` — IDENTIQUE pour les quatre
+# registres. L'identité du registre ne vit donc QUE dans les lignes de contenu
+# (les états cachés du seg de règle) : c'est bien le canal testé, pas la clé.
+COND_MARK = {                 # (marqueur d'OUVERTURE, marqueur de CLÔTURE)
+    "crimson":    ("Absolutely", "Cheers"),
+    "turquoise":  ("Indeed", "Regards"),
+    "vermilion":  ("Certainly", "Thanks"),
+    "chartreuse": ("Naturally", "Onward"),
+}
+COND_RULE_TMPL = [
+    "Style note: for this session, keep every reply in the {v} register.",
+    # ASCII STRICT : le self-test hermétique tokenise 1 char = 1 ord() sur un
+    # vocab de 512, un tiret cadratin (8212) le ferait sortir de la table.
+    "One request: from here on, answer me in the {v} register please.",
+    "Let us switch registers: use the {v} register for the rest of this chat.",
+]
+COND_Q_TMPL = ["Tell me about {c}.", "What do you make of {c}?",
+               "Say something about {c}, would you?"]
+# corps de réponse PARTAGÉ par les quatre registres : à index j fixé, deux
+# registres produisent exactement la même phrase entre les deux marqueurs.
+COND_TOPICS = ["gardening", "pottery", "birdwatching", "sailing", "baking",
+               "astronomy", "cycling", "knitting", "origami", "geology",
+               "beekeeping", "fencing", "calligraphy", "kayaking", "botany"]
+COND_BODY = [
+    "{c} is worth a little of our time.",
+    "Let us look at {c} together.",
+    "{c} comes up rather often around here.",
+    "There is plenty to say about {c}.",
+    "{c} makes for a good topic today.",
+]
+
+
+class PersonaRuleStream(PersonaChatStream):
+    """PersonaChatStream + un troisième genre de conv : la VIE-RÈGLE.
+
+    Les vies de rappel restent dans le flux telles quelles : la citation de la
+    phase 9 (`evaluate`) continue d'être mesurée sur le MÊME run que le
+    conditionnement (`evaluate_cond`). Le seul ajout est `p_rule`.
+
+    Les valeurs de registre sont RETIRÉES du pool `color` : sans ça le même mot
+    serait tantôt une règle de style, tantôt une valeur à citer, et les deux
+    canaux se contamineraient.
+
+    `cond_decoys` faits LEURRES (slots ≠ color) accompagnent la règle et sont
+    écrits eux aussi : le préfixe injecté fait 1 + cond_decoys groupes, l'ordre
+    des writes est tiré au sort, donc la règle n'est pas toujours la plus
+    récente — c'est ce qui donne au code d'ÂGE (`code.age_rope`) quelque chose
+    à coder, et au modèle quelque chose à sélectionner.
+    """
+
+    def __init__(self, tok, *, p_rule: float = 0.35, cond_decoys: int = 1,
+                 cond_fillers: tuple = (2, 5), **kw) -> None:
+        super().__init__(tok, **kw)
+        self.p_rule = float(p_rule)
+        self.cond_decoys = int(cond_decoys)
+        self.cond_fillers = tuple(int(v) for v in cond_fillers)
+        assert 0.0 <= self.p_rule <= 1.0, self.p_rule
+        if COND_RULE_SLOT in self.slots:
+            st, qs, ans, upd, pool = self.slots[COND_RULE_SLOT]
+            sub = [v for v in pool if v not in COND_REGISTERS]
+            if len(sub) >= 4:
+                self.slots[COND_RULE_SLOT] = (st, qs, ans, upd, sub)
+            else:                      # sous-pool trop maigre : slot retiré
+                del self.slots[COND_RULE_SLOT]
+
+    # ── pièces ──────────────────────────────────────────────────────────────
+    def cond_answer(self, reg: str, j: int, topic: str) -> dict:
+        """Réponse conditionnée + `cond_mask` sur les DEUX marqueurs.
+
+        `cond_mask` isole les seuls tokens que le registre décide : le Δnll
+        restreint à ce masque est la mesure NETTE (le corps de phrase, lui, est
+        identique entre les deux membres de la paire et ne fait que diluer).
+        """
+        pre, suf = COND_MARK[reg]
+        seg = self._assistant(f"{pre}. {COND_BODY[j].format(c=topic)} {suf}.")
+        ids = seg["input_ids"][0].tolist()
+        m = torch.zeros(len(ids))
+        for w in (pre, suf):
+            sp = self._val_span(ids, w)
+            if sp is not None:
+                m[sp[0]:sp[1]] = 1.0
+        seg["cond_mask"] = m.unsqueeze(0)
+        return seg
+
+    def _conv_rule(self) -> dict:
+        reg = self.rng.choice(COND_REGISTERS)
+        rule = self._user_valued(self.rng.choice(COND_RULE_TMPL).format(v=reg),
+                                 reg, slot=COND_RULE_SLOT)
+        writes = [rule]
+        used_slots, used_vals = {COND_RULE_SLOT}, {reg}
+        for _ in range(self.cond_decoys):
+            f = self._sample_fact(used_slots, used_vals)
+            used_slots.add(f["slot"])
+            used_vals.add(f["v"])
+            writes.append(self._user_valued(
+                self.rng.choice(f["st"]).format(v=f["v"], p=f["p"]), f["v"],
+                slot=f["slot"], p=f["p"]))
+        self.rng.shuffle(writes)
+        rule_at = next(i for i, s in enumerate(writes) if s is rule)
+        segs = list(writes)
+        for _ in range(self.rng.randint(*self.cond_fillers)):
+            segs += self._filler_pair()
+        turns, alts = [], []
+        for _ in range(self.rng.randint(*self.n_queries)):
+            topic = self.rng.choice(COND_TOPICS)
+            j = self.rng.randrange(len(COND_BODY))
+            alt = self.rng.choice([r for r in COND_REGISTERS if r != reg])
+            segs.append(self._user(self.rng.choice(COND_Q_TMPL).format(c=topic)))
+            segs.append(self.cond_answer(reg, j, topic))
+            turns.append(len(segs) - 1)
+            alts.append(self.cond_answer(alt, j, topic))
+        return {"kind": "rule", "segs": segs,
+                # `truths` VIDE : `evaluate` (la citation) saute ces convs,
+                # elles ne polluent aucune métrique de la phase 9.
+                "info": {"truths": [], "queries": [], "ages": [],
+                         "cond": {"reg": reg, "rule_at": rule_at,
+                                  "turns": turns, "alts": alts}}}
+
+    def next_conv(self) -> dict:
+        r = self.rng.random()
+        if r < self.p_smalltalk:
+            return self._conv_smalltalk()
+        if r < self.p_smalltalk + self.p_rule:
+            return self._conv_rule()
+        return self._conv_recall()
+
 
 class GroupBank(list):
     """Banque du format `toprows` : une LISTE DE LIGNES qui se souvient de ses
@@ -1846,6 +2265,47 @@ class OracleEnv:
                if e["gidx"] is not None}
         return out, sum(1 for e in plan.values() if e["gidx"] is None)
 
+    def cond_plan(self, model: ToyReadLM, conv: dict) -> dict:
+        """PHASE 10 — {index du seg de RÉPONSE conditionnée → (lignes, âges)}.
+
+        `lignes` : [G, top_k, d] pour les codes d'états cachés (`tophid`/
+        `midhid`), [G, top_k] d'ID pour `toprows` — exactement les tenseurs que
+        `ToyReadLM.forward` sait poser en préfixe multi-groupes.
+        `âges` : [G] long, l'âge EN WRITES de chaque groupe (0 = le write le
+        plus récent). C'est ce que `code.age_rope` rote.
+
+        G est CONSTANT sur un run (1 + cfg.cond_decoys, cf. PersonaRuleStream),
+        ce qui permet d'empiler les plans d'un lot sans regrouper par taille.
+        Aucune sélection ici : TOUS les groupes résidents sont injectés, la
+        règle parmi les leurres. Le bras ne s'offre donc AUCUN privilège de
+        retrieval — l'oracle ne fait que rejouer le FIFO.
+
+        Rend {} pour toute conv qui n'est pas une vie-règle : le chemin des
+        phases 6-9 n'est pas touché.
+        """
+        cond = (conv.get("info") or {}).get("cond")
+        if not cond:
+            return {}
+        turns = set(cond["turns"])
+        hid = model.cfg.code in HID_CODES
+        out, fifo, w = {}, [], 0
+        for i, seg in enumerate(conv["segs"]):
+            if i in turns and fifo:
+                # âge 0 = le write LE PLUS RÉCENT (w−1), pas « zéro write
+                # écoulé » : la table de rotation est indexée par le RANG de
+                # récence, l'identité rot(0) revenant au plus frais.
+                out[i] = (torch.stack([r for r, _ in fifo]),
+                          torch.tensor([w - 1 - t for _, t in fifo],
+                                       dtype=torch.long))
+            f = self.fact_of(seg)
+            if f is not None:
+                st = self.seg_tokens(seg)
+                fifo.append(((model.tophid_rows_fixed(st) if hid
+                              else model.toprows_sel_fixed(st)), w))
+                w += 1
+                fifo = fifo[-self.max_mem:]
+        return out
+
     def retr_plan(self, model: ToyReadLM, conv: dict) -> dict:
         """L'ÉTAT DE BANQUE vu par chaque segment de RÉPONSE gradé.
 
@@ -1931,6 +2391,38 @@ def pad_bank(banks: list, device, dtype=torch.float32):
             out[i, :len(b)] = torch.stack(b).to(device=device, dtype=dtype)
             msk[i, :len(b)] = True
     return out, msk
+
+
+def pad_bank_age(banks: list, device, group_rows: int = 1):
+    """[B, M] long — l'ÂGE EN WRITES de la ligne m de la lane b.
+
+    PHASE 10, pendant côté BANQUE de `cond_plan` : 0 = le write le PLUS
+    RÉCENT, 1 = celui d'avant, etc. Toutes les lignes d'un même groupe
+    partagent l'âge de leur slot (c'est une propriété du slot, pas de la
+    ligne). Les lignes de PADDING prennent l'âge 0 — elles sont déjà inertes
+    par le masque, la valeur n'a aucun effet.
+
+    `GroupBank.groups` porte les tailles réelles ; une banque ordinaire (une
+    ligne par write) retombe sur group_rows = 1 sans cas particulier.
+    """
+    M = max((len(b) for b in banks), default=0)
+    out = torch.zeros(len(banks), max(M, 1), dtype=torch.long, device=device)
+    for i, b in enumerate(banks):
+        sizes = list(getattr(b, "groups", [group_rows] * (len(b) // max(
+            group_rows, 1)))) or []
+        ng = len(sizes)
+        pos = 0
+        for g, sz in enumerate(sizes):
+            out[i, pos:pos + sz] = ng - 1 - g
+            pos += sz
+    return out
+
+
+def bank_ages_for(model, banks: list, device):
+    """[B, M] des âges, ou None si le bras ne rote rien (chemin par défaut)."""
+    if not model.cfg.age_rope:
+        return None
+    return pad_bank_age(banks, device, model.cfg.group_rows)
 
 
 def pad_segs(segs: list, device, max_len: int):
@@ -2043,6 +2535,30 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
     plans = ([{i: e["res"][e["gidx"]][2] for i, e in p.items()
                if e["gidx"] is not None} for p in rplans] if r5
              else [env.inject_plan(model, c)[0] for c in convs] if r4 else None)
+    # ── PHASE 10 : les tours CONDITIONNÉS reçoivent leur préfixe ────────────
+    # `cond_plan` rend {} sur toute conv qui n'est pas une vie-règle, donc les
+    # runs des phases 6-9 ne voient RIEN de plus. `ages` voyage à côté des
+    # lignes (c'est lui que `code.age_rope` rote au moment de l'aplatissement).
+    ages: list = [{} for _ in convs]
+    if r4 and cfg.cond:
+        cps = [env.cond_plan(model, c) for c in convs]
+        if cfg.cond_arm == "shuffle":
+            # CONTRÔLE BANQUE MÉLANGÉE, version ENTRAÎNEMENT : la vie i reçoit
+            # le préfixe de la vie i+1 du lot. Les registres sont tirés
+            # indépendamment, donc le préfixe est faux ~3 fois sur 4 et ne
+            # porte JAMAIS d'information sur la règle de la vie courante.
+            cps = [cps[(i + 1) % len(cps)] for i in range(len(cps))]
+        if cfg.cond_arm != "none":
+            for i, cp in enumerate(cps):
+                for jj, (rows, ag) in cp.items():
+                    # `shuffle` peut proposer un index de seg que la vie i n'a
+                    # pas : on ne pose un préfixe QUE sur ses propres tours.
+                    if jj in (conv_turns := set(
+                            ((convs[i].get("info") or {}).get("cond")
+                             or {}).get("turns") or [])):
+                        plans[i][jj] = rows
+                        ages[i][jj] = ag
+                    del conv_turns
     # normalisation de la CE auxiliaire : une MOYENNE sur les réponses
     # supervisées du pas, pour qu'elle ne dépende pas du nombre de segs (la
     # loss LM est elle aussi normalisée par le total de tokens du pas).
@@ -2082,8 +2598,17 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
             if rest:
                 subsets.append((rest, False))
         elif r4:
-            subsets = [([i for i in lanes if j in plans[i]], True),
-                       ([i for i in lanes if j not in plans[i]], False)]
+            # Un forward exige un préfixe UNIFORME. Sans la phase 10 tous les
+            # plans font top_k et le regroupement rend EXACTEMENT les deux
+            # sous-lots historiques ; avec elle, les tours conditionnés
+            # apportent des plans [G, k(, d)] qui doivent voyager à part.
+            byshape: dict = {}
+            for i in lanes:
+                pj = plans[i].get(j)
+                if pj is not None:
+                    byshape.setdefault(tuple(pj.shape), []).append(i)
+            subsets = [(v, True) for _, v in sorted(byshape.items())]
+            subsets.append(([i for i in lanes if j not in plans[i]], False))
         else:
             subsets = [(lanes, False)]
         for sub, has_inj in subsets:
@@ -2103,10 +2628,19 @@ def train_step(model, env, convs, device, max_len, amp, scale_by):
             elif has_inj:
                 # toutes de MÊME longueur (top_k) : cf. toprows_sel_fixed
                 inj = torch.stack([plans[i][j] for i in sub]).to(device)
-            bank, bmask = pad_bank([banks[i] for i in sub], device)
+            # PHASE 10 : les âges du préfixe voyagent AVEC le sous-lot. Ils
+            # n'existent que pour les tours conditionnés (les réponses de
+            # rappel des ph.7-9 n'ont pas d'âge ⇒ None ⇒ chemin inchangé).
+            iage = None
+            if has_inj and all(j in ages[i] for i in sub):
+                iage = torch.stack([ages[i][j] for i in sub]).to(device)
+            sub_banks = [banks[i] for i in sub]
+            bank, bmask = pad_bank(sub_banks, device)
+            bage = bank_ages_for(model, sub_banks, device)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
                                 enabled=amp):
-                logits = model(X, bank, bmask, inject=inj)
+                logits = model(X, bank, bmask, inject=inj, inject_age=iage,
+                               bank_age=bage)
             s, n = seg_ce(logits, X, W)
             obj = s / total_w * scale_by if float(n) > 0 else None
             if obj is not None and ent_c > 0 and \
@@ -2200,6 +2734,7 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
             X = seg["input_ids"][:, :max_len].to(device)
             W = seg["loss_mask"][:, :max_len].to(device)
             b, bm = pad_bank([bank], device)
+            bage = bank_ages_for(model, [bank], device)
             if i in graded:
                 inj = None
                 sel_ok = None
@@ -2241,7 +2776,7 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                         inj = tk[None].to(device)
                 with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
                                     enabled=amp):
-                    lg_live = model(X, b, bm, inject=inj)
+                    lg_live = model(X, b, bm, inject=inj, bank_age=bage)
                     lg_abl = model(X, None, None)
                 sl, nl = seg_ce(lg_live, X, W)
                 sa, _ = seg_ce(lg_abl, X, W)
@@ -2258,7 +2793,7 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
                     abl_txt = tok.decode(model.greedy(a_open, None, None,
                                                       max_new, stop_id))
                 live = tok.decode(model.greedy(a_open, b, bm, max_new, stop_id,
-                                               inject=inj))
+                                               inject=inj, bank_age=bage))
                 tr = truths[qi] if qi < len(truths) else "?"
                 live_ans.append(live)
                 abl_ans.append(abl_txt)
@@ -2350,7 +2885,248 @@ def evaluate(model, env, stream, seed, n_convs, device, tok, a_open, stop_id,
     return out
 
 
+@torch.no_grad()
+def evaluate_cond(model, env, stream, seed, n_convs, device, max_len, amp):
+    """PHASE 10 — le Δnll CONTRASTIF de conditionnement, en 3 lectures.
+
+    Pour chaque tour conditionné on tient DEUX rendus de la même réponse (même
+    corps, même sujet, même index de gabarit) : celui du registre VRAI et celui
+    d'un AUTRE registre. On mesure nll(incohérent) − nll(cohérent) sous trois
+    conditions de lecture, sur le MÊME modèle :
+
+      live  la banque / le préfixe de CETTE vie          (le bras)
+      shuf  ceux d'une AUTRE vie, de registre DIFFÉRENT  (contrôle d'artefact)
+      none  aucune mémoire                               (borne basse)
+
+    Un Δ positif en `live` qui S'EFFONDRE en `shuf` et en `none` est la seule
+    signature qui prouve que le conditionnement passe PAR LA BANQUE. Un Δ
+    positif partout mesurerait la difficulté intrinsèque des gabarits ; un Δ
+    positif en `shuf` mesurerait une fuite du harnais.
+
+    Deux échelles, toujours rendues ensemble :
+      `dnll`  moyenne PAR TOKEN supervisé (dilué : le corps de phrase est
+              identique entre les deux membres de la paire, il ne peut que
+              rapprocher les deux nll)
+      `mark`  restreint aux tokens de MARQUEUR (`cond_mask`) — les seuls que
+              le registre décide. C'est la mesure NETTE.
+      `acc`   2AFC : fraction des tours où nll(cohérent) < nll(incohérent) sur
+              les marqueurs. Hasard = 0.500, lisible sans échelle.
+    """
+    model.eval()
+    inj_arm = model.cfg.variant in INJECT_VARIANTS
+    stream.rng = random.Random(seed)
+    items: list = []
+    guard = 0
+    while len({id(x["conv"]) for x in items}) < n_convs and \
+            guard < n_convs * 20:
+        guard += 1
+        conv = stream.next_conv()
+        cond = (conv.get("info") or {}).get("cond")
+        if not cond:
+            continue
+        cplan = env.cond_plan(model, conv) if inj_arm else {}
+        bank: list = []
+        turns = {t: q for q, t in enumerate(cond["turns"])}
+        for i, seg in enumerate(conv["segs"]):
+            q = turns.get(i)
+            if q is not None:
+                st = (("inj",) + cplan.get(i, (None, None)) if inj_arm
+                      else ("bank", list(bank)))
+                items.append({"conv": conv, "reg": cond["reg"], "state": st,
+                              "coh": seg, "inc": cond["alts"][q]})
+            if not inj_arm:
+                bank = env.write(model, bank, seg)
+    # ── appariement du contrôle MÉLANGÉ ────────────────────────────────────
+    # Chaque item emprunte l'état d'un item de REGISTRE DIFFÉRENT (le premier
+    # qui suit cycliquement). Un état de même registre ne serait pas un
+    # contrôle : il porterait la bonne règle.
+    shuf = []
+    n = len(items)
+    for i in range(n):
+        j = next((k % n for k in range(i + 1, i + n)
+                  if items[k % n]["reg"] != items[i]["reg"]), None)
+        shuf.append(None if j is None else items[j]["state"])
+
+    def _read(state):
+        """(bank, bank_mask, inject, inject_age, bank_age) d'un état de
+        lecture."""
+        if state is None or state[0] is None:
+            return None, None, None, None, None
+        if state[0] == "bank":
+            b, bm = pad_bank([state[1]], device)
+            return b, bm, None, None, bank_ages_for(model, [state[1]], device)
+        rows, ages = state[1], state[2]
+        if rows is None:
+            return None, None, None, None, None
+        return None, None, rows[None].to(device), ages[None].to(device), None
+
+    def _nll(seg, state):
+        b, bm, inj, ag, bag = _read(state)
+        X = seg["input_ids"][:, :max_len].to(device)
+        W = seg["loss_mask"][:, :max_len].to(device)
+        Mk = seg["cond_mask"][:, :max_len].to(device) * (W > 0).float()
+        with torch.autocast(device.split(":")[0], dtype=torch.bfloat16,
+                            enabled=amp):
+            lg = model(X, b, bm, inject=inj, inject_age=ag, bank_age=bag)
+        s_all, w_all = seg_ce(lg, X, W)
+        s_mk, w_mk = seg_ce(lg, X, Mk)
+        return (float(s_all), float(w_all), float(s_mk), float(w_mk))
+
+    acc: dict = {}
+    for cond_name in ("live", "shuf", "none"):
+        num = den = mnum = mden = 0.0
+        hit = tot = 0
+        for i, it in enumerate(items):
+            st = (it["state"] if cond_name == "live"
+                  else shuf[i] if cond_name == "shuf" else None)
+            if cond_name == "shuf" and st is None:
+                continue
+            ca, cw, cm, cmw = _nll(it["coh"], st)
+            ia, iw, im, imw = _nll(it["inc"], st)
+            if cw > 0 and iw > 0:
+                num += ia / iw - ca / cw
+                den += 1.0
+            if cmw > 0 and imw > 0:
+                mnum += im / imw - cm / cmw
+                mden += 1.0
+                hit += int(cm / cmw < im / imw)
+                tot += 1
+        acc[f"dnll_{cond_name}"] = num / den if den else float("nan")
+        acc[f"mark_{cond_name}"] = mnum / mden if mden else float("nan")
+        acc[f"acc_{cond_name}"] = hit / tot if tot else float("nan")
+    acc["n"] = len(items)
+    acc["n_convs"] = len({id(x["conv"]) for x in items})
+    model.train()
+    return acc
+
+
 # ── nom de run (⇒ save_dir) ──────────────────────────────────────────────────
+
+# ── PHASE 10 : nommage DÉTERMINISTE de la grille §2.4 ────────────────────────
+# Un combo = un dossier, et le NOM du dossier se relit comme le combo. C'est ce
+# qui rend les 36 runs agrégeables sans grepper un seul log.
+GRID_READ = {("r0", "entry"): "seqfw",     ("r3", "entry"): "bankxattn",
+             ("r4", "entry"): "injentry",  ("r4", "kv"): "kvappend",
+             ("r5", "entry"): "r5entry",   ("r5", "kv"): "r5kv"}
+GRID_TAP = {"toprows": "native", "tophid": "postnorm", "midhid": "mid",
+            "mean": "pooled"}
+
+
+def grid_name(cfg: ToyCfg) -> str:
+    """`read-<mode>_rot-<on|off>_tap-<prov>_m<k>` (+ suffixe de bras).
+
+    Le seed n'entre PAS dans le nom : la grille tourne à seed FIXE, un run par
+    combo. Un balayage de graine, s'il vient, ajoutera son propre suffixe.
+    """
+    name = (f"read-{GRID_READ.get((cfg.variant, cfg.read_path), cfg.variant)}"
+            f"_rot-{'on' if cfg.age_rope else 'off'}"
+            f"_tap-{GRID_TAP.get(cfg.code, cfg.code)}"
+            f"_m{cfg.top_k}")
+    if cfg.cond_arm != ToyCfg.cond_arm:
+        name += f"_arm-{cfg.cond_arm}"
+    if cfg.cond_decoys != ToyCfg.cond_decoys:
+        name += f"_dec{cfg.cond_decoys}"
+    if cfg.write_mode != ToyCfg.write_mode:
+        name += f"_w{cfg.write_mode}"
+    return name
+
+
+def grid_combos(reads=("seq_fw", "inject_entry", "kv_append"),
+                rots=(False, True), taps=("postnorm", "mid"),
+                ms=(1, 4, 8)) -> list:
+    """La GRILLE COMPLÈTE, en clair. Un dict par combo, dans un ordre stable."""
+    out = []
+    for rd in reads:
+        for tp in taps:
+            for m in ms:
+                for rot in rots:
+                    out.append({"read": rd, "age_rot": bool(rot), "tap": tp,
+                                "m": int(m)})
+    return out
+
+
+def _grid_cfg(combo: dict, base: dict) -> ToyCfg:
+    v, c, rp = READ_MODES[combo["read"]]
+    code = {"native": "toprows", "postnorm": "tophid",
+            "mid": "midhid"}[combo["tap"]] if c is None else c
+    return ToyCfg(**{**base, "variant": v, "code": code, "read_path": rp,
+                     "age_rope": combo["age_rot"], "top_k": int(combo["m"]),
+                     "cond": True})
+
+
+def print_grid_manifest(config: str, base: dict, save_root: str,
+                        fmt: str = "tsv", b_convs: int = 8) -> None:
+    """Le MANIFESTE : une ligne par combo, commande exacte + coût estimé.
+
+    Colonnes : run | read | rot | tap | m | lignes_lues | commande | note.
+    `lignes_lues` = ce que le bras traverse VRAIMENT par forward — c'est le
+    seul proxy honnête du coût, et il n'a pas la même unité selon le chemin :
+      seq_fw     M = max_mem·(1+m) sous-slots, en boucle SÉQUENTIELLE et PAR
+                 COUCHE : le coût est LINÉAIRE en M et il domine tout le reste.
+      injentry   G·(1+m)+G positions de préfixe AJOUTÉES à la séquence :
+                 l'attention est quadratique dessus.
+      kvappend   G·m clés/valeurs de plus, sur les couches lectrices seulement,
+                 sans allonger la séquence des queries.
+    """
+    rows = []
+    for combo in grid_combos():
+        cfg = _grid_cfg(combo, base)
+        m = combo["m"]
+        G = cfg.cond_groups
+        if cfg.variant == "r0":
+            load = cfg.max_mem * cfg.group_rows
+            unit = "sous-slots seq"
+        elif cfg.read_path == "kv":
+            load = G * m
+            unit = "K/V add."
+        else:
+            load = G * (m + 1)
+            unit = "pos. préfixe"
+        cmd = (f"python -m deepseek_v4_mini.toy_read_lab {config} --cond "
+               f"--read {combo['read']} --tap {combo['tap']} --m {m}"
+               + (" --age-rot" if combo["age_rot"] else ""))
+        # COÛT : mesuré, pas deviné. `params` vient de param_report aux dims
+        # de la config ; `rel` est le rapport de temps par pas RELEVÉ sur CPU à
+        # dims RÉELLES (d512/L6, batch_convs=2, 2 pas) — c'est le RATIO entre
+        # bras qui transfère au GPU, pas la seconde absolue.
+        mod = ToyReadLM(cfg, 11, 12, sif_w=(torch.ones(cfg.vocab_size)
+                                            if cfg.code in SIF_CODES else None))
+        pr = param_report(mod)
+        del mod
+        # états AdamW fp32 (poids + grad + 2 moments) = 16 octets par paramètre
+        opt_go = pr["total"] * 16 / 2 ** 30
+        # terme DOMINANT d'activation : les logits [batch, T, V] en fp32, et
+        # leur gradient. C'est lui qui décide, pas les poids.
+        act_go = (b_convs * cfg.max_seq_len * cfg.vocab_size * 4 * 3) / 2 ** 30
+        vram = opt_go + act_go
+        rel = {"seq_fw": 2.0, "inject_entry": 1.0, "kv_append": 1.07}[
+            combo["read"]] * (1.0 + 0.03 * (m - 1))
+        note = ("boucle fast-weight de %d itérations × %d couches : le bras "
+                "LENT (×2.0 relevé)" % (load, cfg.n_layers)
+                if combo["read"] == "seq_fw" else "")
+        if vram > 8.0:
+            note = (note + " | ⚠️ NE TIENT PAS EN 8 Go "
+                    f"({vram:.1f} Go estimés) — à lancer ailleurs, PAS à "
+                    f"raboter en silence").strip(" |")
+        rows.append({"run": grid_name(cfg), "read": combo["read"],
+                     "rot": "on" if combo["age_rot"] else "off",
+                     "tap": combo["tap"], "m": m,
+                     "load": f"{load} {unit}",
+                     "params_M": f"{pr['total']/1e6:.1f}",
+                     "vram_Go_est": f"{vram:.2f}",
+                     "cout_rel": f"{rel:.2f}",
+                     "save_dir": os.path.join(save_root, grid_name(cfg)),
+                     "cmd": cmd, "note": note})
+    if fmt == "json":
+        import json
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    cols = ["run", "read", "rot", "tap", "m", "load", "params_M",
+            "vram_Go_est", "cout_rel", "save_dir", "cmd", "note"]
+    print("\t".join(cols))
+    for r in rows:
+        print("\t".join(str(r[c]) for c in cols))
+
 
 def run_name_for(cfg: ToyCfg) -> str:
     """Nom de dossier d'un run. INVARIANT : deux configs qui n'entraînent PAS
@@ -2367,6 +3143,9 @@ def run_name_for(cfg: ToyCfg) -> str:
     à UN groupe injecté, donc tout entraînement à plusieurs groupes doit sortir
     ailleurs, y compris quand c'est devenu le défaut.
     """
+    if cfg.cond:
+        # PHASE 10 : le dossier se relit comme le combo de la grille §2.4.
+        return grid_name(cfg)
     name = cfg.variant if cfg.code == "mean" else f"{cfg.variant}_{cfg.code}"
     if cfg.pos_offset:
         name += f"_o{cfg.pos_offset}"
@@ -2394,6 +3173,19 @@ def run_name_for(cfg: ToyCfg) -> str:
             name += "_nodetach"
     if cfg.write_mode == "every":
         name += "_wev"
+    # ── phase 10 : chaque axe de la grille §2.4 entre dans le nom ───────────
+    if cfg.read_path != ToyCfg.read_path:
+        name += f"_{cfg.read_path}"
+    if cfg.age_rope:
+        name += "_age"
+    if cfg.code == "midhid" and cfg.hid_tap != ToyCfg.hid_tap:
+        name += f"_tap{cfg.hid_tap:g}"
+    if cfg.cond:
+        name += "_cond"
+        if cfg.cond_arm != ToyCfg.cond_arm:
+            name += f"_{cfg.cond_arm}"
+        if cfg.cond_decoys != ToyCfg.cond_decoys:
+            name += f"_dec{cfg.cond_decoys}"
     return name
 
 
@@ -2408,8 +3200,16 @@ def build_tokenizer(name):
     return tok
 
 
-def persona_kwargs(raw, split, smoke):
+def persona_kwargs(raw, split, smoke, cond: bool = False):
     gen = dict((raw.get("persona") or {}).get("gen") or {})
+    if cond:
+        # kwargs PROPRES à PersonaRuleStream (bloc `cond:` du YAML). Ils ne
+        # sont ajoutés QUE si la phase 10 est active : PersonaChatStream ne les
+        # connaît pas et lèverait.
+        gen.update((raw.get("cond") or {}).get("gen") or {})
+    else:
+        for k in ("p_rule", "cond_decoys", "cond_fillers"):
+            gen.pop(k, None)
     # Le toy n'utilise PAS surp_w : garder surprisal_mode ne ferait que payer
     # une passe de 300 convs pour construire la table unigram, par instance.
     gen.pop("surprisal_mode", None)
@@ -2469,6 +3269,53 @@ def main(argv=None):
                     dest="final_eval_convs",
                     help="surcharge training.final_eval_convs (passe d'éval "
                          "élargie en fin de run ; 0 = désactivée)")
+    # ── PHASE 10 : les quatre axes de la grille de la spec §2.4 ─────────────
+    ap.add_argument("--read", choices=tuple(READ_MODES), default=None,
+                    help="CHEMIN DE LECTURE (axe 1) : seq_fw = fast-weight "
+                         "séquentiel (r0, impose --code mean — confond de "
+                         "format DÉCLARÉ) ; bank_xattn = lecture apprise sur "
+                         "la MÊME banque de groupes (r3) ; inject_entry = "
+                         "pseudo-tokens en préfixe (r4, lecture α) ; "
+                         "kv_append = lignes appondues aux K/V des couches "
+                         "lectrices, sans ré-encodage (lecture β). Surcharge "
+                         "--variant et code.read_path.")
+    ap.add_argument("--age-rot", action="store_true", dest="age_rot",
+                    help="AXE 2 : rote chaque ligne injectée par l'ÂGE en "
+                         "writes de son slot (binding DFT, table max_mem). "
+                         "Élémentaire, aucune matmul dédiée.")
+    ap.add_argument("--tap", choices=("native", "postnorm", "mid"),
+                    default=None,
+                    help="AXE 3 — PROVENANCE de la ligne : native = "
+                         "embedding d'entrée (--code toprows, ph.6-8) ; "
+                         "postnorm = état après norm_f (--code tophid, ph.9) ; "
+                         "mid = état à code.hid_tap de profondeur (--code "
+                         "midhid, défaut 2/3). Surcharge --code.")
+    ap.add_argument("--m", type=int, default=None, dest="m_rows",
+                    help="AXE 4 : LIGNES par write (alias de --top-k / "
+                         "code.top_k). C'est le cadran de budget de la spec "
+                         "§2.4 une fois la largeur fixée à d_model.")
+    ap.add_argument("--cond", action="store_true",
+                    help="PHASE 10 : ajoute les vies-RÈGLE au flux et l'éval "
+                         "CONTRASTIVE de conditionnement (les vies de rappel "
+                         "restent, donc la citation de la ph.9 est mesurée sur "
+                         "le même run)")
+    ap.add_argument("--cond-arm", choices=COND_ARMS, default=None,
+                    dest="cond_arm",
+                    help="ce que l'injection dépose À L'ENTRAÎNEMENT devant un "
+                         "tour conditionné : true (défaut) | shuffle (banque "
+                         "MÉLANGÉE, from-scratch) | none (BORNE BASSE)")
+    ap.add_argument("--cond-decoys", type=int, default=None,
+                    dest="cond_decoys",
+                    help="faits LEURRES plantés à côté de la règle (le préfixe "
+                         "fait 1+d groupes). 0 ⇒ tous les âges valent 0 et "
+                         "--age-rot devient un no-op mesurable.")
+    ap.add_argument("--cond-eval-convs", type=int, default=None,
+                    dest="cond_eval_convs",
+                    help="vies-règle gradées par passe d'éval contrastive")
+    ap.add_argument("--manifest", choices=("tsv", "json"), default=None,
+                    help="n'entraîne RIEN : imprime le MANIFESTE de la grille "
+                         "§2.4 (36 combos, commande exacte, save_dir et coût "
+                         "estimé par combo) et sort. Exige la config.")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -2480,11 +3327,29 @@ def main(argv=None):
         return
 
     assert a.config, "config YAML requise (ou --selftest)"
-    if a.code != "mean" and a.variant not in ("r3",) + INJECT_VARIANTS:
+    # ── PHASE 10 : les axes-raccourcis se traduisent AVANT toute validation ─
+    read_path = "entry"
+    if a.tap is not None:
+        a.code = {"native": "toprows", "postnorm": "tophid",
+                  "mid": "midhid"}[a.tap]
+    if a.read is not None:
+        v, c, read_path = READ_MODES[a.read]
+        a.variant = v
+        if c is not None:
+            a.code = c
+        elif a.tap is None and a.code == "mean":
+            # un chemin de lecture sans provenance explicite : le défaut de la
+            # grille est la provenance de la phase 9 (post-norm_f).
+            a.code = "tophid"
+    if a.code != "mean" and a.variant not in ("r3",) + INJECT_VARIANTS and \
+            not (a.variant == "r0" and a.code in GROUP_CODES):
         raise SystemExit(
             f"--code {a.code} n'est supporté QUE par --variant r3 (banque en "
-            f"espace d'embedding + pointer nu). Les variantes r0/r1/r2 sont le "
-            f"contrôle de la phase 1 : lance-les sans --code (mean).")
+            f"espace d'embedding + pointer nu), les variantes d'injection "
+            f"{INJECT_VARIANTS}, et — phase 10 — r0 sur les codes de GROUPES "
+            f"({GROUP_CODES}, la matrice plate lue ligne à ligne par le "
+            f"fast-weight, spec §2.4(b)). r1/r2 restent le contrôle de la "
+            f"phase 1 : lance-les sans --code (mean).")
     raw = load_yaml(a.config)              # le toy parse son YAML lui-même :
     t = dict(raw.get("training") or {})    # PAS de cfg_schema (trainer principal)
     mc = dict(raw.get("model") or {})
@@ -2522,6 +3387,31 @@ def main(argv=None):
         mc["retr_train_order"] = a.retr_train_order
     if "pos_entropy" in cb:
         mc["pos_entropy"] = float(cb["pos_entropy"])
+    # ── PHASE 10 : knobs YAML puis surcharges CLI ──────────────────────────
+    for key, cast in (("hid_tap", float), ("age_rope", bool),
+                      ("read_path", str), ("cond_arm", str),
+                      ("cond_decoys", int)):
+        if key in cb:
+            mc[key] = cast(cb[key])
+    if a.read is not None:
+        mc["read_path"] = read_path
+    if a.age_rot:
+        mc["age_rope"] = True
+    if a.m_rows is not None:
+        mc["top_k"] = int(a.m_rows)
+    if a.cond_arm is not None:
+        mc["cond_arm"] = a.cond_arm
+    if a.cond_decoys is not None:
+        mc["cond_decoys"] = int(a.cond_decoys)
+    mc["cond"] = bool(a.cond)
+    if a.manifest:
+        print_grid_manifest(
+            a.config, {k: v for k, v in mc.items()
+                       if k not in ("variant", "code", "read_path", "age_rope",
+                                    "top_k", "cond")},
+            t.get("save_dir", "./checkpoints/toy_read_lab"), a.manifest,
+            b_convs=int(t.get("batch_convs", 8)))
+        return
     if a.readout_mix is not None:          # la CLI gagne sur le YAML
         mc["readout_mix"] = a.readout_mix
     if a.pos_offset is not None:           # la CLI gagne sur le YAML
@@ -2542,9 +3432,14 @@ def main(argv=None):
     # éval FINALE élargie (0 = désactivée) : le juge du run, cf. plus bas.
     final_eval_convs = int(a.final_eval_convs if a.final_eval_convs is not None
                            else t.get("final_eval_convs", 200))
+    # PHASE 10 : vies-règle gradées par passe contrastive (pas de décodage
+    # greedy là-dedans — que des forwards teacher-forcés, donc c'est bon marché)
+    cond_eval_convs = int(a.cond_eval_convs if a.cond_eval_convs is not None
+                          else t.get("cond_eval_convs", 32))
     if a.smoke:
         mc.update(d_model=64, n_layers=2, n_heads=4, mem_dim=64, x_dim=0)
         steps, b_convs, eval_every, eval_convs, max_new = 2, 2, 1, 1, 8
+        cond_eval_convs = 2
 
     torch.manual_seed(int(t.get("seed", 0)))
     tok = build_tokenizer(raw["tokenizer"])
@@ -2561,12 +3456,17 @@ def main(argv=None):
         # contenu.
         mc["inject_sep_id"] = int(tok.convert_tokens_to_ids("<blank>"))
     cfg = ToyCfg(**mc)
-    P = chat_stream_class("persona")
+    # PHASE 10 : le stream gagne un troisième genre de conv, il ne perd rien.
+    P = PersonaRuleStream if cfg.cond else chat_stream_class("persona")
+
+    def pk(split, **over):
+        return {**persona_kwargs(raw, split, a.smoke, cond=cfg.cond), **over}
+
     sif_w = None
     if cfg.code in SIF_CODES:
         # table SIF sur le split TRAIN (la vue du write). Le stream
         # d'entraînement reste surp OFF : le SIF n'entre QUE dans le code.
-        sif_w = sif_weight_table(P, tok, persona_kwargs(raw, "train", a.smoke),
+        sif_w = sif_weight_table(P, tok, pk("train"),
                                  cfg.vocab_size, cfg.sif_a,
                                  seed=int(t.get("seed", 0)))
     model = ToyReadLM(cfg, env.n_slots, env.n_attrs, sif_w=sif_w).to(device)
@@ -2700,6 +3600,37 @@ def main(argv=None):
               f"donc aucun token hybride fabricable)"
               + (f" | pénalité d'entropie sur p : {cfg.pos_entropy:g}"
                  if cfg.pos_entropy else ""), flush=True)
+    if cfg.cond or cfg.age_rope or cfg.read_path != "entry" or \
+            cfg.code == "midhid":
+        print(f"  PHASE 10 — grille §2.4 : lecture "
+              + {("r0", "entry"): "seq_fw (fast-weight séquentiel, banque mean "
+                                  "— CONFOND de format déclaré)",
+                 ("r3", "entry"): "bank_xattn (cross-attn contenu + "
+                                  "GroupReadout sur la banque de groupes)",
+                 ("r4", "entry"): "inject_entry (pseudo-tokens en PRÉFIXE, α)",
+                 ("r5", "entry"): "inject_entry + retriever appris",
+                 ("r4", "kv"): "kv_append (lignes aux K/V des couches "
+                               "lectrices, SANS ré-encodage ni RoPE, β)",
+                 ("r5", "kv"): "kv_append + retriever appris",
+                 }.get((cfg.variant, cfg.read_path), cfg.read_path)
+              + f" | provenance "
+              + {"toprows": "native (embedding d'entrée)",
+                 "tophid": "postnorm (état après norm_f)",
+                 "midhid": f"mid ({cfg.hid_tap_layers}/{cfg.n_layers} blocs, "
+                           f"hid_tap {cfg.hid_tap:.3f}, AVANT norm_f)",
+                 }.get(cfg.code, cfg.code)
+              + f" | m = {cfg.top_k} ligne(s)/write | âge "
+              + ("ROTÉ (DFT sur max_mem rangs de récence)" if cfg.age_rope
+                 else "non codé"), flush=True)
+    if cfg.cond:
+        print(f"  CONDITIONNEMENT : {len(COND_REGISTERS)} registres "
+              f"(clé de groupe IDENTIQUE pour tous ⇒ l'identité du registre "
+              f"ne vit QUE dans les lignes de contenu), {cfg.cond_decoys} "
+              f"leurre(s) ⇒ {cfg.cond_groups} groupes injectés, bras "
+              f"d'entraînement `{cfg.cond_arm}`. Éval contrastive : "
+              f"{cond_eval_convs} vies par palier, 3 lectures "
+              f"(live / shuf / none). La règle n'est JAMAIS citable : son nom "
+              f"n'apparaît dans aucune réponse.", flush=True)
     print(f"  éval FINALE élargie : {final_eval_convs} convs "
           + ("(désactivée)" if final_eval_convs <= 0 else
              "en fin de run → final_metrics.csv (les paliers restent à "
@@ -2722,10 +3653,16 @@ def main(argv=None):
     max_len = int(cfg.max_seq_len)
     clip = float(t.get("grad_clip", 1.0))
 
-    tr_stream = P(tok, seed=int(t.get("seed", 0)),
-                  **persona_kwargs(raw, "train", a.smoke))
-    ev_stream = P(tok, seed=1234, **persona_kwargs(raw, "eval", a.smoke))
-    tc_stream = P(tok, seed=4321, **persona_kwargs(raw, "train", a.smoke))
+    tr_stream = P(tok, seed=int(t.get("seed", 0)), **pk("train"))
+    ev_stream = P(tok, seed=1234, **pk("eval"))
+    tc_stream = P(tok, seed=4321, **pk("train"))
+    # PHASE 10 : deux streams DÉDIÉS à l'éval contrastive (p_rule = 1.0 : on ne
+    # paie pas de convs qu'`evaluate_cond` jetterait). Instances SÉPARÉES de
+    # ev_stream/tc_stream, qui se font resemer par `evaluate`.
+    cv_stream = (P(tok, seed=2468, **pk("eval", p_rule=1.0, p_smalltalk=0.0))
+                 if cfg.cond else None)
+    ct_stream = (P(tok, seed=8642, **pk("train", p_rule=1.0, p_smalltalk=0.0))
+                 if cfg.cond else None)
 
     a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
                           dtype=torch.long, device=device).unsqueeze(0)
@@ -2766,6 +3703,23 @@ def main(argv=None):
                   f"(n={ev['n']}) | TRAIN grade live {tc['grade_live']:.3f} "
                   f"abl {tc['grade_abl']:.3f} Δnll {tc['dnll']:+.4f} "
                   f"(n={tc['n']})", flush=True)
+            cd = ct = None
+            if cfg.cond:
+                # ── PHASE 10 : Δnll CONTRASTIF, trois lectures ─────────────
+                cd = evaluate_cond(model, env, cv_stream, 2468,
+                                   cond_eval_convs, device, max_len, amp)
+                ct = evaluate_cond(model, env, ct_stream, 8642,
+                                   cond_eval_convs, device, max_len, amp)
+                print(f"    COND held-out (n={cd['n']} tours / "
+                      f"{cd['n_convs']} vies) Δnll marqueurs "
+                      f"live {cd['mark_live']:+.4f} shuf {cd['mark_shuf']:+.4f} "
+                      f"none {cd['mark_none']:+.4f} | 2AFC "
+                      f"{cd['acc_live']:.3f}/{cd['acc_shuf']:.3f}/"
+                      f"{cd['acc_none']:.3f} | Δnll tous tokens "
+                      f"{cd['dnll_live']:+.4f}/{cd['dnll_shuf']:+.4f}/"
+                      f"{cd['dnll_none']:+.4f}  || TRAIN marqueurs "
+                      f"{ct['mark_live']:+.4f}/{ct['mark_shuf']:+.4f}/"
+                      f"{ct['mark_none']:+.4f}", flush=True)
             print("    strates held-out : " + "  ".join(
                 f"{g} {ev['grade_' + g]:.3f} (n={ev['n_' + g]})"
                 for g in GROUPS) + f"  | porte pointer σ {ev['ptr_gate']:.4f}",
@@ -2811,6 +3765,13 @@ def main(argv=None):
                                # de HEAD.
                                + (["age_writes", "age_evicted"]
                                   if cfg.write_mode == "every" else [])
+                               # colonnes de la PHASE 10 seulement sous --cond :
+                               # le CSV des phases 1-9 reste octet-à-octet.
+                               + ([f"cond_{p}_{c}" for p in
+                                   ("mark", "dnll", "acc")
+                                   for c in ("live", "shuf", "none")]
+                                  + ["cond_n", "cond_mark_live_train"]
+                                  if cfg.cond else [])
                                + ["ptr_gate", "sec"])
                     new_csv = False
 
@@ -2825,6 +3786,11 @@ def main(argv=None):
                                ev[f"n_{g}"])]
                            + ([_f(ev["age_writes"]), _f(ev["age_evicted"])]
                               if cfg.write_mode == "every" else [])
+                           + ([_f(cd[f"{p}_{c}"]) for p in
+                               ("mark", "dnll", "acc")
+                               for c in ("live", "shuf", "none")]
+                              + [cd["n"], _f(ct["mark_live"])]
+                              if cfg.cond else [])
                            + [_f(ev["ptr_gate"]), f"{time.time()-t0:.0f}"])
             if ev["grade_live"] > best:
                 best = ev["grade_live"]
@@ -2839,6 +3805,7 @@ def main(argv=None):
     # [0.07, 0.65]) — INADJUDICABLE. Une seule passe élargie en fin de run met
     # l'erreur-type sous 0.03 pour un coût payé UNE fois. Même fonction, même
     # stream held-out, même graine : seul n_convs change.
+    fv = fc = None
     if final_eval_convs > 0:
         fv = evaluate(model, env, ev_stream, 1234, final_eval_convs, device,
                       tok, a_open, stop_id, max_new, max_len, amp, n_show=0)
@@ -2892,6 +3859,75 @@ def main(argv=None):
                           (_g(fv[f"grade_{g}"]), _g(fv[f"grade_{g}_abl"]),
                            fv[f"n_{g}"])] + [_g(fv["ptr_gate"])])
         print(f"  [final] écrit {fp}", flush=True)
+    # ── PHASE 10 : ÉVAL CONTRASTIVE FINALE ÉLARGIE ─────────────────────────
+    if cfg.cond and final_eval_convs > 0:
+        fc = evaluate_cond(model, env, cv_stream, 2468, final_eval_convs,
+                           device, max_len, amp)
+        print(f"  [final] COND ({fc['n_convs']} vies, {fc['n']} tours) — Δnll "
+              f"MARQUEURS live {fc['mark_live']:+.4f} | shuf "
+              f"{fc['mark_shuf']:+.4f} | none {fc['mark_none']:+.4f} ; 2AFC "
+              f"{fc['acc_live']:.3f} / {fc['acc_shuf']:.3f} / "
+              f"{fc['acc_none']:.3f} (hasard 0.500) ; Δnll tous tokens "
+              f"{fc['dnll_live']:+.4f} / {fc['dnll_shuf']:+.4f} / "
+              f"{fc['dnll_none']:+.4f}", flush=True)
+        print("    LECTURE DU VERDICT : live ≫ shuf ≈ none ⇒ le "
+              "conditionnement passe PAR LA BANQUE (barreau 1 de l'échelle "
+              "§2.4 franchi) ; live ≈ shuf ⇒ la sonde mesure un artefact ; "
+              "live ≈ none ⇒ l'injection ne conditionne pas.", flush=True)
+        fcp = os.path.join(save_dir, "cond_metrics.csv")
+        with open(fcp, "w", newline="") as f:
+            w = csv.writer(f)
+            cols = [f"{p}_{c}" for p in ("mark", "dnll", "acc")
+                    for c in ("live", "shuf", "none")] + ["n", "n_convs"]
+            w.writerow(cols)
+            w.writerow([f"{fc[c]:.5f}" if fc[c] == fc[c] else "" for c in
+                        cols[:-2]] + [fc["n"], fc["n_convs"]])
+        print(f"  [final] écrit {fcp}", flush=True)
+    # ── RÉSULTAT PARSABLE : UN json par run, agrégeable sans grep ───────────
+    # Il porte le COMBO (les quatre axes en clair) et les DEUX métriques du
+    # run : conditionnement contrastif (avec ses contrôles shuf/none) et
+    # citation (avec son bras ablaté). Écrit même si l'éval finale est coupée.
+    import json
+    res = {
+        "run": run_name, "save_dir": save_dir, "steps": steps,
+        "seed": int(t.get("seed", 0)), "device": device,
+        "combo": {"read": next((k for k, v in READ_MODES.items()
+                                if v[0] == cfg.variant
+                                and v[2] == cfg.read_path), cfg.variant),
+                  "age_rot": bool(cfg.age_rope),
+                  "tap": GRID_TAP.get(cfg.code, cfg.code),
+                  "m": cfg.top_k, "cond_arm": cfg.cond_arm,
+                  "cond_decoys": cfg.cond_decoys,
+                  "hid_tap_layers": cfg.hid_tap_layers,
+                  "d_model": cfg.d_model, "n_layers": cfg.n_layers,
+                  "max_mem": cfg.max_mem},
+        "citation": ({"grade_live": fv["grade_live"],
+                      "grade_abl": fv["grade_abl"], "dnll": fv["dnll"],
+                      "grade_resident": fv["grade_resident"],
+                      "n": fv["n"], "n_convs": final_eval_convs,
+                      "strates": {g: fv[f"grade_{g}"] for g in GROUPS}}
+                     if final_eval_convs > 0 else None),
+        # Le CONDITIONNEMENT et ses DEUX contrôles, à plat : `live` est le
+        # bras, `shuf` la banque MÉLANGÉE, `none` la borne SANS MÉMOIRE.
+        "conditioning": (dict(fc) if cfg.cond and final_eval_convs > 0
+                         else None),
+    }
+    def _clean(o):
+        # NaN n'est PAS du JSON valide : une strate vide sort en `null`, pas en
+        # un littéral que le moindre parseur strict refuserait. C'est le point
+        # du fichier — être agrégeable sans précaution.
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_clean(v) for v in o]
+        if isinstance(o, float) and o != o:
+            return None
+        return o
+
+    rp = os.path.join(save_dir, "results.json")
+    with open(rp, "w") as f:
+        json.dump(_clean(res), f, indent=2, ensure_ascii=False, default=float)
+    print(f"  écrit {rp} (résultat AGRÉGEABLE du combo)", flush=True)
     print(f"done — best grade held-out {best:.3f} | ckpt {save_dir}", flush=True)
 
 
@@ -3256,9 +4292,14 @@ def _selftest() -> None:
         assert torch.equal(x, y), "FIFO rows : mauvaises lignes conservées"
 
     # 10. r0/r1/r2 REFUSENT les nouveaux formats (message clair)
+    #     ⚠️ PHASE 10 : `toprows`/`tophid`/`midhid` sortent de cette liste pour
+    #     r0 SEULEMENT — la banque de GROUPES est la matrice plate de la spec
+    #     §2.4(b), que le hypernet fast-weight lit ligne à ligne (c'est le bras
+    #     `--read seq_fw` de la grille). r1/r2 les refusent toujours, et r0 les
+    #     refuse toujours pour tous les autres formats.
     for var in ("r0", "r1", "r2"):
         for code in ("phase", "segmean", "segphase", "segsif", "pack",
-                     "segpack", "toprows"):
+                     "segpack") + (() if var == "r0" else GROUP_CODES):
             try:
                 ToyCfg(vocab_size=512, d_model=32, n_heads=4, mem_dim=32,
                        variant=var, code=code, n_pos=4, seg_n_pos=8)
@@ -4300,6 +5341,200 @@ def _selftest() -> None:
     # (top_k=3 ≠ défaut ⇒ suffixe _k3, cf. le sweep de k : c'est voulu)
     assert run_name_for(m_i9.cfg) == "r4_tophid_k3", run_name_for(m_i9.cfg)
 
+    # ═══ PHASE 10 : provenance mi-tardive, âge roté, lecture β, règle ═══════
+    # 21a. `midhid` : MÊME sélection, MÊME clé, MÊME layout que tophid/toprows —
+    #      seul le vecteur normé change, et il change bien (l'A/B est isolé).
+    K10 = 5
+    m_mh = _mk("midhid", d=512, top_k=K10)
+    assert torch.equal(m_mh.toprows_sel_idx(seg20), m_th9.toprows_sel_idx(seg20))
+    g_mh = m_mh.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
+    assert g_mh.shape == g_th.shape and torch.equal(g_mh[0], g_th[0]), \
+        "midhid doit partager la CLÉ de tophid (l'A/B ne porte que le contenu)"
+    assert not torch.equal(g_mh[1:], g_th[1:]), \
+        "midhid ≡ tophid : le prélèvement n'a pas bougé"
+    r = g_mh[1:].pow(2).mean(-1).sqrt()
+    assert float((r - 1.0).abs().max()) < 1e-4, float(r.max())
+    # 21b. le TAP est le bon étage : à hid_tap = 1.0 (n_layers blocs, AVANT
+    #      norm_f) `seg_hidden` doit valoir la reconstruction explicite, et il
+    #      doit DIFFÉRER de l'étage post-norm_f (sinon norm_f serait l'identité
+    #      et tout le débat de la spec §2.4 serait vide).
+    c_full = ToyCfg(vocab_size=512, d_model=64, n_layers=3, n_heads=4,
+                    mem_dim=64, variant="r3", max_seq_len=64, code="midhid",
+                    seg_n_pos=8, sif_a=A_SIF, top_k=3, hid_tap=1.0)
+    m_full = ToyReadLM(c_full, env.n_slots, env.n_attrs,
+                       sif_w=_sifw(512)).eval()
+    assert m_full.cfg.hid_tap_layers == 3, m_full.cfg.hid_tap_layers
+    with torch.no_grad():
+        xx = m_full.embed(seg20.reshape(1, -1))
+        for blk in m_full.blocks:
+            xx = blk(xx, None, None, None)
+        h_pre = xx[0].float()
+        _, h_post = m_full.forward(seg20.reshape(1, -1), None, None,
+                                   return_hidden=True)
+    assert torch.allclose(m_full.seg_hidden(seg20), h_pre, atol=1e-5)
+    assert not torch.allclose(h_pre, h_post[0].float(), atol=1e-3), \
+        "pré-norm_f ≡ post-norm_f : le tap ne mesurerait rien"
+    for tp, exp in ((2.0 / 3.0, 2), (0.34, 1), (0.5, 2)):
+        assert ToyCfg(d_model=64, n_layers=3, n_heads=4, mem_dim=64,
+                      variant="r3", code="midhid", hid_tap=tp,
+                      sif_a=A_SIF).hid_tap_layers == exp, tp
+    # 21c. ROTATION PAR ÂGE : buffers absents par défaut, âge 0 = IDENTITÉ,
+    #      âges distincts ⇒ préfixes distincts, et rien ne bouge sans `ages`.
+    def _mk_inj(**kw):
+        # MÊME graine pour tous : les bras de la grille §2.4 doivent partager
+        # leurs poids d'init, sinon un A/B mesurerait un tirage.
+        torch.manual_seed(90210)
+        c = ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, variant="r4", max_seq_len=64, code="tophid",
+                   top_k=3, seg_n_pos=8, sif_a=A_SIF, inject_sep_id=5,
+                   max_mem=8, **kw)
+        return ToyReadLM(c, env.n_slots, env.n_attrs, sif_w=_sifw(512)).eval()
+
+    m_noage, m_age = _mk_inj(), _mk_inj(age_rope=True)
+    assert not hasattr(m_noage, "age_cos") and hasattr(m_age, "age_cos")
+    rows10 = m_age.tophid_rows_fixed(seg20)[None, None].expand(1, 2, 3, 64)
+    ids10 = torch.tensor([[5, 6, 7]])
+    z2 = torch.zeros(1, 2, dtype=torch.long)
+    with torch.no_grad():
+        o_none = m_age(ids10, None, None, inject=rows10)
+        o_zero = m_age(ids10, None, None, inject=rows10, inject_age=z2)
+        o_mix = m_age(ids10, None, None, inject=rows10,
+                      inject_age=torch.tensor([[0, 1]]))
+        o_off = m_noage(ids10, None, None, inject=rows10,
+                        inject_age=torch.tensor([[0, 1]]))
+        o_offn = m_noage(ids10, None, None, inject=rows10)
+    assert torch.equal(o_none, o_zero), "âge 0 doit être rot(0) = IDENTITÉ"
+    assert not torch.equal(o_zero, o_mix), "des âges distincts doivent séparer"
+    assert torch.equal(o_off, o_offn), \
+        "age_rope OFF : `inject_age` doit être IGNORÉ (rétro-compat)"
+    # 21c-bis. PENDANT BANQUE de la rotation d'âge (bras seq_fw / bank_xattn) :
+    #      `pad_bank_age` rend le RANG DE RÉCENCE par ligne (toutes les lignes
+    #      d'un groupe partagent l'âge de leur slot), et la rotation change
+    #      bien le forward — mesuré PORTE OUVERTE, puisque toutes les portes de
+    #      read du labo sont fermées à l'init (convention de la phase 1).
+    m_bk = _mk("tophid", d=64, top_k=3, vocab=512, seg_n_pos=8)
+    m_bk.cfg.age_rope = True
+    c_, s_ = phase_tables(m_bk.cfg.max_mem, 64, 0.0)
+    m_bk.register_buffer("age_cos", c_)
+    m_bk.register_buffer("age_sin", s_)
+    bk = GroupBank()
+    for _ in range(2):
+        bk = env.write(m_bk, bk, seg_tpl)
+    assert list(bk.groups) == [4, 4] and len(bk) == 8, (bk.groups, len(bk))
+    ages_bk = pad_bank_age([bk], "cpu", m_bk.cfg.group_rows)
+    assert ages_bk.tolist() == [[1, 1, 1, 1, 0, 0, 0, 0]], ages_bk.tolist()
+    for blk in m_bk.blocks:
+        if blk.read is not None:
+            for _n, _p in blk.read.named_parameters():
+                if "gate" in _n:
+                    _p.data.fill_(1.0)
+    b_bk, bm_bk = pad_bank([bk], "cpu")
+    ids_bk = torch.tensor([[5, 6, 7]])
+    with torch.no_grad():
+        assert not torch.equal(m_bk(ids_bk, b_bk, bm_bk),
+                               m_bk(ids_bk, b_bk, bm_bk, bank_age=ages_bk)), \
+            "la rotation d'âge côté BANQUE ne change rien : plomberie morte"
+        assert torch.equal(
+            m_bk(ids_bk, b_bk, bm_bk),
+            m_bk(ids_bk, b_bk, bm_bk, bank_age=torch.zeros_like(ages_bk))), \
+            "âge 0 partout doit être l'IDENTITÉ côté banque aussi"
+    # 21d. LECTURE β (`read_path='kv'`) : pas de préfixe, mémoire visible de
+    #      TOUTE position, contenu comptant, ablaté ≡ backbone nu BIT-À-BIT,
+    #      et la mémoire n'entre QUE dans les couches lectrices.
+    m_kv = _mk_inj(read_path="kv")
+    with torch.no_grad():
+        k_nu1 = m_kv(ids10, None, None)
+        k_nu2 = m_noage(ids10, None, None)
+        k_a = m_kv(ids10, None, None, inject=rows10)
+        k_b = m_kv(ids10, None, None, inject=rows10 * 0.5)
+    assert torch.equal(k_nu1, k_nu2), \
+        "read_path kv : le forward SANS injection doit être le backbone nu"
+    assert not torch.equal(k_a, k_nu1) and not torch.equal(k_a, k_b), \
+        "kv_append : l'injection et son CONTENU doivent compter"
+    assert k_a.shape == k_nu1.shape, "kv_append ne doit rendre AUCUN préfixe"
+    # la PREMIÈRE position voit déjà la mémoire (c'est tout l'intérêt de β :
+    # aucune position n'est en amont de la banque)
+    assert not torch.equal(k_a[:, 0], k_nu1[:, 0])
+    m_kv1 = _mk_inj(read_path="kv", read_layers=[1])
+    assert [b.read_bank for b in m_kv1.blocks] == [False, True]
+    # 21e. LE STREAM : la règle est un seg PORTEUR (donc écrit), son nom
+    #      n'apparaît JAMAIS dans une réponse, et la paire contrastive partage
+    #      TOUT sauf les marqueurs.
+    rs = PersonaRuleStream(tok, seed=11, p_rule=1.0, p_smalltalk=0.0,
+                           cond_decoys=1)
+    rconv = next(rs.next_conv() for _ in range(1))
+    cnd = rconv["info"]["cond"]
+    assert rconv["kind"] == "rule" and rconv["info"]["truths"] == [], \
+        "une vie-règle ne doit RIEN offrir à grade_recall (ph.9 intacte)"
+    wsegs = [i for i, s in enumerate(rconv["segs"])
+             if OracleEnv.fact_of(s) is not None]
+    assert len(wsegs) == 2 and cnd["rule_at"] < 2, wsegs
+    assert cnd["turns"], "aucune réponse conditionnée"
+    for q, ti in enumerate(cnd["turns"]):
+        coh, inc = rconv["segs"][ti], cnd["alts"][q]
+        txt = tok.decode(coh["input_ids"][0].tolist())
+        assert cnd["reg"] not in txt, \
+            f"le nom du registre FUIT dans la réponse : {txt!r}"
+        assert float(coh["cond_mask"].sum()) > 0 and \
+            float(inc["cond_mask"].sum()) > 0
+        # même corps, mêmes marqueurs en NOMBRE, contenus DIFFÉRENTS
+        assert not torch.equal(coh["input_ids"], inc["input_ids"])
+    # les valeurs de registre sont RETIRÉES du pool `color`
+    assert not (set(COND_REGISTERS) & set(rs.slots.get(COND_RULE_SLOT,
+                                                       ((), (), (), (), ()))[4]))
+    # 21f. `cond_plan` : G CONSTANT, âges = rangs de récence (0 = plus récent),
+    #      et {} sur toute conv qui n'est pas une vie-règle.
+    m_c = _mk_inj(cond=True, cond_decoys=1)
+    cp = env.cond_plan(m_c, rconv)
+    assert set(cp) == set(cnd["turns"]), (set(cp), cnd["turns"])
+    for rws, ags in cp.values():
+        assert rws.shape == (2, 3, 64), rws.shape
+        assert sorted(ags.tolist()) == [0, 1], ags.tolist()
+    assert env.cond_plan(m_c, conv) == {}, \
+        "cond_plan doit être un no-op hors vie-règle (phases 6-9 intactes)"
+    # 21g. `evaluate_cond` tourne, rend ses trois lectures, et `none` est
+    #      EXACTEMENT le bras sans mémoire (Δ identique à un forward nu).
+    ec = evaluate_cond(m_c, env, PersonaRuleStream(tok, seed=11, p_rule=1.0,
+                                                   p_smalltalk=0.0),
+                       11, 3, "cpu", 64, False)
+    assert ec["n"] >= 3 and ec["n_convs"] == 3, ec
+    for kk in ("mark_live", "mark_shuf", "mark_none", "acc_live", "dnll_none"):
+        assert ec[kk] == ec[kk], f"{kk} NaN : la métrique ne sort pas"
+    assert 0.0 <= ec["acc_live"] <= 1.0
+    # 21h. NOMMAGE : les quatre axes séparent les dossiers (aucun run écrasé).
+    _n10 = {run_name_for(_mk_inj(**kw).cfg) for kw in (
+        {}, {"age_rope": True}, {"read_path": "kv"}, {"cond": True},
+        {"cond": True, "cond_arm": "none"}, {"cond": True, "cond_decoys": 3},
+        {"cond": True, "age_rope": True, "read_path": "kv"})}
+    assert len(_n10) == 7, sorted(_n10)
+    assert run_name_for(_mk_inj(cond=True, age_rope=True,
+                                read_path="kv").cfg) == \
+        "read-kvappend_rot-on_tap-postnorm_m3", _n10
+    # la GRILLE : 36 combos, 36 noms DISTINCTS, et le nom se relit
+    _base = dict(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                 mem_dim=64, max_seq_len=64, sif_a=A_SIF, seg_n_pos=8,
+                 inject_sep_id=5, max_mem=8)
+    _cmb = grid_combos()
+    assert len(_cmb) == 36, len(_cmb)
+    _gn = [grid_name(_grid_cfg(cc, _base)) for cc in _cmb]
+    assert len(set(_gn)) == 36, sorted(_gn)
+    assert "read-seqfw_rot-off_tap-mid_m4" in _gn, sorted(_gn)
+    # 21i. les GARDE-FOUS : chaque axe refuse les combinaisons qui seraient
+    #      silencieusement ignorées (le labo ne laisse pas passer un no-op).
+    for bad in ({"variant": "r1", "code": "mean", "age_rope": True},
+                {"variant": "r3", "read_path": "kv"},
+                {"variant": "r1", "code": "mean", "cond": True},
+                {"variant": "r4", "code": "tophid", "cond_arm": "none"},
+                {"variant": "r3", "code": "midhid", "hid_tap": 0.0}):
+        try:
+            ToyCfg(vocab_size=512, d_model=64, n_layers=2, n_heads=4,
+                   mem_dim=64, max_seq_len=64, sif_a=A_SIF, top_k=3,
+                   **{"code": "tophid", **bad})
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"ToyCfg aurait dû refuser {bad}")
+
     torch.manual_seed(4242)
     m_r2 = _mk("toprows", d=64, n_pos=4, vocab=512, seg_n_pos=8, top_k=3)
     rows_r2 = m_r2.oracle_lines(3, 2, tok8[:3], seg_tok=seg20)
@@ -4404,6 +5639,21 @@ def _selftest() -> None:
           "([B,k,d] ≡ [B,1,k,d], contenu ET échelle comptent), `hid_scale` "
           "init 1.0 et dérivable, absent de toprows (bras comparables) ; "
           "r4_tophid ≠ r4_toprows au nommage")
+    print(f"  phase 10 — GRILLE §2.4, quatre axes ORTHOGONAUX. "
+          f"(a) PROVENANCE `midhid` : même sélection/clé/layout que tophid, "
+          f"seul le vecteur change ; tap = round(hid_tap·n_layers) borné "
+          f"[1,L], et pré-norm_f ≠ post-norm_f (le tap mesure quelque chose). "
+          f"(b) ÂGE : buffers absents par défaut, rot(0) = IDENTITÉ, âges "
+          f"distincts ⇒ préfixes distincts, `inject_age` IGNORÉ si age_rope "
+          f"OFF. (c) LECTURE β `kv` : forward sans injection ≡ backbone nu "
+          f"BIT-À-BIT, aucun préfixe rendu, la position 0 voit déjà la banque, "
+          f"contenu comptant, mémoire limitée aux couches lectrices. "
+          f"(d) RÈGLE : vie-règle = 1 règle + {1} leurre écrits, truths VIDE "
+          f"(ph.9 intacte), nom du registre JAMAIS dans la réponse, registres "
+          f"retirés du pool `color`, cond_plan à G constant et âges = rangs de "
+          f"récence, no-op hors vie-règle ; evaluate_cond rend ses 3 lectures. "
+          f"(e) 7 configs de la grille ⇒ 7 save_dir distincts, et 5 "
+          f"combinaisons no-op sont REFUSÉES à la construction.", flush=True)
     print("  chantier 1 — grade CONDITIONNÉ À LA RÉSIDENCE aligné sur les "
           "réponses gradées (n_resident/n_absent), et éval FINALE élargie "
           "(training.final_eval_convs, défaut 200) écrite dans "

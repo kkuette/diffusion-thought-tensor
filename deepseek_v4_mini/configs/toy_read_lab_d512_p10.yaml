@@ -1,0 +1,434 @@
+# toy_read_lab — PHASE 10 : la banque CONDITIONNE-T-ELLE ?
+#
+# Clone de toy_read_lab_d512.yaml (mêmes dims, même tokenizer, même stream
+# persona) avec le bloc `cond:` en plus et un save_dir séparé. C'est la config
+# de la GRILLE de la spec §2.4 : les quatre axes sont des FLAGS orthogonaux,
+# rien ici ne les fixe.
+#
+# ── LA QUESTION ─────────────────────────────────────────────────────────────
+# La phase 9 a mesuré la CITATION depuis des lignes d'états cachés injectées
+# (0.434 from-scratch contre 0.708 pour l'embedding natif ; morte sous readout
+# appris). La mesure MANQUANTE est le CONDITIONNEMENT : ces mêmes lignes
+# modulent-elles la DISTRIBUTION sans qu'il y ait rien à citer ? Si oui, le
+# fast-weight read devient optionnel et « une seule lecture, tout par le
+# préfixe » tient — la banque est une modalité au sens plein (§2.4, barreau 1
+# de l'échelle de test).
+#
+# ── LA TÂCHE ────────────────────────────────────────────────────────────────
+# Une VIE-RÈGLE énonce UNE fois, tôt, une consigne de registre (« garde chaque
+# réponse dans le registre {v} », v ∈ 4 valeurs). Ce seg est le seg PORTEUR :
+# c'est lui que le write oracle met en banque, avec `cond_decoys` faits leurres
+# à côté (ordre tiré au sort ⇒ la règle n'est pas toujours la plus récente).
+# Du filler suit ; comme le labo forwarde SEG PAR SEG, la fenêtre du tour
+# conditionné ne contient RIEN que le tour lui-même. Les réponses conditionnées
+# partagent un corps de phrase IDENTIQUE entre registres : seuls changent un
+# marqueur d'ouverture et un marqueur de clôture. Le nom du registre
+# n'apparaît JAMAIS dans une réponse — il n'y a rien à citer, seulement une
+# distribution à moduler. La clé du groupe est la même pour les quatre
+# registres : l'identité du registre ne vit QUE dans les lignes de contenu.
+#
+# ── LA MESURE ───────────────────────────────────────────────────────────────
+# Paires contrastives : nll(rendu du registre VRAI) contre nll(la MÊME réponse
+# rendue dans un AUTRE registre), sous trois conditions de LECTURE, sur le même
+# modèle :  live (la banque de cette vie) | shuf (celle d'une autre vie, de
+# registre différent) | none (aucune mémoire).
+#   live ≫ shuf ≈ none  ⇒ le conditionnement passe PAR LA BANQUE (barreau 1
+#                          franchi)
+#   live ≈ shuf         ⇒ la sonde mesure un artefact, pas la banque
+#   live ≈ none         ⇒ l'injection ne conditionne pas
+# Deux échelles : `mark` (tokens de marqueur seuls = la mesure NETTE) et `dnll`
+# (tous les tokens supervisés = diluée), plus un 2AFC lisible sans échelle
+# (hasard 0.500). La CITATION de la phase 9 continue d'être mesurée sur le même
+# run : les vies de rappel restent dans le flux, `evaluate` ne voit aucun
+# changement.
+#
+# ── LA GRILLE (spec §2.4, quatre axes ORTHOGONAUX) ──────────────────────────
+#   --read  seq_fw       fast-weight SÉQUENTIEL sur la matrice plate
+#                        (max_mem·(1+m), d), une transformation low-rank par
+#                        LIGNE, appliquées en série (§2.4(b))
+#           bank_xattn   lecture apprise sur la MÊME banque (cross-attn contenu
+#                        + GroupReadout) — le comparateur non-injectif
+#           inject_entry pseudo-tokens en PRÉFIXE (lecture α, le bras ph.7-9)
+#           kv_append    lignes appondues aux K/V des couches LECTRICES, sans
+#                        ré-encodage ni RoPE (lecture β, « VUE PLATE +
+#                        ATTENTION »)
+#   --age-rot            rotation type RoPE par l'ÂGE du slot (binding DFT sur
+#                        max_mem rangs de récence). Élémentaire : aucune matmul
+#                        dédiée, appliquée aux lignes AVANT le vecteur de type
+#                        (injection) ou avant tout read (banque).
+#   --tap   native       ligne = embedding d'entrée (ph.6-8)
+#           postnorm     ligne = état après norm_f (ph.9)
+#           mid          ligne = flux résiduel à code.hid_tap de profondeur
+#                        (défaut 2/3), AVANT norm_f — le correctif ranké
+#   --m     K            lignes de contenu par write (= code.top_k). C'est LE
+#                        cadran de budget une fois la largeur fixée à d_model.
+#
+# Manifeste de la grille complète (36 combos, commandes + coût estimé) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p10.yaml --manifest tsv
+#
+# Chaque run écrit save_dir/<combo>/results.json (combo + conditionnement avec
+# ses deux contrôles + citation) : les 36 s'agrègent sans grepper un log.
+#
+# SMOKE CPU (dims minuscules, filler template, 2 pas) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p10.yaml --cond \
+#     --read kv_append --tap mid --m 4 --age-rot --smoke --device cpu
+#
+# ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal).
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:
+  d_model: 512            # RE-BASELINE (d256 : round-trip segsif 59.9 %)
+  n_layers: 6
+  n_heads: 8
+  d_ff_mult: 4
+  mem_dim: 512            # r3 l'écrase à d_model (banque = embeddings)
+  max_mem: 8              # FIFO, comme le 350M
+  max_seq_len: 320
+  dropout: 0.0
+  fw_rank: 8              # = mem_read_rank du 350M
+  read_layers: []         # vide = toutes les couches lisent (comme le 350M)
+  x_dim: 2048             # dim interne des cross-attn r1/r3 (0 = d_model).
+                          # 2048 = APPARIEMENT DE BUDGET avec le hypernetwork
+                          # fast-weight de r0 : r0 36.56M / r1 36.17M / r2
+                          # 36.89M (±1 %). r3 reste à 24.11M — structurel : sa
+                          # V n'est PAS projetée (c'est sa définition), on ne
+                          # peut pas lui dépenser les params sans casser la
+                          # variante. Mettre 0 pour la version « naturelle »
+                          # (cross-attn en d_model, r1 à 19.65M).
+  ptr_bias_init: -8.0     # porte du pointer readout FERMÉE à l'init
+  oracle_ka_scale: 0.2    # K[slot]/A[attr] = petits offsets de liaison
+  oracle_seed: 20260730
+
+# ── PHASE 2 : axe FORMAT DE CODE (--code mean|chunk|phase|rows, r3 seulement)
+# Le pool MOYEN de la phase 1 détruit l'ordre des tokens (la ligne est un sac
+# de tokens) ⇒ grade 0.000 partout malgré Δnll +3.80 sur r3. Ces knobs pilotent
+# les formats qui PRÉSERVENT l'ordre. --code mean les ignore intégralement
+# (chemin bit-à-bit de la phase 1, sous save_dir/<variant>/).
+code:
+  n_pos: 8                # tokens de valeur retenus par fait.
+                          # Distribution ÉCHANTILLONNÉE des longueurs de " "+val
+                          # (10 slots équiprobables) : 1 tok 4.6 %, 2 tok 27.0 %,
+                          # 3 tok 27.4 %, 4 tok 9.3 %, 5 tok 1.7 %, 6 tok 8.3 %,
+                          # 7 tok 17.0 %, 8 tok 4.8 % ⇒ n_pos=7 couvre 95.2 %,
+                          # n_pos=8 couvre 100 %. 8 est aussi une puissance de 2
+                          # qui divise d_model=512 (blocs chunk de 64 dims) ET
+                          # le d_model=64 du smoke (blocs de 8).
+  rope_base: 0.0          # binding `phase`. 0 (ou négatif) = DFT :
+                          # θ_i = 2π·(i mod n_pos)/n_pos, la SEULE famille de
+                          # fréquences qui annule EXACTEMENT l'interférence
+                          # entre positions (⟨cos(θ_i·Δ)⟩_i = 0 ∀Δ≠0).
+                          # (partagé par `phase` ET `segphase`.)
+                          # ÉCART ASSUMÉ vs la spec « RoPE base 100 » : mesuré,
+                          # la forme RoPE littérale θ_i = base^(−2i/d) a θ_max =
+                          # 1 rad, donc ⟨cos(θ_i·1)⟩ = 0.95 à base 100 et 0.54 à
+                          # base 1 — elle ne sépare PAS 8 positions (round-trip
+                          # oracle 3/8 à base 100, 6/8 au mieux, contre 8/8 en
+                          # DFT). Mettre une base > 0 rejoue la forme RoPE
+                          # (gardée comme ablation).
+
+  # ── PHASE 3 : --code segmean|segphase (r3 seulement) ──────────────────────
+  # Ces deux formats RETIRENT le privilège d'oracle sur le span valeur : le
+  # code poole le SEGMENT PORTEUR ENTIER (template ChatML compris), comme le
+  # write du 350M qui ne sait pas où est la valeur. On GARDE l'autre privilège
+  # (le write n'est déclenché que sur les segs porteurs) — une variable à la
+  # fois. segmean = contrôle (coût du bruit de template seul, ordre détruit) ;
+  # segphase = le test (binding DFT sur la position DANS LE SEGMENT) ;
+  # segsif = segphase PONDÉRÉ SIF = la recette cible du write du 350M.
+  seg_n_pos: 32           # positions bindées dans le segment porteur.
+                          # MESURÉ (393 segs porteurs du stream persona) :
+                          # longueur ∈ [12, 26], moyenne 18.5, p98 = 23 ⇒ 32 est
+                          # la puissance de 2 qui couvre 100 %. Fin du span
+                          # valeur ∈ [6, 22] ⇒ 32 la couvre aussi à 100 %.
+                          # Débordement (jamais observé ici) : poolé SANS
+                          # rotation — contenu gardé, position perdue.
+                          # COÛT : le pointer voit max_mem×seg_n_pos = 8×32 =
+                          # 256 candidats (contre 8 en `mean`, 64 en `phase`),
+                          # soit un produit [B,T,256] au lieu de [B,T,8] sur
+                          # l'attention plate — négligeable devant le [B,T,V]
+                          # du biais de logits (V = 49 154).
+  pos_offset: 0           # DÉCALAGE de l'index de phase (`phase`, `segphase`,
+                          # `segsif` seulement). 0 = DÉFAUT et rétro-compat
+                          # bit-à-bit des runs passés.
+                          # POURQUOI le knob : à offset 0 la position 0 a
+                          # rot(0) = IDENTITÉ, donc son token se superpose SANS
+                          # étiquette rotationnelle à K[slot]+A[attr], qui
+                          # vivent eux aussi NON tournés dans la ligne (dumps :
+                          # SV-19621 → EX-19621, les chiffres exacts mais le
+                          # premier token de la valeur faux). offset=k tourne le
+                          # token de position j de θ·(j+k), AU WRITE ET aux
+                          # candidats du readout : plus aucune position ne
+                          # partage la phase identité.
+                          # WRAP : le binding DFT est de période n_pos, donc
+                          # l'offset CONSOMME k positions — il faut
+                          # n_pos ≥ longueur_max + k. MESURÉ sur le stream :
+                          # segs porteurs ≤ 26 tokens ⇒ seg_n_pos 32 avec
+                          # offset 1 ne wrappe JAMAIS ; valeurs ≤ 8 tokens ⇒
+                          # `phase` à n_pos 8 avec offset 1 fait wrapper la
+                          # position 7 des 18 valeurs de 8 tokens (mesuré : le
+                          # round-trip reste 100 % / +3.2σ, K/A à 0.2 est trop
+                          # faible pour mordre à d=512 ; mettre n_pos 16 pour
+                          # supprimer le wrap si un jour il compte).
+                          # ⚠️ MESURÉ à d=512 : l'offset ne change RIEN au
+                          # round-trip oracle (segsif 97.4 → 97.5 %, aucune
+                          # anomalie position-0 dans le code lui-même) — il ne
+                          # se teste donc qu'au niveau du READ APPRIS.
+
+  # ── PHASE 5 : --code pack|segpack (r3 seulement) ──────────────────────────
+  # La ligne n'est plus une SUPERPOSITION mais une PARTITION : pack_blocks
+  # sous-espaces disjoints, bloc 0 = CLÉ dédiée de la paire (slot, attr), blocs
+  # 1.. = UN token chacun (R_j^T·ê(t_j), frames orthonormés figés). Zéro
+  # interférence entre positions, mais capacité DURE de pack_blocks−1 tokens.
+  # `pack` garde le privilège de span (blocs = tokens de la valeur) ;
+  # `segpack` le retire (blocs = les top-(pack_blocks−1) tokens SIF du segment,
+  # dans l'ordre du segment) — c'est le bras comparable à segsif.
+  pack_blocks: 8          # nombre TOTAL de blocs, CLÉ COMPRISE (d_model doit
+                          # être divisible par lui ; ⇒ d_sub = 512/8 = 64 dims
+                          # par bloc, 7 tokens de contenu).
+                          # SWEEP ORACLE k×d_sub (500 faits held-out, partition
+                          # (k_val+1)·d_sub = 512, RT = top-1 par bloc sur les
+                          # tokens de valeur | clé = retrieval rang-1 sur des
+                          # banques de 8 lignes à clés distinctes) :
+                          #   d_sub 64 (8 blocs)   RT 100.0 % +3.84σ | clé 100 %
+                          #   d_sub 32 (16 blocs)  RT  95.9 % +1.42σ | clé 100 %
+                          #   d_sub 16 (32 blocs)  RT  40.2 % −0.21σ | clé 100 %
+                          #   d_sub  8 (64 blocs)  RT   3.3 % −1.37σ | clé 100 %
+                          #   d_sub  4 (128 blocs) RT   0.0 % −2.41σ | clé 100 %
+                          #   d_sub  1 (512 blocs) RT   0.0 % −3.53σ | clé 25 %
+                          # « pourquoi pas 512 blocs de 1 dim » : un bloc de
+                          # d_sub dims oppose le token cible au MAX de |V|
+                          # concurrents, dont le cos est ≈ √(2·ln|V|/d_sub) ;
+                          # il atteint 1 vers d_sub ≈ 2·ln|V| ≈ 21.6 (V=49 154).
+                          # Le cliff mesuré est bien là : 64 → 32 → 16 = 100 →
+                          # 95.9 → 40.2 %. La CLÉ, elle, ne discrimine que 8
+                          # lignes (pas 49 k) et tient donc jusqu'à d_sub 4 :
+                          # c'est le CONTENU qui fixe le plancher, pas l'adresse.
+                          # 8 = le verdict (RT ≥ 99 % ET clé ≥ 99 %, marge
+                          # saine). ⚠️ ARBITRAGE OUVERT : à pack_blocks 16 la
+                          # sélection SIF du `segpack` couvre 99.9 % des tokens
+                          # de valeur au lieu de 63.5 %, et le RT EFFECTIF
+                          # (couverture × RT) monte à 98.0 % contre 63.5 % —
+                          # payé par une marge à +1.4σ seulement. Si le grade de
+                          # r3_segpack plafonne par MANQUE DE CAPACITÉ (valeurs
+                          # tronquées), 16 est le knob à tourner.
+  # ── PHASE 6 : --code toprows (r3 seulement) ───────────────────────────────
+  # PRINCIPE : NE JAMAIS TRANSFORMER. Le write SÉLECTIONNE des embeddings et
+  # les stocke TELS QUELS. La banque devient une FIFO de GROUPES : un write
+  # dépose 1+top_k lignes — ligne 0 = CLÉ dédiée de la paire (slot, attr),
+  # lignes 1.. = les embeddings BRUTS des top_k tokens SIF du segment, dans
+  # l'ordre du segment. max_mem reste le nombre de GROUPES résidents (8), donc
+  # le même nombre de writes résidents que tous les autres codes ; l'éviction
+  # FIFO sort un groupe ENTIER et les âges restent comptés en writes.
+  # POURQUOI : les 4 bras pack ont montré que la ligne pack (concat de
+  # projections) est ÉTRANGÈRE à l'espace d'embedding et tue le canal contenu
+  # du CrossAttnRead — Δnll effondré à +1.5 contre +4.7 (phase) et +5.5 (mean),
+  # alors même que b16 donnait le meilleur grade sans-privilège (0.3-0.4).
+  # Des lignes natives rendent la banque lisible par le read de contenu ET par
+  # le readout de citation, sans rien dé-projeter.
+  top_k: 13               # lignes de CONTENU par groupe (⇒ groupes de 14
+                          # lignes, banque effective 8×14 = 112 lignes de 512).
+                          # MESURÉ (500 faits held-out, couverture = fraction
+                          # des tokens de VALEUR survivant à la sélection) :
+                          #    k    global   valeur complète   code  short  word
+                          #    4    47.9 %        50.8 %      19.5 %  96.4  89.0
+                          #    6    57.2 %        59.4 %      31.2 % 100.0  95.8
+                          #    8    71.1 %        61.8 %      53.1 % 100.0  98.5
+                          #   12    94.3 %        79.0 %      90.7 % 100.0  99.8
+                          #   13    98.2 %        92.6 %      97.0 % 100.0 100.0
+                          #   14    99.8 %        99.2 %      99.7 % 100.0 100.0
+                          # 13 = le plus petit k dont la strate `code` passe
+                          # 95 %. ⚠️ C'EST BEAUCOUP PLUS QUE LES 6 ATTENDUS, et
+                          # la raison est le BIAIS SIF déjà documenté : les
+                          # codes/refs/plaques sont faits de digrammes
+                          # FRÉQUENTS, donc le SIF les classe BAS. Rang médian
+                          # d'un token de valeur dans le tri SIF du segment :
+                          # strate code 7 (p90 11) contre 0 pour `short` et 1
+                          # pour `word`. Les segs porteurs faisant 18.6 tokens
+                          # en moyenne, k=13 revient à garder ~70 % du segment :
+                          # à ce régime la sélection SIF ne sélectionne presque
+                          # plus, elle ne fait qu'écarter le template.
+                          # ARBITRAGE : k=8 (groupes de 9, banque 72) garde
+                          # 100 % de `short` et 98.5 % de `word` pour 53 % de
+                          # `code` — c'est le bras économique si la strate code
+                          # n'est pas la cible. --top-k le change sans recommit
+                          # (suffixe _k<K> au save_dir).
+  row_pos_tag: true       # marquer la ligne de contenu j par pos_emb[j] × 0.2
+                          # (model.oracle_ka_scale), le tag du format `rows`
+                          # dont le round-trip était à 100 %. Quasi-non-
+                          # transformation : l'embedding domine, l'argmax ne
+                          # bouge pas (vérifié au self-test). false = lignes
+                          # STRICTEMENT natives, l'ordre ne tient plus qu'au
+                          # layout du groupe (--no-row-pos-tag, suffixe _notag).
+
+  readout_mix: linear     # GroupReadout (toprows) : comment les lignes du
+                          # groupe se combinent avant les logits.
+                          # `linear` (DÉFAUT, rétro-compat bit-à-bit du run
+                          # 1345f49) : u = Σ s·p·ligne PUIS u @ Ê^T. Les lignes
+                          # se SUPERPOSENT dans l'espace d'embedding, et le plus
+                          # proche voisin d'une superposition de H/Q/B est un
+                          # token PLAUSIBLE FAUX — c'est la machine à
+                          # HAB-719 → HQR-719 relevée à l'audit.
+                          # `mos` : softmax PAR LIGNE, puis mixture des
+                          # DISTRIBUTIONS pondérée par s·p, puis log. Un token
+                          # qu'AUCUNE ligne ne porte reste à probabilité ~0 :
+                          # l'hybridation devient structurellement impossible.
+                          # COÛT : un tenseur [B, G·k, V] par forward (les
+                          # lignes ne dépendent pas de t) plus le mélange
+                          # [B,T,V] — négligeable devant le [B,T,V] déjà payé.
+  # ── PHASE 8 : --variant r5 (retriever appris) ─────────────────────────────
+  # r4 a montré que le stack natif SAIT citer : strate `code` 0.708 (n=106)
+  # quand on lui injecte le bon groupe. Il ne manque que la SÉLECTION. r5
+  # remplace l'oracle par score_g = (W_q·h_query)·clé_g/√d, W_q zéro-init, seul
+  # module appris du bras.
+  # PRÉDICTION INSCRITE AVANT LE RUN : plafond = 0.708 × recall@2. L'oracle des
+  # clés sépare à 100 %, donc recall@2 < 0.9 incrimine l'apprentissage de W_q,
+  # pas la géométrie.
+  retr_ce: 1.0            # coefficient de la CE AUXILIAIRE (supervisée par
+                          # l'env, qui connaît le groupe porteur). Le retriever
+                          # apprend PAR CE CANAL, jamais par la loss LM.
+                          # La CE est MULTI-POSITIVE : deux writes du même slot
+                          # (fait mis à jour) ont la MÊME clé, une cible unique
+                          # aurait un gradient exactement nul. Elle est
+                          # normalisée par le nombre de réponses supervisées du
+                          # pas, donc comparable à la loss LM.
+  retr_topk: 2            # groupes injectés À L'ÉVAL (top-k DUR). À
+                          # l'ENTRAÎNEMENT l'injection reste le groupe ORACLE :
+                          # le circuit de copie s'entraîne sur du vrai.
+                          # MISMATCH train/éval ASSUMÉ en v1 — repli si le gap
+                          # est énorme : anneal oracle → prédit.
+                          # À score ÉGAL (clés dupliquées) l'injection prend le
+                          # groupe le PLUS RÉCENT : c'est lui qui porte la
+                          # vérité, et la clé ne peut pas le dire.
+  retr_train_groups: 0    # groupes injectés À L'ENTRAÎNEMENT. 0 = « suivre
+                          # retr_topk » (donc 2) — c'est le FIX du verdict r5 :
+                          # le retriever était PARFAIT (recall@1 1.000 sur 267)
+                          # mais le grade tombait à 0.067 contre 0.708 en r4,
+                          # parce que le circuit de copie avait été câblé sur un
+                          # préfixe MONO-groupe et que le distracteur de l'éval
+                          # le cassait. On entraîne donc avec le même nombre de
+                          # groupes qu'à l'éval : l'ORACLE + des DISTRACTEURS
+                          # tirés parmi les résidents. Banque trop courte ⇒ G
+                          # RÉDUIT pour cette réponse (jamais de doublon).
+                          # 1 = comportement v1, bit-à-bit (runs 60/61).
+  retr_train_order: random  # place de l'oracle dans le préfixe d'entraînement.
+                          # `random` : le modèle ne doit pas apprendre « copie
+                          # le groupe 1 » mais TROUVER le bon groupe.
+                          # `oracle_first` : l'oracle en tête, ce qui reproduit
+                          # EXACTEMENT l'ordre de l'éval (groupes triés par
+                          # score, le vrai sortant premier — recall@1 1.000).
+                          # ⚠️ OBJECTION STRUCTURELLE À TRANCHER AVANT LE RUN :
+                          # le décodage gradé part de A_OPEN SEUL — la question
+                          # n'est PAS dans le contexte (cf. evaluate/greedy, le
+                          # bras ablaté décode une fois pour toutes). Avec
+                          # plusieurs groupes en ordre ALÉATOIRE, aucune
+                          # information ne dit lequel copier à l'inférence : la
+                          # tâche est indécidable et le plafond retombe à
+                          # ~0.708/G au lieu de 0.708×recall@1. `oracle_first`
+                          # supprime l'ambiguïté ET ferme le mismatch, puisque
+                          # l'éval trie déjà par score. À l'inverse, si un jour
+                          # la question entre dans le prompt de décodage,
+                          # `random` redevient le bon réglage.
+  retr_detach: true       # la CE du retriever ne remonte PAS dans le backbone.
+                          # W_q est alors le SEUL apprenant de ce canal, ce qui
+                          # rend la prédiction lisible et protège le circuit de
+                          # copie déjà acquis par r4. false = laisser la
+                          # sélection remodeler le trunk.
+
+  pos_entropy: 0.0        # pénalité d'ENTROPIE sur la porte-position p du
+                          # GroupReadout, ajoutée à la loss. 0 = OFF (défaut :
+                          # AUCUN terme n'est ajouté, gradient inchangé). > 0
+                          # durcit p vers le choix d'UNE ligne du groupe.
+                          # Suffixe _ent<c> au save_dir.
+
+  sif_a: 0.01             # `segsif`/`segpack`/`toprows` : a de w = a/(a+p).
+                          # La table unigram vient de _sif_table() de
+                          # PersonaChatStream (300 convs, rng 4242) — MÊME
+                          # recette que le write du 350M. Le stream d'entraîne-
+                          # ment du toy reste surp OFF : le SIF n'entre QUE
+                          # dans le code de banque, jamais dans la loss.
+                          # ÉCART ASSUMÉ vs le 350M (a=1e-4) : MESURÉ, a=1e-4
+                          # DÉGRADE la strate `code` (round-trip 28.8 % en
+                          # poids uniformes → 15.1 %) parce que les codes/refs/
+                          # plaques sont faits de digrammes FRÉQUENTS (w̄ 0.042
+                          # sur les tokens chiffrés contre 0.62 sur les valeurs
+                          # linguistiques) — le SIF les écrase pile là où on en
+                          # a besoin. Balayage à d=256 sur la strate `code` :
+                          # 1e-4 15.1 % | 3e-3 45.3 % | 1e-2 59.9 % | 3e-2
+                          # 55.9 % | 1e-1 45.6 % | 1 30.9 % | uniforme 28.8 %.
+                          # 1e-2 est l'optimum ; mettre 1e-4 pour rejouer
+                          # exactement la recette du 350M (ablation).
+
+training:
+  seed: 0
+  steps: 3000
+  batch_convs: 8          # 1 pas = un groupe de 8 conversations complètes
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  amp: true               # bf16 autocast (ignoré sur cpu)
+  log_every: 20
+  eval_every: 200
+  eval_convs: 24          # convs gradées par bras (held-out ET train)
+  final_eval_convs: 200   # ÉVAL FINALE ÉLARGIE, une seule fois en fin de run.
+                          # POURQUOI : un palier grade ~30 réponses, dont n=10
+                          # sur la strate `code` — l'IC95 d'un 3/10 va de 0.07 à
+                          # 0.65, aucun bras n'est adjudicable à ce n. 200 convs
+                          # ⇒ ~250 réponses, erreur-type ~0.03. Les paliers
+                          # restent à eval_convs (le coût est dans le décodage
+                          # greedy, on ne le paie en grand qu'une fois).
+                          # Sortie : lignes `[final]` dans le log +
+                          # save_dir/final_metrics.csv (avec l'erreur-type, les
+                          # strates, et le grade CONDITIONNÉ À LA RÉSIDENCE).
+                          # 0 = désactivée (--final-eval-convs 0).
+  max_new: 48
+  cond_eval_convs: 32     # vies-RÈGLE gradées par passe contrastive. Aucun
+                          # décodage greedy là-dedans (que des forwards
+                          # teacher-forcés sur deux rendus par tour), donc c'est
+                          # bon marché : ~1.4 tour par vie ⇒ ~45 paires ×
+                          # 2 rendus × 3 lectures = ~270 forwards de seg court.
+                          # L'éval contrastive FINALE réutilise
+                          # final_eval_convs (200) et écrit cond_metrics.csv.
+  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab_p10
+
+# kwargs de la branche persona de chat.eval_gen de sft_recall_350m_table2.yaml.
+# pool_split est SURCHARGÉ par le code : 'train' pour l'entraînement et le
+# contrôle mécanisme, 'eval' pour le held-out.
+persona:
+  gen:
+    p_smalltalk: 0.15
+    n_facts:
+    - 1
+    - 3
+    n_queries:
+    - 1
+    - 2
+    p_ack: 0.5
+    p_update: 0.15
+    p_beyond: 0.15
+    value_weight: 4.0
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cap: 20000
+    real_max_tok: 96
+    p_real: 0.8
+    real_cache_dir: ${TB_ROOT}/data_cache
+
+# ── PHASE 10 : kwargs du PersonaRuleStream (ignorés hors --cond) ────────────
+cond:
+  gen:
+    p_rule: 0.35          # part des convs qui sont des VIES-RÈGLE. Le reste se
+                          # partage entre smalltalk (p_smalltalk) et rappel :
+                          # la citation de la ph.9 garde donc ~50 % du flux, et
+                          # les deux métriques sortent du MÊME run.
+    cond_decoys: 1        # faits LEURRES écrits à côté de la règle ⇒ 2 groupes
+                          # injectés, la règle en position 0 ou 1 au hasard.
+                          # C'est ce qui donne au code d'ÂGE quelque chose à
+                          # coder : à 0 leurre tous les âges valent 0 et
+                          # --age-rot devient un no-op (contrôle utile de la
+                          # sonde, pas un bras de la grille).
+    cond_fillers:         # paires de filler entre les writes et les tours
+    - 2                   # conditionnés. Le labo forwarde seg par seg, donc la
+    - 5                   # règle est DÉJÀ hors fenêtre après un seg : ce filler
+                          # ne sert qu'au réalisme du flux, pas à l'éviction.
