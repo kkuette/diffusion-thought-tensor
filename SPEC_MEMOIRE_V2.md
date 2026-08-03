@@ -260,7 +260,14 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
   dans la fenêtre (cos(ωt − φ_âge)). Corollaire : les clés banque se dockent
   naturellement dans la bande lente — HoPE retrouvé par l'implémentation ; le
   fait que kvproj gagne suggère que W_K' l'apprend seul. À vérifier en ph.11
-  (spectre de W_K' par dim de fréquence).
+  (spectre de W_K' par dim de fréquence). Fallback si contamination avérée :
+  DÉ-ROTER q pour les colonnes banque (score banque = qᵀk' nu, deux attentions
+  fusionnées par log-sum-exp — exact, prix = perte du SDPA unique). JAMAIS de
+  rotation de la banque par position absolue de fenêtre : (R(t)q)ᵀR(p)k' =
+  qᵀR(p−t)k' — le parasite devient relatif au lieu de disparaître, et la
+  position de fenêtre (qui meurt au RESET) rentre par la fenêtre. Principe :
+  toute rotation côté banque est fonction de propriétés DE LA LIGNE (âge,
+  canal, index local), jamais de la position du token lecteur.
 - Trois examens EN SUSPENS avant d'acter (§3-S3/S4/S5) : le contrôle θ_âge=0
   (HoPE : la rotation nulle sur l'axe long maximise le rappel — si l'âge rotatif
   ne le bat pas, l'âge passe en biais scalaire de récence), l'OOD d'âge, et le
