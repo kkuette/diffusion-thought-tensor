@@ -1587,7 +1587,11 @@ class ToyBlock(nn.Module):
         if self.read is not None and bank is not None and bank.size(1) > 0:
             x = self.read(x, bank, bank_mask)
         x = x + self.mlp(self.n2(x))
-        return (x, mem) if self.bank_q else x
+        # tuple UNIQUEMENT quand des lanes existent : les chemins qui appellent
+        # le bloc nu (prélèvement midhid, self-tests) reçoivent x brut — un
+        # bloc bank_q à mem=None rendait (x, None) et le RMSNorm du bloc
+        # suivant croquait le tuple (6 cellules bq×tap-mid du carré, 08-03).
+        return (x, mem) if (self.bank_q and mem is not None) else x
 
 
 def sif_weight_table(stream_cls, tok, gen_kwargs: dict, vocab_size: int,
