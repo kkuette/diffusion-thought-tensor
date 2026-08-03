@@ -1,0 +1,197 @@
+# toy_read_lab — PHASE 12 : LA MAINTENANCE (S6) ET LA DILUTION (S8)
+#
+# Clone de toy_read_lab_d512_p11.yaml (mêmes dims, même tokenizer, même seed)
+# avec le bloc `p12:` en plus et un save_dir séparé. TOUT ce qui est tranché
+# est FIXÉ, pas rebalayé : kvproj (S1), prélèvement postnorm, m = 4.
+#
+# ⚠️ CADRAGE : le RL est MIS DE CÔTÉ. Aucun bras GRPO, aucune politique apprise
+# de write ou de rétention. La maintenance est PROCÉDURALE et hors graphe
+# (spec §2.3, §2.9 : « tout le neuf est procédural ; tout ce qui apprend est du
+# transformer standard ») — le seul module appris reste le read kvproj.
+#
+# ── LES DEUX EXAMENS (registre §3 de SPEC_MEMOIRE_V2) ──────────────────────
+#   retention  S6  BAKEOFF du signal de rétention sur des vies LONGUES
+#                  (T ≫ max_mem) à supersession tardive et ré-évocation
+#                  historique. Cinq signaux — fifo (baseline basse) / age (le
+#                  proxy RÉPUDIÉ par la spec : sa présence EST la preuve qu'on
+#                  l'a battu) / attn-ema (le lecteur vote) / coverage (la
+#                  redondance meurt) / actr — × trois configurations (p, T).
+#                  14 cellules.
+#                  Métriques de PREMIÈRE CLASSE, et elles ne se résument pas
+#                  l'une l'autre :
+#                    (a) temps d'adaptation au fait NOUVEAU (courbe par
+#                        horizon dw = writes écoulés depuis la supersession) ;
+#                    (b) survie du fait ANCIEN utile (strate `hist`) ;
+#                    (c) grade global + r@1 (masse d'attention par groupe) ;
+#                    (d) horizon effectif MESURÉ (âge max encore cité).
+#                  Un horizon p90 > max_mem PROUVE la propagation.
+#   dilution   S8  KT8 au jouet : la banque est remplie de distracteurs RÉELS
+#                  (groupes d'AUTRES vies du même stream) jusqu'à S groupes,
+#                  S ∈ {1, 4, 8, 16, 64}. Où l'attention PLATE s'écroule-t-elle ?
+#                  S=1 = le plafond (aucun distracteur possible), S=8 =
+#                  l'appariement avec le carré factoriel. Deux envs parce que
+#                  les deux moitiés de la question ne vivent pas au même
+#                  endroit : `rule` porte le CONDITIONNEMENT (2AFC + marges de
+#                  marqueurs) et `span` la CITATION (grade + r@1). 7 cellules.
+#                  C'est la baseline d'ENTRÉE de la hiérarchie (S9) : la
+#                  hiérarchie n'entre que si la plate s'écroule.
+#
+# Manifestes (une ligne par cellule, commande exacte, save_dir, coût) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml \
+#     --manifest tsv --manifest-subset {retention|dilution}
+#
+# ── LA CAUSALITÉ DU SIGNAL `attn-ema` (leçon S2, payée cher) ───────────────
+# Le rejeu d'entraînement est TEACHER-FORCÉ : tout le futur de la vie existe
+# dans la structure. Le bank-q au read a été INVALIDÉ le 08-03 pour exactement
+# ça — les lanes voyaient le futur du segment et le réinjectaient. Le tampon de
+# `RetentionStore` est donc à deux temps : la masse d'attention du tour t est
+# déposée EN ATTENTE et n'entre dans les scores qu'au write du tour t+1. Le
+# self-test le prouve (une observation ne bouge aucun score avant le write
+# suivant).
+#
+# ── LE COÛT DU VOTE ───────────────────────────────────────────────────────
+# Les bras `attn-ema` et `actr` paient UN forward no-grad de sonde par WRITE
+# (pas par seg) : la sonde recalcule le softmax en clair et n'altère pas le
+# forward. Les trois autres signaux ne touchent jamais le modèle.
+#
+# SMOKE CPU (dims minuscules, filler template, 2 pas) :
+#   python -m deepseek_v4_mini.toy_read_lab \
+#     deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml --read kv_proj \
+#     --tap postnorm --m 4 --p12-exam retention --p11-env life \
+#     --retention attn-ema --prop 1 --smoke --device cpu
+#
+# ⚠️ Cette config NE PASSE PAS par cfg_schema (réservé au trainer principal).
+
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  d_ff_mult: 4
+  mem_dim: 512
+  max_mem: 8              # écrasé par --max-mem sur les cellules de dilution
+  max_seq_len: 320
+  dropout: 0.0
+  fw_rank: 8
+  read_layers: []
+  x_dim: 2048
+  ptr_bias_init: -8.0
+  oracle_ka_scale: 0.2
+  oracle_seed: 20260730
+
+code:
+  n_pos: 8
+  rope_base: 0.0
+  seg_n_pos: 32
+  pos_offset: 0
+  pack_blocks: 8
+  top_k: 13               # écrasé par --m sur chaque cellule
+  row_pos_tag: true
+  readout_mix: linear
+  retr_ce: 1.0
+  retr_topk: 2
+  retr_train_groups: 0
+  retr_train_order: random
+  retr_detach: true
+  pos_entropy: 0.0
+  sif_a: 0.01
+
+# ── PHASE 11 : les métadonnées restent ÉTEINTES ici ────────────────────────
+# La ph.12 ne rebalaye pas les rotations : elle mesure la maintenance et la
+# dilution sur le kvproj NU. Les âges circulent quand même (le store les
+# calcule et les métriques les lisent) — ils ne sont simplement rotés par
+# personne.
+p11:
+  bank_rot: none
+  tag_mode: none
+  loc_mode: none
+  p11_env: rule
+
+# ── PHASE 12 ───────────────────────────────────────────────────────────────
+p12:
+  retention: fifo         # signal de rétention. `fifo` = AUCUNE propagation,
+                          # la baseline basse. Les quatre autres exigent un
+                          # budget ≥ 1 (sinon ils seraient un no-op silencieux
+                          # et ToyCfg les refuse).
+  prop_budget: 0          # p — lignes propagées PAR WRITE. Petit par
+                          # construction : p ≥ max_mem immobiliserait toute la
+                          # banque et la FIFO n'existerait plus (refusé).
+  ema_beta: 0.9           # `attn-ema` : l'EMA regarde ~10 tours en arrière,
+                          # l'ordre de grandeur d'une fenêtre de travail.
+  actr_decay: 0.5         # `actr` : le d classique de la loi de puissance
+                          # ACT-R (base-level learning).
+  life_turns: 48          # longueur CIBLE d'une vie en segs ⇒ ≈ 12 writes
+                          # contre max_mem 8 : la pression FIFO est RÉELLE (le
+                          # bord est atteint, des lignes tombent VRAIMENT).
+                          # Le bloc `long` de l'examen tourne à 88 (≈ 22
+                          # writes, presque trois fois la profondeur).
+  bank_fill: none         # S8 : `foreign` (--bank-fill foreign).
+  fill_pool: 96           # réservoir de segments étrangers (en TOKENS : des
+                          # lignes stockées vieilliraient pendant que les
+                          # embeddings bougent).
+  fill_refresh: 8         # ≈ une recomputation par pas d'entraînement à
+                          # batch_convs 8.
+
+  gen:
+    life_fillers:         # paires de filler entre deux writes de la vie. Le
+    - 1                   # smalltalk du stream fait le remplissage, mais c'est
+    - 2                   # le nombre de WRITES qui fait la pression FIFO (un
+                          # write = un slot) : les fillers sont là pour le
+                          # réalisme du flux, pas pour la pression.
+
+training:
+  seed: 0
+  steps: 3000             # les cellules `retention` tournent à 1500 (--steps
+                          # dans le .job) : une vie de 48 segs coûte ~3× un
+                          # tour de vie-règle, et le manifeste porte le chiffre.
+  batch_convs: 8
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  amp: true
+  log_every: 20
+  eval_every: 200
+  eval_convs: 12          # une vie `life` porte ~10 tours gradés : 12 vies
+                          # ⇒ ~120 réponses par palier, déjà lisible.
+  final_eval_convs: 60    # ⇒ ~600 réponses gradées, et chaque strate
+                          # (cur_pre / cur_post / hist) garde n ≥ 100 —
+                          # la condition pour que t_adapt et surv_hist soient
+                          # adjudicables par horizon.
+  max_new: 48
+  cond_eval_convs: 32
+  save_dir: ${TB_ROOT}/checkpoints/toy_read_lab_p12
+
+persona:
+  gen:
+    p_smalltalk: 0.10     # plus bas qu'en ph.11 : une vie longue coûte cher,
+                          # on ne paie pas des convs que l'éval jetterait.
+    n_facts:
+    - 1
+    - 3
+    n_queries:
+    - 1
+    - 2
+    p_ack: 0.5
+    p_update: 0.15
+    p_beyond: 0.15
+    value_weight: 4.0
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cap: 20000
+    real_max_tok: 96
+    p_real: 0.8
+    real_cache_dir: ${TB_ROOT}/data_cache
+
+# ── vie-règle (env `rule`, cellules de dilution) ───────────────────────────
+# cond_decoys 0 sur les cellules de dilution : UN SEUL vrai groupe, tout le
+# reste est du remplissage. C'est la seule façon d'avoir un cadran PROPRE (S)
+# au lieu de mélanger « nombre de leurres de la vie » et « taille de banque ».
+cond:
+  gen:
+    p_rule: 0.35
+    cond_decoys: 1
+    cond_fillers:
+    - 2
+    - 5
