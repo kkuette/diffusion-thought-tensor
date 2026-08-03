@@ -103,6 +103,16 @@ def main():
     a = ap.parse_args()
     raw = yaml.safe_load(open(a.config))
 
+    def expand(x):                      # le loader de main expanse ${TB_ROOT}
+        if isinstance(x, str):
+            return os.path.expandvars(x)
+        if isinstance(x, dict):
+            return {k: expand(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [expand(v) for v in x]
+        return x
+    raw = expand(raw)
+
     res = {}
     dirs = sorted(d for d in globmod.glob(os.path.join(a.root, a.glob))
                   if os.path.exists(os.path.join(d, "final.pt"))
@@ -120,7 +130,11 @@ def main():
               f"{' OK' if r['harness_ok'] else ' ⚠️ DIVERGE'})", flush=True)
 
     out_path = os.path.join(a.root, "abs_nll_audit.json")
-    json.dump(res, open(out_path, "w"), indent=1)
+    try:
+        json.dump(res, open(out_path, "w"), indent=1)
+    except PermissionError:
+        out_path = os.path.abspath("abs_nll_audit.json")
+        json.dump(res, open(out_path, "w"), indent=1)
     print(f"\nécrit {out_path}", flush=True)
 
     # la réponse à la question : deltas appariés sur les ABSOLUS
