@@ -134,6 +134,17 @@ tenseur à taille CONSTANTE conservé (CUDA-graphs), et les lignes vides MASQUÉ
 du softmax — le vide ne coûte alors ni dilution ni signal, seulement de la
 mémoire. Chiffrage sur corpus réel = §3-S16.
 
+**Comptabilité de capacité** : l'accumulation k×T des tours ne s'empile PAS
+dans mem_dim — elle consomme des SLOTS (un tour = un write = un slot FIFO).
+Factorisation propre des cadrans : mem_dim = largeur d'UN tour (invariant en
+T), max_mem = horizon EN TOURS, capacité totale = max_mem × k lignes utiles
+(celle que la hiérarchie S9 étend vers ~10³). Les overlaps étirent l'horizon
+au-delà de max_mem tours : un tour dont la tranche delta est entièrement
+redondante (dédup Δn, §2.3) n'écrit rien et ne consomme pas de slot — horizon
+effectif = max_mem / taux-de-write — et la propagation recycle par-dessus les
+lignes utiles. Le taux de write et le taux de dédup mesurés sur corpus réel
+font partie de S16.
+
 **Ancrage cross-modal** : la banque est une modalité — cible long-terme =
 vision/son/texte écrivant dans le même store via des encodeurs de write par
 modalité. Aucun choix ne doit fermer cette voie ; l'attention sur un ensemble de
