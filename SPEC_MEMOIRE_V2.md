@@ -249,6 +249,14 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
   son write (0..mem_dim−1, borné ⇒ aucun risque d'OOD, fréquences standard).
   Jamais la position absolue de fenêtre : elle meurt au RESET et le « quand »
   est déjà porté par les plans d'âge. Test de nécessité = §3-S17.
+  La relativité vit LIGNE↔LIGNE, pas lecteur↔ligne : vu du token lecteur (sans
+  coordonnée locale), R_loc(j) est une signature de phase qui DISTINGUE les
+  lignes ; entre lignes, « avancer d'un token dans le span » devient un
+  opérateur CONSTANT R_loc(1), indépendant du contenu — exactement le geste
+  d'un circuit de copie (induction heads sur RoPE, précédent backbone). C'est
+  l'argument structurel contre l'index ADDITIF (S17) : l'additif donne des
+  signatures, jamais l'opérateur successeur. bank-q en hérite gratuitement
+  (q_b aussi roté ⇒ scores ligne-ligne pleinement relatifs R(j_a − j_b)).
 - **Jamais dans la bande RoPE du backbone** — les plans vivent dans les
   projections K dédiées de kvproj : la dédicace est un MOYEN d'hébergement, pas
   une fin (§2.4).
