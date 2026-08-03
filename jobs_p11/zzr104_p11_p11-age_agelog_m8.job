@@ -1,0 +1,10 @@
+# Labo jouet PHASE 11 — métadonnées par ROTATION sur les clés banque (spec §2.5)
+# S3 — rotation d'ÂGE contre le contrôle θ_âge=0 (HoPE) contre le biais scalaire
+# cellule p11-age_agelog_m8 : bras agelog, env rule, m=8 | ~47.1 M params, VRAM est. 2.11 Go
+# Base = le sommet ADOPTÉ du carré factoriel : --read kv_proj --tap postnorm (S1 tranché).
+# Sorties : $TB_MNT/checkpoints/toy_read_lab_p11/p11-age_agelog_m8/  (metrics.csv, results.json, ckpts)
+set -o pipefail
+export TB_ROOT="$TB_MNT"
+mkdir -p "$TB_MNT/runs/toy_read_lab_p11"
+python -u -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p11.yaml --read kv_proj --tap postnorm --m 8 --p11-exam age --p11-env rule --bank-rot age-log --cond --device cuda \
+  2>&1 | tee $TB_MNT/runs/toy_read_lab_p11/p11-age_agelog_m8.log

@@ -37,6 +37,47 @@ test this — before scale.
 
 ---
 
+## 2026-08-03 (nuit) — Sonde spectre W_K' sur les 15 ckpts kvproj : le corollaire « les clés banque se dockent seules dans la bande lente » est FAUX (0,5000 ± 0,0005, indiscernable de l'uniforme) — la prescription §2.5 reste, l'espoir qu'elle soit gratuite tombe
+
+**Question (spec §2.5, item 5 du dépouillement du carré)** : `kvproj` partage le
+q du backbone, RoPE compris — le score banque vaut (R(t)·W_Q x_t)ᵀ(W_K'·g_r) et
+la rotation de la requête n'est pas annulée côté banque. Le produit se faisant
+paire à paire, une clé qui met son énergie sur les paires rapides voit son score
+osciller avec la POSITION DU LECTEUR. Prédiction inscrite : W_K' devrait
+apprendre seul à docker ses clés dans la bande LENTE (« HoPE retrouvé par
+l'implémentation »), et le fait que kvproj gagne le carré le suggérait.
+
+Mesure, sans rien réentraîner : énergie des LIGNES DE SORTIE de W_K' par tête et
+par paire de dims (celles que le RoPE fait tourner), sur les 15 ckpts kvproj de
+la ph.10 (`final.pt`). Baseline à l'init = uniforme (0,500 / ρ 0).
+
+```
+part d'énergie de la moitié LENTE   ρ(énergie, lenteur)   top4/uniforme
+moyenne 15 ckpts   0,5000 ± 0,0005        −0,035          0,127 / 0,125
+étendue            0,495 … 0,502      −0,503 … +0,243
+```
+
+1. **Le corollaire est RÉFUTÉ** : à max_mem=8 et fenêtre courte, W_K' ne
+   distingue AUCUNE bande de fréquence — l'énergie est plate à 5e-4 près, y
+   compris sur les cellules qui gagnent la citation. Le ρ change de signe d'une
+   cellule à l'autre (bruit), et les trois cellules `_bq` sont les seules à
+   pencher franchement (−0,27 à −0,50 : énergie vers la bande RAPIDE), sans
+   qu'on sache si c'est le portage des lanes ou du bruit à n=3.
+2. **La PRESCRIPTION §2.5 n'est pas touchée**, et gagne même en nécessité : si
+   le modèle ne se protège pas tout seul, poser les plans de métadonnées dans la
+   bande lente doit être fait PAR CONSTRUCTION. C'est ce que la ph.11
+   implémente (`slow_rope_planes` + garde `rot_drift_max`).
+3. **Lecture la plus simple** : à fenêtre courte, la contamination par R(t) ne
+   coûte rien (la dérive de requête sur toute la fenêtre vaut 0,10 rad sur les
+   4 paires les plus lentes, 0,32 sur les 8 — et jusqu'à ~π sur les rapides,
+   mais avec S'=8-16 lignes seulement en compétition). Rien ne pousse donc W_K'
+   à choisir. **L'arbitrage réel se joue en fenêtre LONGUE, au 350M** — c'est là
+   que la mesure doit être refaite, et elle est désormais scriptée.
+
+Repro : `python -m deepseek_v4_mini.analysis.kvproj_wk_spectrum` (CPU, quelques
+secondes ; `--ckpts` pour un autre glob, JSON déposé à côté de chaque ckpt si le
+partage est inscriptible).
+
 ## 2026-08-03 (soir) — Carré factoriel des lectures attention (36/48, ailes dual_heads + kvproj COMPLÈTES) : dual_heads ÉLIMINÉ, kvproj ADOPTÉ (+0,209 citation, t=6,3), la compétition de masse softmax n'existait pas
 
 **Question (SPEC_MEMOIRE_V2 §2.4)** : dans le carré {projections partagées vs
