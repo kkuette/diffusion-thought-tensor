@@ -234,6 +234,26 @@ modality-agnostic). Deux ailes inchangées (§2.5) : surface = RTI α + copy-hea
 plate — le POINT dans le carré factoriel : {kv_append, kv_proj, dual_heads}
 ± bank-q, départagé sur Δnll citation + marges (le 2AFC sature).
 
+**Verdict partiel du carré (08-03 soir, 25/48 cellules — aile dual_heads
+COMPLÈTE, kvproj 1/12, bank-q à venir)** :
+- **dual_heads ≈ kv_append** : Δmark apparié +0,118 (sd 0,198, n=12),
+  Δnll citation −0,046 (nul). Les têtes dédiées à softmax séparé n'achètent
+  RIEN de mesurable à max_mem=8. À m=8, le softmax PARTAGÉ exploite même mieux
+  le budget m (Δnll citation 1,79 vs 1,45) — l'arbitrage de masse appris vaut
+  mieux que la séparation structurelle.
+- **La compétition de masse softmax n'est pas une contrainte réelle** à cette
+  échelle : le `bank_logit_bias` appris de kvproj reste ≈ 0 (moy +0,004,
+  max +0,022) — le modèle n'a pas eu besoin de gonfler la masse banque.
+- **Conséquence de design** : kv_append (projections partagées, softmax unifié)
+  reste le DÉFAUT — le plus simple gagne. Les projections K/V dédiées ne se
+  justifient plus par la performance mais par l'HÉBERGEMENT des plans de
+  métadonnées (§2bis.3 : les rotations ne peuvent pas vivre dans la bande RoPE
+  du backbone). Les cellules kvproj restantes mesurent le COÛT de cette
+  dédicace ; si kvproj ≤ kv_append, les métadonnées exigeront soit des dims
+  K/V étendues sur projections partagées, soit d'assumer un petit prix.
+- Réserve de lecture : ce verdict vaut à max_mem=8 — KT8 (dilution) dira s'il
+  tient quand la banque grandit.
+
 ### 2bis.3 Métadonnées = rotations sur plans réservés (K/V dédiées)
 
 Tout ce qui décrit une ligne — quand, qui, quel canal — est une rotation
@@ -251,7 +271,10 @@ Contraintes actées par la veille (ref-rotations-metadonnees-sota-2026) :
   réimplémentation du chat template dans l'espace où il n'existe plus (la
   sélection détruit les balises de rôle ; précédent : TS-RoPE, locuteur).
 - **Jamais dans la bande RoPE du backbone** (guideline « textual priors ») —
-  les plans vivent dans les projections K/V dédiées du read.
+  les plans vivent dans les projections K/V dédiées du read. NOTE 08-03 : le
+  carré (verdict partiel, §2bis.2) montre que la dédicace ne rapporte rien en
+  soi — elle est ici un MOYEN (héberger les plans hors bande backbone), pas une
+  fin ; son coût éventuel est mesuré par les cellules kvproj restantes.
 - **Contrôle NON NÉGOCIABLE (ph.11) : θ_âge = 0** — HoPE prouve que la rotation
   nulle sur l'axe long maximise le rappel ; si notre rotation d'âge ne bat pas ce
   bras sur la citation, l'âge passe en biais scalaire de récence.
