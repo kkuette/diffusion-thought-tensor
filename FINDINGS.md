@@ -37,6 +37,204 @@ test this — before scale.
 
 ---
 
+## 2026-08-03 — Kill-tests 1 & 2 : la voie surface BAT la compaction textuelle au RAPPEL (0,343 vs 0,227) et le PERD en nll — la dissociation est le résultat
+
+**TL;DR.** 563 sondes, cinq bras appariés sur les mêmes vies, même checkpoint
+(`v350_sft_recall_copy/final.pt`, step 1200). **Le kill-test 1 se scinde en
+deux.** Sur le RAPPEL EXACT, l'injection native gagne franchement : A 0,343
+contre 0,227 pour les mêmes tokens en texte (Δ apparié **+0,115**, IC95
+[+0,089, +0,142] — adjudicable, l'intervalle ne touche pas zéro). Sur la
+**nll VALEUR**, elle PERD : A 4,785 contre 4,500 (Δ **+0,223**, IC95
+[+0,116, +0,330] — A est *moins bon*). Les deux mesures ne pointent pas dans
+le même sens, et c'est le fait à retenir : le préfixe injecté + copy-head est
+un **pointeur**, pas un meilleur modèle de langue. Il gagne à l'argmax, il
+perd en vraisemblance. Aucun des deux chiffres seul ne dit la vérité de ce
+bras — c'est exactement le piège que la ventilation valeur/template avait déjà
+révélé au run rti, une strate plus bas.
+
+**Kill-test 2 : la CoT explicite ne nous tue pas ICI, et l'honnêteté oblige à
+dire pourquoi.** Le bras `<think>` (tous les faits résidents en verbatim dans
+la fenêtre, aucun retrieval) rend un grade de **0,009** — la borne basse. Mais
+sa **nll valeur est 4,264, MEILLEURE que celle de A (4,785)** : l'information
+est bien dans sa fenêtre, le modèle ne sait simplement pas l'en extraire au
+décodage. Ce checkpoint n'a jamais vu de bloc `<think>` : son 0,009 mesure un
+**écart de layout à l'entraînement**, pas une limite de la CoT. Verdict
+prudent : le précédent Coconut n'est **pas** réfuté par ce run, il est
+**hors de portée** de ce checkpoint.
+
+### Dispositif
+
+`analysis/kt12_surface_vs_text.py` — une passe, cinq bras, banque partagée,
+sondes appariées (mêmes vies, mêmes scripts, mêmes positions supervisées :
+l'invariant `den` identique bras à bras est vérifié au self-test).
+
+| bras | mémoire | contenu |
+|---|---|---|
+| `A_rti` | banque ON | préfixe de 2×(13+1) = 28 pseudo-tokens NATIFS injectés (`RtiRunner.parts`, sélection réelle du retriever) + copy-head |
+| `B_text` | OFF | les **mêmes ids**, **même ordre**, **même séparateur** (`<blank>`), mais en TEXTE — donc même longueur, mêmes positions RoPE que A ; seule change la NATURE du préfixe |
+| `B_nat` | OFF | même contenu détokenisé, en note naturelle (`Notes:\n…`) |
+| `C_off` | OFF | rien (borne basse, décodé une fois : sa sortie est constante) |
+| `D_think` | OFF | bloc `<think>` = énoncés VERBATIM des 8 faits résidents, sans retrieval |
+
+Env `recall_env` (life_seed 20260803, vies 100000+, disjointes du train),
+300 vies + 3 de chauffe, **563 sondes possibles**, 0 impossible, 0 sans
+injection. Banque NON remise à zéro entre vies (comme à l'éval du trainer) :
+les vies antérieures fournissent les distracteurs résidents. Décodage greedy
+`max_new=96`, cache ON ; nll teacher-forcée, pondérée `value_weight`=4 comme
+la CE du run. 4363 s sur la 3090.
+
+**B et B_nat reçoivent GRATUITEMENT le retrieval que A a payé** (leur texte
+est la sortie du retriever de A). Ce sont donc des **bornes supérieures** de
+la déflation « compaction avec indirection » : le +0,115 de A est acquis
+*malgré* ce cadeau.
+
+### Chiffres
+
+```
+bras       grade            IC95   nllVAL   nllTPL   nllANS  p_c val  calls   tokens
+A_rti      0.343   [0.305,0.383]    4.785    2.486    3.922    0.462   1126    37592
+B_text     0.227   [0.195,0.264]    4.500    2.363    3.698        —    563    26946
+B_nat      0.188   [0.158,0.223]    4.021    2.043    3.279        —    563    28603
+C_off      0.000   [0.000,0.007]    5.786    2.472    4.542        —    563    11182
+D_think    0.009   [0.004,0.021]    4.264    2.051    3.433        —    563    88172
+```
+
+Δ appariés (bootstrap 20 k sur les sondes ; grade : + = A meilleur ;
+val_nll : − = A meilleur) :
+
+```
+A − B_text    grade  +0.115 [+0.089,+0.142]    val_nll  +0.223 [+0.116,+0.330]
+A − B_nat     grade  +0.155 [+0.124,+0.187]    val_nll  +0.711 [+0.533,+0.890]
+A − C_off     grade  +0.343 [+0.304,+0.382]    val_nll  −1.332 [−1.631,−1.034]
+A − D_think   grade  +0.334 [+0.295,+0.373]    val_nll  +0.094 [−0.224,+0.414]
+```
+
+Grade CONDITIONNÉ à la sélection (n=345 hit / 218 miss) :
+
+```
+             hit     miss
+A_rti      0.559    0.000        (et 0.717 quand le VRAI groupe sort en tête, n=269)
+B_text     0.371    0.000
+B_nat      0.307    0.000
+D_think    0.012    0.005
+```
+
+Par strate (grade | nll VALEUR), n = persona 245, code 116, numeric 103,
+pref 99 :
+
+```
+strate         A_rti      B_text       B_nat       C_off     D_think
+persona     0.70|1.77   0.50|2.12   0.42|2.05   0.00|4.89   0.02|3.63
+numeric     0.20|3.78   0.05|3.02   0.02|2.66   0.00|3.70   0.01|2.21
+code        0.00|6.73   0.00|6.18   0.00|5.18   0.00|7.03   0.00|4.78
+pref       0.00|10.53   0.00|9.87   0.00|9.24   0.00|9.05   0.00|8.37
+```
+
+### Comptabilité des forwards (kill-test 2 — les DEUX comptes, non arbitrés)
+
+L'appariement en « tokens visibles » est proscrit (§1). On rapporte donc les
+deux comptes que la règle admet, et ils **ne classent pas dans le même sens** :
+
+| | invocations du modèle | positions traversées |
+|---|---|---|
+| `A_rti` | **1126** (563 réponses + 563 QUESTIONS) | **37 592** (26 946 réponse dont 28×563 de préfixe, + 10 646 question) |
+| `D_think` | **563** | **88 172** |
+| `B_text` | 563 | 26 946 |
+| `C_off` | 563 | 11 182 |
+
+- En **invocations**, D est 2× moins cher que A (A paie un forward de question
+  pour produire h_query — c'est le prix du retrieval).
+- En **positions traversées** (le proxy FLOPs), A est **2,35× moins cher** que
+  D : porter 8 faits en fenêtre coûte 156,6 tokens par réponse contre 47,9.
+- Les **writes de A coûtent 0 forward** : la sélection de surface est
+  procédurale (`build_group` lit la table d'embedding, zéro passage dans le
+  stack). C'est ce qui rend le bras A bon marché, et il faut le dire — ce
+  n'est pas de la magie, c'est un write qui ne pense pas.
+
+Sous l'un comme sous l'autre compte, A domine D au grade (+0,334). Le claim
+« budget visible » reste mort ; ce run ne le ressuscite pas et n'en avait pas
+besoin.
+
+### Verdicts
+
+1. **KT1 — la banque bat la compaction texte appariée AU RAPPEL.** +0,115 de
+   grade à IC95 [+0,089, +0,142] sur 563 sondes appariées, contre une borne
+   SUPÉRIEURE de la déflation (B reçoit le retrieval gratuitement). La voie
+   surface n'est pas un résumé textuel déguisé. La décision du §4 (« si B ≥ A
+   en fenêtre libre, le protocole RESET devient le seul terrain ») **ne se
+   déclenche pas** : B < A, ici, en fenêtre déjà bornée au segment.
+2. **KT1 bis — et elle le PERD en nll valeur** (+0,223 en faveur de B_text,
+   IC95 strictement positif). La lecture : le couple préfixe-injecté +
+   copy-head est un **pointeur discret**, il concentre la masse au bon endroit
+   quand la sélection est juste et n'améliore pas la distribution ailleurs ; le
+   texte en fenêtre, lui, est traité par le circuit natif du modèle et rend une
+   nll uniformément meilleure sans savoir *choisir*. **Conséquence de
+   protocole : Δnll seul ne peut plus servir de juge pour l'aile citation.**
+   C'est la deuxième fois que cette métrique nous égare (run rti : Δnll global
+   qui monte, nll valeur plate) — elle est désormais un diagnostic, pas un
+   verdict.
+3. **KT2 — la CoT explicite ne gagne pas ici, mais le test n'est pas
+   concluant contre elle.** Grade 0,009 ; nll valeur 4,264, MEILLEURE que celle
+   de A. Le canal existe, l'extraction n'existe pas — parce que ce checkpoint
+   n'a jamais été entraîné sur ce layout. Un vrai KT2 exige un bras `<think>`
+   ENTRAÎNÉ. À rouvrir avant toute affirmation publique sur Coconut.
+4. **Le mur est la SÉLECTION, pas la copie.** A monte à 0,559 sur les sondes
+   où le retriever a trouvé, 0,717 quand le vrai groupe sort en tête, et
+   **0,000** sur les 218 sondes ratées. Le r@1 tombe ici à **0,480** (contre
+   0,818 à l'éval du run) : la banque non réinitialisée mélange 8 groupes
+   venus de plusieurs vies et l'env recall a 4 strates, c'est un régime de
+   distracteurs bien plus dur que l'éval persona du trainer. Le levier le plus
+   rentable n'est pas la copie, c'est W_q.
+5. **Les strates non-lexicales restent à zéro partout.** `code` 0,00 et `pref`
+   0,00 dans les CINQ bras, y compris avec la vérité verbatim en fenêtre
+   (D_think). Ce n'est donc pas un problème de mémoire : c'est un plafond de
+   génération du backbone (exécuter un code, restituer une consigne longue).
+   Les gains de la banque vivent aujourd'hui sur `persona` (0,70) et un peu sur
+   `numeric` (0,20).
+
+### Réserves honnêtes
+
+- **Layout.** B change la nature du préfixe (pas de type-vec, pas de
+  copy-head) : c'est CONSTITUTIF du test (la compaction textuelle paie ce
+  prix), mais le modèle a été entraîné 1200 pas avec le préfixe injecté et
+  zéro avec le préfixe textuel. `B_nat` est là pour borner l'effet : il est
+  encore un peu PLUS bas que B_text au grade (0,188), donc l'écart n'est pas
+  un artefact de tokenisation bizarre — mais aucun des deux bras n'a été
+  entraîné, et un B entraîné n'est pas mesuré ici. **L'avantage de A est un
+  avantage à entraînement inégal.** C'est la réserve la plus lourde de ce run.
+- **D est pire que ça n'en a l'air, et mieux aussi.** Pire : il n'a jamais vu
+  ce layout. Mieux : il porte TOUS les faits sans retrieval, donc il n'a même
+  pas le droit de rater une sélection — et sa nll le montre.
+- **n et saturation.** n=563 donne des IC95 de largeur ~0,08 sur le grade :
+  adjudicable. Mais 2 strates sur 4 sont à zéro partout (216 sondes, 38 %),
+  donc le grade agrégé est porté par persona+numeric ; les Δ appariés
+  ci-dessus sont conservateurs de ce fait (les sondes plancher contribuent 0
+  à la différence, pas du bruit).
+- **Pas de held-out.** `recall_env._sample_persona` tire dans le pool COMPLET
+  de `persona_chat_data` (pas de `pool_split`), donc certaines valeurs ont pu
+  être vues au SFT. Le biais est **identique pour les cinq bras** et ne touche
+  donc pas les Δ appariés, mais il gonfle les niveaux absolus.
+- Tout est teacher-forcé sauf le décodage des réponses gradées : **aucun
+  chiffre ici ne parle de l'horizon de divergence** (§5.5).
+
+### Repro
+
+```
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate diffusion-thought
+PYTHONPATH=. python -m deepseek_v4_mini.analysis.kt12_surface_vs_text --selftest
+PYTHONPATH=. TB_ROOT=/mnt/tb python -m deepseek_v4_mini.analysis.kt12_surface_vs_text \
+  --ckpt /mnt/tb/checkpoints/v350_sft_recall_copy/final.pt \
+  --lives 300 --warmup 3 --out /mnt/tb/runs/kt12_surface_vs_text.json
+```
+
+Sortie par sonde (vie, pid, strate, âge, hit, top1, grade/nll par bras) dans
+le json. **Bug corrigé au passage** : `probe_id` est posé sur les DEUX segs
+d'une sonde (question ET réponse) par `RecallEnvStream.segs` ; grader sur cette
+clé seule comptait le tour de QUESTION comme une sonde « sans injection » et
+jetait la moitié de l'échantillon. Le tour gradé est celui qui porte `decode`.
+
+---
+
 ## 2026-08-02 — Labo jouet phase 9 (`tophid`) : from-scratch, le canal post-norm MARCHE et coûte 39 % de la citation — et il est mort dès que le readout est appris
 
 **TL;DR.** Prédiction inscrite dans le `.job` **avant** le run : « `code` < 0,35
