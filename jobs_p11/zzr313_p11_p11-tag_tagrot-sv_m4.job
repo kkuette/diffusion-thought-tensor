@@ -1,0 +1,17 @@
+# Labo jouet PHASE 11 — S5 tag de provenance, INSTRUMENT v2 (08-04)
+# Re-run de zzr30x : l'examen `ref` était INVALIDE — valeurs XX-12345 (queue à
+# 5 chiffres) hors de portée du circuit de copie du jouet ⇒ grade plancher
+# 0,000 dans TOUS les bras, métriques gelées step 0→3000, zéro discrimination
+# (sonde de décodage 08-04 : template du bon canal + lettres copiées, chiffres
+# dégénérés en répétitions — classe d'échec KT3/RTI). v2 = --prov-vals span :
+# valeurs MESURÉES en tokens (buckets 2-3), la copie est dans la plage prouvée
+# de l'instrument (span grade 0,97 à m8).
+# cellule p11-tag_tagrot-sv_m4 : r@1 (masse d'attention par groupe) et grade
+# (copie décodée) mesurés SÉPARÉMENT — règle S5 inchangée.
+# Adjudication (règle durcie 08-03) : nll_live ABSOLU apparié + grade décodé + r@1 — jamais le Δnll intra-modèle.
+# Sorties : $TB_MNT/checkpoints/toy_read_lab_p11/p11-tag_tagrot-sv_m4/
+set -o pipefail
+export TB_ROOT="$TB_MNT"
+mkdir -p "$TB_MNT/runs/toy_read_lab_p11"
+python -u -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p11.yaml --read kv_proj --tap postnorm --m 4 --p11-exam tag --p11-env prov --tag rot --prov-vals span --device cuda \
+  2>&1 | tee $TB_MNT/runs/toy_read_lab_p11/p11-tag_tagrot-sv_m4.log

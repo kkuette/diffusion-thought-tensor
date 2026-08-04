@@ -700,6 +700,15 @@ class ToyCfg:
                               # à budget de dims identique).
     n_channels: int = 2       # canaux de provenance (user, self). Un plan
                               # 0/π par canal ⇒ n_channels plans réservés.
+    prov_vals: str = "ref"    # POOL DE VALEURS de l'env `prov` : `ref` (legacy,
+                              # codes XX-12345 — INVALIDÉ 08-04 comme
+                              # instrument : la queue à 5 chiffres est hors de
+                              # portée du circuit de copie du jouet, grade
+                              # plancher 0 dans TOUS les bras, l'examen ne
+                              # discrimine rien) | `span` (valeurs MESURÉES en
+                              # tokens par span_value_pool, buckets courts —
+                              # la copie est dans la plage prouvée de
+                              # l'instrument : span grade 0,97).
     loc_mode: str = "none"    # famille INDEX LOCAL intra-span (S17) : `none` |
                               # `rot` (R_loc(j) sur loc_planes plans, j =
                               # index de la ligne DANS son write — borné par
@@ -985,6 +994,13 @@ class ToyCfg:
                 f"le tag de PROVENANCE code un canal user/self : hors de l'env "
                 f"`prov` toutes les lignes ont le canal 0 et le tag serait un "
                 f"no-op silencieux (reçu p11_env={self.p11_env!r})")
+        assert self.prov_vals in ("ref", "span"), (
+            f"prov_vals inconnu {self.prov_vals!r} (∈ ref|span)")
+        if self.prov_vals != "ref":
+            assert self.p11_env == "prov", (
+                f"prov_vals ne concerne que l'env `prov` (reçu "
+                f"p11_env={self.p11_env!r}) — ailleurs il serait un no-op "
+                f"silencieux")
         if self.loc_mode != "none":
             assert self.top_k >= 2, (
                 f"l'index LOCAL distingue les lignes DANS un write : à "
@@ -3282,12 +3298,25 @@ class PersonaProvStream(Persona11Stream):
     La question nomme le canal ; la réponse cite la valeur de CE canal.
     """
 
-    def __init__(self, tok, *, prov_fillers: tuple = (1, 3), **kw) -> None:
+    def __init__(self, tok, *, prov_fillers: tuple = (1, 3),
+                 prov_vals: str = "ref", **kw) -> None:
         super().__init__(tok, **kw)
         self.prov_fillers = tuple(int(v) for v in prov_fillers)
+        # `span` : valeurs MESURÉES en tokens (buckets 2-3, les deux plus
+        # courts disponibles au-delà de 1) — la copie reste dans la plage
+        # prouvée de l'instrument, et la longueur n'entre pas comme variable
+        # confondante de l'examen tag (elle appartient à S17, pas S5).
+        self.prov_pool = None
+        if prov_vals == "span":
+            sp = span_value_pool(tok)
+            keep = [n for n in sorted(sp) if n >= 2][:2]
+            self.prov_pool = [v for n in keep for v in sp[n]]
+            assert len(self.prov_pool) >= 8, (
+                f"pool prov `span` trop petit ({len(self.prov_pool)}) avec ce "
+                f"tokenizer — buckets {keep} sur {sorted(sp)}")
 
     def _conv_prov(self) -> dict:
-        pool = self.slots[PROV_SLOT][4]
+        pool = self.prov_pool or self.slots[PROV_SLOT][4]
         v_user, v_self = self.rng.sample(pool, 2)
         st = self.slots[PROV_SLOT][0]
         u_seg = self._user_valued(self.rng.choice(st).format(v=v_user, p=""),
@@ -5184,7 +5213,9 @@ def p11_name(cfg: ToyCfg) -> str:
     if ex in ("age", "ood"):
         arm = P11_ARM[cfg.bank_rot] + ("-aug" if cfg.age_aug else "")
     elif ex == "tag":
-        arm = "tag" + cfg.tag_mode
+        # `-sv` = pool de valeurs `span` (instrument v2, 08-04) — legacy `ref`
+        # sans suffixe pour ne pas renommer les cellules déjà dépouillées.
+        arm = "tag" + cfg.tag_mode + ("-sv" if cfg.prov_vals == "span" else "")
     else:
         arm = "loc" + cfg.loc_mode
     return f"p11-{ex}_{arm}_m{cfg.top_k}"
@@ -5884,6 +5915,12 @@ def main(argv=None):
                     help="famille PROVENANCE (S5) : none | rot (un plan 0/π "
                          "PAR CANAL) | add (vecteur appris par canal sur les "
                          "MÊMES dims réservées). Exige --p11-env prov.")
+    ap.add_argument("--prov-vals", choices=("ref", "span"), default=None,
+                    dest="prov_vals",
+                    help="pool de valeurs de l'env prov (S5) : ref (legacy, "
+                         "codes XX-12345 — examen INVALIDÉ 08-04, copie hors "
+                         "de portée) | span (valeurs mesurées en tokens, "
+                         "buckets courts — l'instrument v2).")
     ap.add_argument("--locidx", choices=LOC_MODES, default=None,
                     dest="loc_mode",
                     help="famille INDEX LOCAL intra-span (S17) : none | rot "
@@ -6056,12 +6093,14 @@ def main(argv=None):
     for key, cast in (("bank_rot", str), ("age_planes", int), ("age_ref", int),
                       ("age_aug", bool), ("age_aug_max", float),
                       ("age_eval_scales", str), ("tag_mode", str),
+                      ("prov_vals", str),
                       ("n_channels", int), ("loc_mode", str),
                       ("loc_planes", int), ("rot_drift_max", float),
                       ("p11_env", str), ("p11_exam", str)):
         if key in pb:
             mc[key] = cast(pb[key])
     for key, val in (("bank_rot", a.bank_rot), ("tag_mode", a.tag_mode),
+                     ("prov_vals", a.prov_vals),
                      ("loc_mode", a.loc_mode), ("p11_env", a.p11_env),
                      ("p11_exam", a.p11_exam),
                      ("age_eval_scales", a.age_eval_scales)):
@@ -6186,6 +6225,9 @@ def main(argv=None):
         # la longueur de vie est un AXE DE CELLULE (elle entre dans le nom du
         # dossier), donc elle vient de la config du modèle, pas des kwargs.
         p11_gen["life_turns"] = int(cfg.life_turns)
+    if cfg.p11_env == "prov":
+        # même statut : le pool de valeurs est un axe de cellule (suffixe -sv).
+        p11_gen["prov_vals"] = cfg.prov_vals
 
     def pk(split, **over):
         return {**persona_kwargs(raw, split, a.smoke, cond=cfg.cond),
@@ -6868,7 +6910,8 @@ def main(argv=None):
         "p11": ({"exam": p11_exam(cfg), "env": cfg.p11_env,
                  "bank_rot": cfg.bank_rot, "age_aug": bool(cfg.age_aug),
                  "age_ref": cfg.age_ref, "age_planes": cfg.age_planes,
-                 "tag_mode": cfg.tag_mode, "loc_mode": cfg.loc_mode,
+                 "tag_mode": cfg.tag_mode, "prov_vals": cfg.prov_vals,
+                 "loc_mode": cfg.loc_mode,
                  "loc_planes": cfg.loc_planes,
                  "drift_rad": next((round(float(b.attn.rot.drift), 6)
                                     for b in model.blocks
