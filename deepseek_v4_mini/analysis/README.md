@@ -27,20 +27,18 @@ from the original campaign; pass yours as the first argument instead.
 |---|---|
 | `ttt_demo`, `switch_probe_k2` | `archive/dsv4mini/multiturn_rule_k2_inter_s128_dsv4m.yaml` |
 | `ttt_demo_act2`, `superposition_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w.yaml` |
-| `gate_probe`, `reflection_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml` |
-| `switch_inspect`, `canonical_ident` | `archive/dsv4mini/multiturn_rule_switch.yaml` |
-| `joint_inspect` | `archive/dsv4mini/multiturn_rule_joint.yaml` |
-| `rehearsal_inspect` | `archive/dsv4mini/multiturn_rule_horizon.yaml` |
-| `hop_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s128hop_dsv5c.yaml` |
-| `write_code_probe` | `archive/dsv4mini/multiturn_rule_k2_inter_s256L.yaml` |
-| `affine_per_unit` | `archive/dsv4mini/multiturn_rule_k2_inter_affineL_wr.yaml` |
-| `code_geometry` | `archive/dsv4mini/multiturn_rule_k2_heldout.yaml` |
-| `code_defer_bank_probes` | `archive/mechanism/code_defer_native_v2b_mix.yaml` |
-| `doc2code_probe` | `rl_defer_grpo_97m.yaml` |
-
-`freq_vs_surp` and `freq_vs_surp_mix` need no checkpoint (they measure the
-data). `smollm_graft_smoke` and `verbal_tasks_smoke` target the SmolLM2 graft
-arc, now under `deepseek_v4_mini/legacy/`.
+**Retired probes (2026-08-05).** The other historical diagnostics of the closed
+dsv4mini/mechanism arcs (`gate_probe`, `reflection_probe`, `switch_inspect`,
+`canonical_ident`, `joint_inspect`, `rehearsal_inspect`, `hop_probe`,
+`write_code_probe`, `affine_per_unit`, `code_geometry`,
+`code_defer_bank_probes`, `doc2code_probe`, `freq_vs_surp`, `freq_vs_surp_mix`,
+`postnorm_equiv`, `smollm_graft_smoke`, `verbal_tasks_smoke`) were removed from
+the tree: they are not part of the paper repro (`repro/run_all.sh` only calls
+the four probes above) and their arcs are closed. They remain available in git
+history (`git log --diff-filter=D -- deepseek_v4_mini/analysis/`) and as plain
+files in the NAS archive (`/mnt/tb/archive/repo-cleanup-2026-08-05/`, with a
+MANIFEST mapping each probe to its origin). Their findings are kept in the
+results tables below.
 
 **These are scripts, not modules.** Config and checkpoint are module-level
 constants evaluated at import: importing a probe *runs* it, and fails if the

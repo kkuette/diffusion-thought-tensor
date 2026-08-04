@@ -2379,8 +2379,9 @@ def main() -> None:
                     f"  turns={mp['mem_turns']:.0f}{acc}"
                 )
             if writer is not None and viz_last is not None:
-                from .bank_viz import (bank_content_fig, bank_similarity_fig,
-                                       writes_pca_fig)
+                from .legacy.bank_viz import (bank_content_fig,
+                                              bank_similarity_fig,
+                                              writes_pca_fig)
                 _wl, _fb = viz_last
                 writer.add_figure("bank/content", bank_content_fig(_fb), step)
                 writer.add_figure("bank/similarity", bank_similarity_fig(_fb), step)

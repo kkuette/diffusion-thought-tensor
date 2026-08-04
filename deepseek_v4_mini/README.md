@@ -406,14 +406,12 @@ deepseek_v4_mini/
   train.py       — training loop, probes, synthetic tasks, teacher-forced bootstrap
   eval_memory.py — offline PPL with vs without the bank
   analysis/      — offline mechanistic diagnostics + campaign results (see its README)
-    code_geometry.py     — write-code manifold structure + held-code placement
-    rehearsal_inspect.py — do query-turn writes re-encode the rule? (horizon)
-    switch_inspect.py    — per-turn write similarity across the rule switch
-    canonical_ident.py   — which rule does a write encode, vs canonical codes
     switch_probe_k2.py   — K=2 switch probe on generalizing ckpts (STICK, bank 1-NN, --sweep)
     ttt_demo.py          — headline act 1: bank vs TTT vs ICL, FLOPs accounting (--sub)
     ttt_demo_act2.py     — headline act 2: replacement at inference + TTT interference
     superposition_probe.py — bank geometry / rule-code cloud / write redundancy (paper Fig. 4)
+    (the other historical probes of the closed arcs were retired 2026-08-05 —
+     findings kept in analysis/README.md, files in git history + NAS archive)
   configs/
     tiny.yaml / small.yaml   — TinyStories
     code_persist.yaml        — code, bank persists across sequences

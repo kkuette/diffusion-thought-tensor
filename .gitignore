@@ -94,3 +94,15 @@ repro/out/
 paper/latex/arxiv_build/
 paper/latex/arxiv_submission.tar.gz
 paper/latex/
+
+# Sorties d'analyse écrites dans le cwd par analysis/*.py (fallback abspath)
+/abs_nll_audit.json
+/kvproj_wk_spectrum.json
+/s16_stats.json
+/s18_stock.json
+
+# Sorties toy_read_lab.py quand TB_ROOT=. (save_dir dans le repo)
+results.json
+metrics.csv
+*_metrics.csv
+data_cache/

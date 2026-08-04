@@ -1,13 +1,22 @@
+![Fractale](assets/fractale-banner.png)
+
 # Thought Bank
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21225721.svg)](https://doi.org/10.5281/zenodo.21225721)
 
-Research repo exploring **persistent thought memory** for language models. The
-active line of work is **`deepseek_v4_mini`**: a small reproduction of the
-DeepSeek-V4 architecture fused with a **fast-weight thought bank** — a rolling
-memory the model reads as *weights* (a per-slot low-rank MLP applied to the token
-stream) and writes to itself, targeting **continual learning at inference without
-a backward pass**.
+Research repo exploring **persistent thought memory** for language models: a
+**bank** the model writes to in-line, *outside* its context window, and reads
+back by attention — session state that survives context resets at zero window
+cost. The active line of work is **`deepseek_v4_mini`**, a small DeepSeek-style
+architecture fused with that bank.
+
+**Where the project is now** — the current design and its open questions live
+in **[SPEC_MEMOIRE_V2.md](SPEC_MEMOIRE_V2.md)** (the claim, the architecture,
+the registry of pending decisions), with
+[EXPERIMENTS.md](EXPERIMENTS.md) (experiment tree),
+[FINDINGS.md](FINDINGS.md) (newest-first journal) and
+[assets/diagramme_banque.html](assets/diagramme_banque.html) (architecture
+diagram) as companions.
 
 ## 📄 Paper
 
@@ -86,20 +95,54 @@ documented with exact reproduction commands in **[FINDINGS.md](FINDINGS.md)**
    (usage repo: [fractale-lm/fractale](https://github.com/fractale-lm/fractale);
    the model card lives on the Hub).
 
-The current phase is **phase 2**: instruction-following through a ChatML chat
-template (no address tokens), SFT on reassembled state-of-the-art instruction
-data stretched into long sessions, then a GRPO ratchet on verifiable
-environments. Active configs are the un-archived ones under
-[`deepseek_v4_mini/configs/`](deepseek_v4_mini/configs/); the closed arcs live
-in [`configs/archive/`](deepseek_v4_mini/configs/archive/README.md).
+## 🎯 Current phase: memory v2 — persistence across window RESETs
 
-> **Branches:** day-to-day work happens on the phase-2 branch
-> (`sft-persona-350m` at the time of writing); `main` is the last merged
-> checkpoint and lags behind it.
+Since 2026-07-31 the program is re-anchored on
+**[SPEC_MEMOIRE_V2.md](SPEC_MEMOIRE_V2.md)**. The claim under test:
+
+> At a bounded, matched context window, a model with a bank (written in-line,
+> outside the context) maintains behavioural conditioning AND exact recall
+> **across window resets**, at zero window cost — against text compaction and
+> transcript RAG, matched in total forwards.
+
+The design is being settled arm-by-arm in a **toy read lab**
+([`deepseek_v4_mini/toy_read_lab.py`](deepseek_v4_mini/toy_read_lab.py),
+phases 10–12, run on a rig farm via the pre-registered jobs in
+[`jobs_p11/`](jobs_p11/) and [`jobs_p12/`](jobs_p12/)). Key verdicts so far
+(details and adjudication rules in the spec §3):
+
+- **Attention read wins** — the bank is read by attention over a flat view of
+  native vectors (`kvproj`: dedicated K/V projections, unified softmax); the
+  fast-weight read of the paper era lost in both regimes and is retired from
+  the design.
+- **Citation goes through native injection** — every learned readout died;
+  exact recall = retrieve-then-inject native embeddings + a copy head
+  (validated end-to-end at 350M: the `copy` run).
+- **max_mem = 8 for the graft** — flat attention collapses between 8 and 16
+  slots with real distractors; beyond that the hierarchical read (spec §2.8)
+  is the only path, with the measured collapse as its baseline.
+- **Metadata are rotations on reserved planes** of the dedicated keys — age
+  (log-compressed; scale augmentation is what carries the OOD, not the log
+  itself) and provenance channel (whose real domain is pinning and
+  selection-filtering, not citation); the local intra-span index was measured
+  unnecessary and dropped.
+
+Next step: **graft the v2 read onto the 350M checkpoint** (spec §3, S19-S21),
+then the RESET protocol evals (spec §6.4). Active configs are the un-archived
+ones under [`deepseek_v4_mini/configs/`](deepseek_v4_mini/configs/); the closed
+arcs live in [`configs/archive/`](deepseek_v4_mini/configs/archive/README.md).
 
 ---
 
-## 🧠 Core idea
+## 🧠 Core idea (paper era)
+
+> **Note (2026-08):** this section describes the architecture *as published in
+> the paper* (fast-weight read). The current design replaces the fast-weight
+> read with attention over native vector lines — see
+> [SPEC_MEMOIRE_V2.md](SPEC_MEMOIRE_V2.md) §2 and
+> [assets/diagramme_banque.html](assets/diagramme_banque.html). The invariants
+> survive: write once per turn, FIFO cap, the bank as the only cross-turn
+> channel.
 
 ![The Thought Bank architecture](paper/figures/fig1_architecture.png)
 
@@ -140,8 +183,11 @@ from pretraining to SFT.
 # phase 1 — pretraining (the 350M lineage)
 python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_phase1_10b.yaml
 
-# phase 2 — chat SFT on reassembled SOTA instruction data
-python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/sft_sota_350m.yaml
+# citation wing — SFT recall with the copy head (the validated 350M chain)
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/sft_recall_350m_copy.yaml
+
+# toy read lab — the design cells of memory v2 (see jobs_p11/, jobs_p12/)
+python -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml
 
 # GRPO, disaggregated workers/learner
 python -m deepseek_v4_mini.rl_disagg deepseek_v4_mini/configs/rl_disagg_350m.yaml
@@ -342,16 +388,19 @@ slot count identical:
 
 | File | Purpose |
 |---|---|
-| `configs/v350_*.yaml` | 350M phase 1: bring-up, compile/fastpath smokes, the 10B run (`v350_phase1_10b.yaml`), the SIF teacher repass |
-| `configs/sft_sota_*.yaml` | phase 2 SFT on reassembled state-of-the-art instruction data (long sessions, tools, code-exec) |
-| `configs/sft_persona_*.yaml` | the persona prototype that opened the read channel (arc closed 2026-07-24; kept as the immediate lineage) |
-| `configs/rl_*.yaml` | GRPO: lives, deferred rollouts, disaggregated worker/learner |
-| `configs/code_defer_native_350m*.yaml` | 350M native deferred-continuation lineage |
+| `configs/toy_read_lab*.yaml` | the memory-v2 design lab (phases 10–12): read form, rotations, retention, dilution |
+| `configs/v350_*.yaml` | 350M phase 1: bring-up, fastpath smoke, the 10B run (`v350_phase1_10b.yaml`), the SIF teacher repass |
+| `configs/sft_recall_350m_{copy,rti}.yaml` | the citation wing at 350M (RTI + copy head; `copy` is the validated chain) |
+| `configs/rl_*.yaml` | GRPO harness: lives, recall env, disaggregated worker/learner (recall GRPO paused) |
+| `configs/sft_*stair*.yaml`, `sft_persona_350m_sif_repass*.yaml` | closed runs kept in place as `init_from` lineages of live configs |
+| `configs/code_defer_native_350m.yaml` | 350M native deferred-continuation lineage |
 | `configs/farm/` | 350M ablations run on the 3070Ti rig |
 
-**Archive** — the two closed arcs, kept because FINDINGS/README and the
+**Archive** — the closed arcs, kept because FINDINGS/README and the
 `analysis/` probes cite them by name
-([details](deepseek_v4_mini/configs/archive/README.md)):
+([details](deepseek_v4_mini/configs/archive/README.md), including
+`archive/phase2_350m/` — the persona/SOTA/bring-up-smoke configs closed
+2026-07-30):
 
 | File | Dataset / task | Purpose |
 |---|---|---|
@@ -381,29 +430,40 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 ## 📁 Repository layout
 
 ```
+SPEC_MEMOIRE_V2.md       ← THE current spec: claim, architecture, open decisions
+EXPERIMENTS.md           ← experiment tree (arc → cells → verdicts)
+FINDINGS.md              ← newest-first journal with repro commands
 paper/                   ← the paper (paper.pdf, draft.md, figures/)
 repro/                   ← end-to-end reproduction of the paper (run_all.sh)
-deepseek_v4_mini/        ← active project (fast-weight thought bank)
+assets/                  ← banner, architecture diagram (diagramme_banque.html)
+jobs_p11/, jobs_p12/     ← pre-registered farm jobs of toy-lab phases 11–12
+                           (headers carry the predictions + adjudication rules)
+deepseek_v4_mini/        ← active project
   model.py  memory.py  attention.py  moe.py  mhc.py  cascade.py  config.py
   muon.py                ← Muon + the param split (shared by every trainer)
-  code_defer_native.py   ← THE trainer of the current program (phase 1 + SFT)
+  toy_read_lab.py        ← the memory-v2 design lab (phases 10–12)
+  code_defer_native.py   ← THE trainer of the 350M line (phase 1 + SFT)
+  rti.py  rti_copy.py  rti_policy.py  rti_learner.py  ← citation wing
+  recall_env.py          ← paired-lives recall environment
   streams.py             ← name→class registry for conversation streams
   *_data.py              ← the streams: sota_session, tool_env, code_exec,
                            persona, math_school, chat_mix
   rl_disagg.py  rl_lives.py  rl_rewards.py  exec_sandbox.py   ← GRPO + envs
+  decode.py  decode_graphs.py  ← unified decode + CUDA-graphs fast path
   train.py               ← trainer of the closed dsv4mini arc (repro only)
   eval_memory.py         ← offline PPL with/without the bank
   analysis/              ← mechanistic diagnostics + campaign results
                            (see its README for repro status per probe)
   legacy/                ← closed arc: the SmolLM2 graft
-  configs/               ← active program: phase-1 SIF (v350_*), SFT (sft_*),
-                           RL (rl_*), 350M ablations (farm/)
+  configs/               ← active program: toy lab, phase-1 SIF (v350_*),
+                           citation SFT, RL (rl_*), 350M ablations (farm/)
     archive/dsv4mini/    ← closed toy arc: tiny, small, code, code_persist,
                            synth_recall, gist, multiturn_rule family
     archive/mechanism/   ← closed native v2/v3 arc (+ farm/ sweeps)
+    archive/phase2_350m/ ← closed persona/SOTA arcs + bring-up smokes
 scripts/                 ← selftest.sh (hermetic CPU tests), farm/ (rig queue)
 legacy/thought_lm_minimal/  ← the 2025 ancestor, kept for the record
-checkpoints/, runs/      ← training outputs
+checkpoints/, runs/      ← training outputs (gitignored)
 ```
 
 ---

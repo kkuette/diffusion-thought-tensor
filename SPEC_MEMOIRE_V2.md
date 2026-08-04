@@ -4,8 +4,10 @@ Statut : **VALIDÉ ET CONSOLIDÉ**. Cette édition fusionne le recentrage du 07-
 (critique adversariale acceptée), les verdicts du 08-01 (KT3, sonde de
 localisation), et la journée du 08-03 (run copy, KT1-2, grille jouet ph.10,
 carré factoriel partiel, veille rotations, cinq itérations de design du write).
-L'historique des strates vit dans git et [FINDINGS.md](FINDINGS.md) ; companion :
-[EXPERIMENTS.md](EXPERIMENTS.md) (arbre). Ce qui n'est pas encore tranché est
+L'historique des strates vit dans git et [FINDINGS.md](FINDINGS.md) ; companions :
+[EXPERIMENTS.md](EXPERIMENTS.md) (arbre) et
+[assets/diagramme_banque.html](assets/diagramme_banque.html) (le diagramme
+d'architecture, tenu à jour avec les verdicts). Ce qui n'est pas encore tranché est
 au **§3 (EN SUSPENS)** — une décision, un test, une règle.
 
 Remplace comme cap de phase : l'arc recall/RTI en tant que *fin* — le RTI est
