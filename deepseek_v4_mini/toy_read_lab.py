@@ -5263,6 +5263,16 @@ def p12_name(cfg: ToyCfg) -> str:
     arm = P12_ARM[cfg.retention]
     if cfg.prop_budget:
         arm += f"-p{cfg.prop_budget}"
+    # Les bras de ROTATION entrent dans le nom — sans quoi deux cellules qui ne
+    # diffèrent que par bank_rot/tag/loc partagent le save_dir et la seconde
+    # ÉCRASE la première (payé 08-04 : zzs115/116 agelog ont détruit les
+    # results.json/ckpts des bras base zzs101/103 ; seuls les logs survivent).
+    if cfg.bank_rot != "none":
+        arm += "-" + P11_ARM[cfg.bank_rot] + ("-aug" if cfg.age_aug else "")
+    if cfg.tag_mode != "none":
+        arm += f"-tag{cfg.tag_mode}"
+    if cfg.loc_mode != "none":
+        arm += f"-loc{cfg.loc_mode}"
     return f"p12-retention_{arm}_T{cfg.life_turns}"
 
 
