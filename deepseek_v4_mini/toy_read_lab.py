@@ -3511,6 +3511,13 @@ class PersonaLifeStream(Persona11Stream):
             assert len(self.life_pool) >= 16, (
                 f"pool life `span` trop petit ({len(self.life_pool)}) avec ce "
                 f"tokenizer — buckets {keep} sur {sorted(sp)}")
+            # les valeurs span doivent exister dans val_ids : fact_val du
+            # write ET p11_target de l'env se résolvent par cette table
+            # (même extension des deux côtés — cf. extend_val_ids_span).
+            for n in sorted(sp):
+                for v in sp[n]:
+                    if v not in self.val_ids:
+                        self.val_ids[v] = len(self.val_ids) + 1
         assert LIFE_SLOT in self.slots, (
             f"l'env `life` a besoin du slot {LIFE_SLOT!r} (supersession "
             f"outillée) — pool_split trop maigre ?")
@@ -3753,10 +3760,26 @@ class GroupBank(list):
         self.groups = list(groups)
 
 
+def extend_val_ids_span(val_ids: dict, tok) -> None:
+    """Fix life-sv (08-05) : enregistre les valeurs de `span_value_pool` dans
+    `val_ids`, ids DÉTERMINISTES appendés après la table de base (ordre =
+    buckets croissants puis ordre du pool). Sans ça, `fact_val` vaut 0 côté
+    stream et `p11_target` ne résout jamais la vérité côté env : le smoke a
+    rendu resident_rate 0,0 et r@1 n_sel=0 alors que les writes se faisaient.
+    À appeler des DEUX côtés (stream ET env) — chacun a sa copie de la table,
+    et l'appariement des ids exige la même extension dans le même ordre."""
+    sp = span_value_pool(tok)
+    for n in sorted(sp):
+        for v in sp[n]:
+            if v not in val_ids:
+                val_ids[v] = len(val_ids) + 1
+
+
 class OracleEnv:
     """Rejoue une conv seg par seg et pose la banque à la place du modèle."""
 
-    def __init__(self, tok, max_mem: int, write_mode: str = "fact"):
+    def __init__(self, tok, max_mem: int, write_mode: str = "fact",
+                 span_vals: bool = False):
         self.tok = tok
         self.max_mem = max_mem
         assert write_mode in WRITE_MODES, write_mode
@@ -3765,6 +3788,8 @@ class OracleEnv:
         # d'âge : « combien de writes séparent le fait de sa query »).
         self.last_added = 0
         slot_ids, val_ids, attr_ids = fact_id_maps()
+        if span_vals:
+            extend_val_ids_span(val_ids, tok)
         self.slot_ids = slot_ids
         self.val_ids = val_ids
         self.id2val = {i: v for v, i in val_ids.items()}
@@ -6256,7 +6281,8 @@ def main(argv=None):
 
     torch.manual_seed(int(t.get("seed", 0)))
     tok = build_tokenizer(raw["tokenizer"])
-    env = OracleEnv(tok, int(mc.get("max_mem", 8)), write_mode=a.write_mode)
+    env = OracleEnv(tok, int(mc.get("max_mem", 8)), write_mode=a.write_mode,
+                    span_vals=(mc.get("life_vals") == "span"))
 
     mc["variant"] = a.variant
     mc["code"] = a.code
