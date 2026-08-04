@@ -101,7 +101,7 @@ pool l'est (`real_filler` → `PersonaChatStream._load_real_pairs`, le même
 chemin disque-caché que le SFT).
 
 Self-test CPU hermétique (stub tokenizer, vrai bac à sable) :
-    python -m deepseek_v4_mini.recall_env
+    python -m deepseek_v4_mini.data.recall_env
 """
 from __future__ import annotations
 
@@ -115,8 +115,8 @@ from typing import Callable
 import torch
 
 from . import persona_chat_data as P
-from .exec_sandbox import pass_frac
-from .rl_rewards import extract_code
+from ..rl.exec_sandbox import pass_frac
+from ..rl.rl_rewards import extract_code
 
 # Base des identifiants de slot. Les ids persona (`fact_id_maps`) sont 1-based
 # et petits ; en décaler les nôtres de 1000 garantit qu'un fait persona et une
@@ -647,7 +647,7 @@ def make_recall_env_reward(n_max: int = 16, floor: float = 1.0,
     Une sonde IMPOSSIBLE rend None : à l'appelant de l'exclure du groupe GRPO
     plutôt que de la compter comme un échec.
     """
-    from .rl_rewards import think_economy
+    from ..rl.rl_rewards import think_economy
 
     def fn(ce, info):
         g = grade_probe(info["probe"], info.get("text") or "", timeout)
@@ -1021,7 +1021,7 @@ def _selftest() -> None:
     # (le schéma dit que la clé existe ; ceci dit que la dataclass la lit.)
     import pathlib
     import yaml as _yaml
-    p = pathlib.Path(__file__).with_name("configs") / "rl_recall_env_smoke.yaml"
+    p = pathlib.Path(__file__).parents[1] / "configs" / "rl_recall_env_smoke.yaml"
     if p.exists():
         raw = _yaml.safe_load(p.read_text())
         c = RecallEnvConfig.from_raw(raw["recall_env"])

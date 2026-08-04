@@ -23,7 +23,7 @@ import re
 
 import torch
 
-from .cascade import CascadeMemory
+from ..core.cascade import CascadeMemory
 
 
 # ── écriture ─────────────────────────────────────────────────────────────────

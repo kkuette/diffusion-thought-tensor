@@ -39,8 +39,8 @@ from collections import defaultdict
 
 import torch
 
-from deepseek_v4_mini.recall_env import RecallEnvStream, slot_id_map
-from deepseek_v4_mini.rti import RtiConfig, build_group, key_separation, sif_table
+from deepseek_v4_mini.data.recall_env import RecallEnvStream, slot_id_map
+from deepseek_v4_mini.rl.rti import RtiConfig, build_group, key_separation, sif_table
 
 
 def collect(stream, lives: int) -> list:

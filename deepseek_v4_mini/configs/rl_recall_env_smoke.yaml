@@ -1,6 +1,6 @@
 # rl_recall_env_smoke — l'ENV DE RAPPEL GÉNÉRAL, en configuration de fumée.
 #
-# CE QUE CE FICHIER EST. Le curriculum de `deepseek_v4_mini/recall_env.py` (vies
+# CE QUE CE FICHIER EST. Le curriculum de `deepseek_v4_mini/data/recall_env.py` (vies
 # de rappel scriptées et APPARIÉES + reward vérifiable), posé dans la forme que
 # `rl_disagg` consomme pour que `--check` le valide AVANT de réserver le GPU.
 # Le reste du fichier (model/rl) est repris de rl_recall_350m.yaml pour que la

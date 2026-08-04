@@ -24,7 +24,7 @@ $PY -c "import torch, transformers, datasets, yaml, tensorboard, tqdm" 2>/dev/nu
 
 # passe par le loader du paquet : les chemins de config sont relatifs à
 # ${TB_ROOT} (défaut "."), donc il faut l'expansion pour retrouver save_dir.
-SAVE_DIR=$($PY -c "import sys; from deepseek_v4_mini.paths import load_yaml; print(load_yaml(sys.argv[1])['training']['save_dir'])" "$CFG")
+SAVE_DIR=$($PY -c "import sys; from deepseek_v4_mini.infra.paths import load_yaml; print(load_yaml(sys.argv[1])['training']['save_dir'])" "$CFG")
 [ -n "$SAVE_DIR" ] || { echo "[pod_run] save_dir illisible dans $CFG — abandon"; exit 1; }
 mkdir -p "runs/$NAME" "$SAVE_DIR"
 

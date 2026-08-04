@@ -209,11 +209,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .math_school_data import A_OPEN, CLOSE as CLOSE_P11
-from .paths import load_yaml
-from .persona_chat_data import (PET_TYPES, SIBLINGS, PersonaChatStream,
+from .data.math_school_data import A_OPEN, CLOSE as CLOSE_P11
+from .infra.paths import load_yaml
+from .data.persona_chat_data import (PET_TYPES, SIBLINGS, PersonaChatStream,
                                 fact_id_maps, grade_recall)
-from .streams import chat_stream_class
+from .data.streams import chat_stream_class
 
 VARIANTS = ("r0", "r1", "r2", "r3", "r4", "r5")
 # r4 = INJECTION À SÉLECTION ORACLE : AUCUN module de read appris. Le groupe
@@ -7193,7 +7193,7 @@ def code_roundtrip(model: ToyReadLM, slot_id: int, attr_id: int,
 # ── self-test (CPU, dimensions minuscules) ───────────────────────────────────
 
 def _selftest() -> None:
-    from .persona_chat_data import PersonaChatStream, _StubTok
+    from .data.persona_chat_data import PersonaChatStream, _StubTok
 
     # Le self-test ne seedait RIEN : les embeddings de chaque modèle jouet
     # étaient tirés au hasard du process, et les round-trips ORACLE (qui sont

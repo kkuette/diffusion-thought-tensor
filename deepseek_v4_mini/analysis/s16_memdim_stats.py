@@ -57,7 +57,7 @@ def summarize(name, per_turn, write_flags, dedup_pairs):
 
 
 def stats_recall_env(n_lives):
-    from deepseek_v4_mini.recall_env import RecallEnvConfig, build_script
+    from deepseek_v4_mini.data.recall_env import RecallEnvConfig, build_script
     from deepseek_v4_mini.toy_read_lab import build_tokenizer
     cfg = RecallEnvConfig()
     tok = build_tokenizer("HuggingFaceTB/SmolLM2-135M")

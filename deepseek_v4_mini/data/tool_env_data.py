@@ -26,9 +26,9 @@ with rl_rewards.make_tool_reward — same episodes for SFT and for GRPO, which
 is what makes the ratchet's distill step a filter, not a new pipeline.
 
 Hermetic self-test (stub tokenizer, no downloads):
-  python -m deepseek_v4_mini.tool_env_data
+  python -m deepseek_v4_mini.data.tool_env_data
 Real smoke (downloads, prints one session):
-  python -m deepseek_v4_mini.tool_env_data <yaml with tokenizer: + tools.gen>
+  python -m deepseek_v4_mini.data.tool_env_data <yaml with tokenizer: + tools.gen>
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ import sys
 import torch
 
 from .persona_chat_data import PersonaChatStream
-from .rl_rewards import _balanced_spans, extract_calls, grade_calls
-from .paths import load_yaml
+from ..rl.rl_rewards import _balanced_spans, extract_calls, grade_calls
+from ..infra.paths import load_yaml
 
 
 # ── glaive chat mining ───────────────────────────────────────────────────────

@@ -28,12 +28,12 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from .config import ThoughtBankConfig
-from .model import TrunkLM, ThoughtBankLM
+from .infra.config import ThoughtBankConfig
+from .core.model import TrunkLM, ThoughtBankLM
 # Muon vit dans .muon depuis 2026-07-25 ; réexporté ici pour que les commandes
 # de repro dsv4mini et les imports existants (`from .train import Muon`) tiennent.
-from .muon import Muon, _split_muon_params, _zeropower_via_newtonschulz  # noqa: F401
-from .paths import expand
+from .infra.muon import Muon, _split_muon_params, _zeropower_via_newtonschulz  # noqa: F401
+from .infra.paths import expand
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────

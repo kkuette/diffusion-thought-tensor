@@ -67,7 +67,7 @@ Le forward pose `out["logits_are_logprobs"] = True` pour que rien ne se croie
 en face de logits bruts (un `.exp()` naïf sur des logits serait une erreur
 silencieuse ; ici il rend des probabilités justes).
 
-    python -m deepseek_v4_mini.rti_copy      # self-test (CPU, ~1 min)
+    python -m deepseek_v4_mini.rl.rti_copy      # self-test (CPU, ~1 min)
 """
 from __future__ import annotations
 

@@ -25,9 +25,9 @@ Grading: token-F1 of the decoded reply vs the original answer (report-only
 figure — Δnll live/ablated stays the sensitive probe).
 
 Hermetic self-test (stub tokenizer, no downloads):
-  python -m deepseek_v4_mini.sota_session_data
+  python -m deepseek_v4_mini.data.sota_session_data
 Real smoke (downloads/caches the dataset, decodes one conv per kind):
-  python -m deepseek_v4_mini.sota_session_data <any yaml with tokenizer:>
+  python -m deepseek_v4_mini.data.sota_session_data <any yaml with tokenizer:>
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ import torch
 
 from .math_school_data import U_OPEN, A_OPEN, CLOSE
 from .persona_chat_data import PersonaChatStream
-from .paths import load_yaml
+from ..infra.paths import load_yaml
 
 _WORD = re.compile(r"[a-z0-9']+")
 

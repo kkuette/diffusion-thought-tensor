@@ -30,8 +30,8 @@ sys.path.insert(0, REPO)
 
 import yaml  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
-from deepseek_v4_mini.code_data import CodeChunkStream  # noqa: E402
-from deepseek_v4_mini.paths import expand
+from deepseek_v4_mini.data.code_data import CodeChunkStream  # noqa: E402
+from deepseek_v4_mini.infra.paths import expand
 
 
 def prebuild(cfg_path: str, cache_dir: str, only: list[str] | None = None) -> None:

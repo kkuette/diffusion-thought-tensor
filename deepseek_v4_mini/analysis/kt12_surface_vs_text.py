@@ -83,9 +83,9 @@ import torch
 import torch.nn.functional as F
 
 from deepseek_v4_mini.code_defer_native import _greedy, _val_split
-from deepseek_v4_mini.recall_env import (RecallEnvConfig, RecallEnvStream,
+from deepseek_v4_mini.data.recall_env import (RecallEnvConfig, RecallEnvStream,
                                          grade_probe, slot_id_map)
-from deepseek_v4_mini.rti import RtiConfig, RtiRunner, sif_table
+from deepseek_v4_mini.rl.rti import RtiConfig, RtiRunner, sif_table
 
 ARMS = ("A_rti", "B_text", "B_nat", "C_off", "D_think")
 A_OPEN = "<|im_start|>assistant\n"
@@ -385,10 +385,10 @@ def run(model, stream, tok, rti, cfg_rti, device, *, lives: int,
 
 def build(ckpt: str, config: str, device: str):
     from transformers import AutoTokenizer
-    from deepseek_v4_mini.paths import load_yaml
-    from deepseek_v4_mini.model import ThoughtBankConfig, ThoughtBankLM
-    from deepseek_v4_mini.rti import InjectType, Retriever
-    from deepseek_v4_mini.rti_copy import CopyHead, CopyHeadConfig
+    from deepseek_v4_mini.infra.paths import load_yaml
+    from deepseek_v4_mini.core.model import ThoughtBankConfig, ThoughtBankLM
+    from deepseek_v4_mini.rl.rti import InjectType, Retriever
+    from deepseek_v4_mini.rl.rti_copy import CopyHead, CopyHeadConfig
 
     raw = load_yaml(config)
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
@@ -485,9 +485,9 @@ class _Tok:
 
 
 def _selftest() -> None:
-    from deepseek_v4_mini.model import ThoughtBankConfig, ThoughtBankLM
-    from deepseek_v4_mini.rti import InjectType, Retriever
-    from deepseek_v4_mini.rti_copy import CopyHead, CopyHeadConfig
+    from deepseek_v4_mini.core.model import ThoughtBankConfig, ThoughtBankLM
+    from deepseek_v4_mini.rl.rti import InjectType, Retriever
+    from deepseek_v4_mini.rl.rti_copy import CopyHead, CopyHeadConfig
 
     torch.manual_seed(20260803)
     V = 256

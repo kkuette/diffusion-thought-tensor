@@ -30,8 +30,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .config import ThoughtBankConfig
-from .model import TrunkLM, ThoughtBankLM
+from .infra.config import ThoughtBankConfig
+from .core.model import TrunkLM, ThoughtBankLM
 
 
 # ── Synthetic text ────────────────────────────────────────────────────────────

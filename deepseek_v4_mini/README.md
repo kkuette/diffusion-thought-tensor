@@ -396,15 +396,33 @@ Training/data knobs (YAML `training:` / `data:`):
 ## File structure
 
 ```
-deepseek_v4_mini/
-  config.py      — ThoughtBankConfig dataclass + YAML loader
-  mhc.py         — ManifoldHyperConnections + RMSNorm
-  attention.py   — CompressedSparseAttention, HeavilyCompressedAttention, RoPE
-  moe.py         — SwiGLU, DeepSeekMoE
-  memory.py      — ThoughtStream: bank seeding + gated write + FIFO (write side only)
-  model.py       — TrunkLM, ThoughtBankLM, DualModalBlock (fast-weight read)
-  train.py       — training loop, probes, synthetic tasks, teacher-forced bootstrap
+deepseek_v4_mini/            (reorganized 2026-08-05: core/infra/data/rl
+                              subpackages; entrypoints stay at the root)
+  train.py       — ENTRYPOINT dsv4mini arc: training loop, probes, synthetic
+                   tasks, teacher-forced bootstrap (kept for paper repro)
+  code_defer_native.py — ENTRYPOINT of the 350M line (phase 1 + SFT)
+  toy_read_lab.py      — ENTRYPOINT of the memory-v2 design lab (ph. 10–12)
+  rl_disagg.py         — ENTRYPOINT disaggregated GRPO
   eval_memory.py — offline PPL with vs without the bank
+  core/
+    mhc.py       — ManifoldHyperConnections + RMSNorm
+    attention.py — CompressedSparseAttention, HeavilyCompressedAttention, RoPE
+    moe.py       — SwiGLU, DeepSeekMoE
+    memory.py    — ThoughtStream: bank seeding + gated write + FIFO (write side)
+    model.py     — TrunkLM, ThoughtBankLM, DualModalBlock (fast-weight read)
+    cascade.py delta_channel.py
+  infra/
+    config.py    — ThoughtBankConfig dataclass + YAML loader
+    cfg_schema.py paths.py runtime.py sched.py ckpt.py muon.py
+    decode.py decode_graphs.py
+  data/
+    streams.py   — name→class registry for conversation streams
+    persona_chat_data.py math_school_data.py code_data.py sota_session_data.py
+    tool_env_data.py code_exec_data.py chat_mix.py chat_batch.py recall_env.py
+  rl/
+    rti.py rti_copy.py rti_policy.py rti_learner.py — the citation wing
+    rl_lives.py rl_rewards.py rl_defer_grpo.py rl_defer_grpo_lives.py
+    exec_sandbox.py
   analysis/      — offline mechanistic diagnostics + campaign results (see its README)
     switch_probe_k2.py   — K=2 switch probe on generalizing ckpts (STICK, bank 1-NN, --sweep)
     ttt_demo.py          — headline act 1: bank vs TTT vs ICL, FLOPs accounting (--sub)

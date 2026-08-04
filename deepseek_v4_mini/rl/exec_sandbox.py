@@ -20,7 +20,7 @@ boundary, which is what grading needs.
 Cost: one subprocess per grading call (~50-150 ms interpreter start + tests).
 At G=8 rollouts/group that is well under the decode cost of the call turn.
 
-CPU self-test:  python -m deepseek_v4_mini.exec_sandbox
+CPU self-test:  python -m deepseek_v4_mini.rl.exec_sandbox
 """
 from __future__ import annotations
 

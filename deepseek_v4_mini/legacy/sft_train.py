@@ -34,7 +34,7 @@ from torch.optim import AdamW
 
 from .smollm_graft import GraftConfig, SmolBankLM
 from .verbal_tasks import VerbalRuleGen, VerbalTaskConfig, UltraChatTurns
-from ..paths import load_yaml
+from ..infra.paths import load_yaml
 
 
 # ── Conversation plumbing ────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ def main(cfg_path: str) -> None:
                        "weight_decay": 0.0}])
     opt_kind = str(t.get("opt_bank", "adamw"))
     if opt_kind == "muon":
-        from ..muon import Muon
+        from ..infra.muon import Muon
         muon_lr = float(t.get("muon_lr", 3.0e-3))
         mats = [p for p in graft_params if p.ndim == 2]
         rest = [p for p in graft_params if p.ndim != 2]

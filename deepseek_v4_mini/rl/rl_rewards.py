@@ -26,7 +26,7 @@ Everything here is text/floats in, float out: usable identically by the farm
 rollout workers (rl_disagg), the learner's regrade path, and offline SFT
 filtering of RL traces (the distill step of the ratchet).
 
-CPU self-test:  python -m deepseek_v4_mini.rl_rewards
+CPU self-test:  python -m deepseek_v4_mini.rl.rl_rewards
 """
 from __future__ import annotations
 
@@ -244,7 +244,7 @@ def make_recall_reward(n_max: int, floor: float = 0.4
 
     Écrit en retour info["raw"] = le grade AVANT économie de think (même
     convention que tool/exec : c'est le taux que le suivi RL regarde)."""
-    from .persona_chat_data import grade_recall
+    from ..data.persona_chat_data import grade_recall
 
     def fn(ce, info):
         truth = info.get("truth") or ""

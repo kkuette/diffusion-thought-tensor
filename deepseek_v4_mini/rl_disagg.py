@@ -58,17 +58,17 @@ import uuid
 import torch
 import torch.nn.functional as F
 
-from .cascade import CascadeMemory
-from .decode import generate
-from .rl_defer_grpo import pos_write_corr
-from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
+from .core.cascade import CascadeMemory
+from .infra.decode import generate
+from .rl.rl_defer_grpo import pos_write_corr
+from .rl.rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
-from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
-from .rl_rewards import make_exec_reward, make_recall_reward, make_tool_reward
-from .rti_learner import learn_from_raw, step_groups, telemetry
-from .rti_policy import attach_rti_modules, rti_from_raw
-from .cfg_schema import check as check_cfg
-from .paths import load_yaml
+from .rl.rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
+from .rl.rl_rewards import make_exec_reward, make_recall_reward, make_tool_reward
+from .rl.rti_learner import learn_from_raw, step_groups, telemetry
+from .rl.rti_policy import attach_rti_modules, rti_from_raw
+from .infra.cfg_schema import check as check_cfg
+from .infra.paths import load_yaml
 
 
 # ── shared-FS primitives ─────────────────────────────────────────────────────
@@ -239,14 +239,14 @@ def build_envs(d: dict, r: dict, tok, seed: int, raw: dict = None):
     `raw` : la config ENTIÈRE, pour la section `recall_env:` (le curriculum ne
     vit pas dans `data.envs[].gen` — c'est un bloc de premier rang, partagé par
     tous les workers, et c'est lui qui porte le `layout` du préfixe)."""
-    from .code_data import CodeChunkStream
+    from .data.code_data import CodeChunkStream
     envs = []
     for i, e in enumerate(d["envs"]):
         kind = e.get("kind", "code")
         w = float(e.get("weight", 1.0))
         if kind == "recall_env":
-            from .recall_env import RecallEnvConfig, make_recall_env_reward
-            from .streams import chat_stream_class
+            from .data.recall_env import RecallEnvConfig, make_recall_env_reward
+            from .data.streams import chat_stream_class
             rc = RecallEnvConfig.from_raw((raw or {}).get("recall_env") or {})
             stream = chat_stream_class("recall_env")(
                 tok, seed=seed + 31 * i, cfg=rc, **(e.get("gen") or {}))
@@ -277,7 +277,7 @@ def build_envs(d: dict, r: dict, tok, seed: int, raw: dict = None):
         else:
             # tool / exec / sota : même contrat de construction (registre
             # streams.py), seul le reward diffère.
-            from .streams import rl_stream_class
+            from .data.streams import rl_stream_class
             stream = rl_stream_class(kind)(tok, seed=seed + 31 * i,
                                            **(e.get("gen") or {}))
             if kind == "tool":
@@ -373,8 +373,8 @@ class Worker:
                     self.tok.convert_tokens_to_ids("<blank>"))
 
         if model is None:
-            from .config import ThoughtBankConfig
-            from .model import ThoughtBankLM
+            from .infra.config import ThoughtBankConfig
+            from .core.model import ThoughtBankLM
             mcfg = dict(raw["model"])
             mcfg["vocab_size"] = len(self.tok)
             model = ThoughtBankLM(ThoughtBankConfig(**mcfg)).to(self.device)
@@ -426,7 +426,7 @@ class Worker:
         stop = "<|im_end|>"
         self.stop_id = (self.tok.convert_tokens_to_ids(stop)
                         if stop in self.tok.get_vocab() else -1)
-        from .math_school_data import A_OPEN
+        from .data.math_school_data import A_OPEN
         a_ids = self.tok(A_OPEN, add_special_tokens=False)["input_ids"]
         self.a_open = torch.tensor(a_ids, dtype=torch.long,
                                    device=self.device).unsqueeze(0)
@@ -461,7 +461,7 @@ class Worker:
     def _rti_setup(self, raw: dict) -> None:
         """Arme le bras retrieve-then-inject, ou ne fait rien (chemin
         historique BIT À BIT inchangé sans la section `rti:`)."""
-        from .rti_policy import attach_rti_modules, rti_from_raw
+        from .rl.rti_policy import attach_rti_modules, rti_from_raw
         self.rti_cfg, self.rti_pol, self.rti_on = rti_from_raw(raw or {})
         self._sif: dict = {}
         self._rti_n = 0
@@ -503,7 +503,7 @@ class Worker:
 
     def _sif_w(self, env):
         """Table SIF du stream (une par env, calculée une fois)."""
-        from .rti import sif_table
+        from .rl.rti import sif_table
         w = self._sif.get(env.name)
         if w is None:
             w = self._sif[env.name] = sif_table(
@@ -556,7 +556,7 @@ class Worker:
         différents, et le baseline de groupe mesurerait la difficulté du script
         au lieu de la qualité de la politique.
         """
-        from .rti_policy import RtiRollout
+        from .rl.rti_policy import RtiRollout
         roll = RtiRollout(self.model, self.tok, self.rti_cfg, self.rti_pol,
                           self._sif_w(env), self.rti_sep, a_open=self.a_open,
                           stop_id=self.stop_id,
@@ -645,7 +645,7 @@ class Worker:
             return None
         if bank.size(1) != self.max_mem or bank.size(0) > self.G:
             return None                     # vie pas encore établie : eager
-        from .decode_graphs import GraphDecodeRunner
+        from .infra.decode_graphs import GraphDecodeRunner
         B = bank.size(0)
         if B < self.G:
             pad = self.G - B
@@ -935,8 +935,8 @@ class Learner:
 
         if model is None:
             from transformers import AutoTokenizer
-            from .config import ThoughtBankConfig
-            from .model import ThoughtBankLM
+            from .infra.config import ThoughtBankConfig
+            from .core.model import ThoughtBankLM
             if tok_len is None:
                 tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
                 add = [x for x in ("<think>", "<blank>")
@@ -1053,7 +1053,7 @@ class Learner:
         """Attache les modules rti au modèle du learner. IMPÉRATIF : le worker
         recharge le `state_dict` PUBLIÉ tel quel — deux modèles de formes
         différentes et le run s'arrête au premier fetch."""
-        from .rti_policy import attach_rti_modules, rti_from_raw
+        from .rl.rti_policy import attach_rti_modules, rti_from_raw
         _, _, on = rti_from_raw(raw or {})
         if on:
             attach_rti_modules(model, int(model.embed.weight.size(1)))
@@ -1264,8 +1264,8 @@ def main(argv):
 def _self_test():
     import shutil
     import tempfile
-    from .config import ThoughtBankConfig
-    from .model import ThoughtBankLM
+    from .infra.config import ThoughtBankConfig
+    from .core.model import ThoughtBankLM
 
     root = tempfile.mkdtemp(prefix="rl_disagg_")
     torch.manual_seed(0)
@@ -1458,8 +1458,8 @@ def _self_test():
     #    UN script (appariement), le groupe expédié porte les trois actions
     #    avec leurs log-probs, et le learner v1 REFUSE bruyamment de le
     #    consommer (l'algo est le chantier de l'agent 3).
-    from . import persona_chat_data as _P
-    from .rti_policy import probe_pairs
+    from .data import persona_chat_data as _P
+    from .rl.rti_policy import probe_pairs
 
     class _RtiTok(_P._StubTok):               # ids = ord(c) : vocab 512 suffit
         def get_vocab(self):

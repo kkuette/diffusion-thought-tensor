@@ -39,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mhc import RMSNorm
-from .config import ThoughtBankConfig
+from ..infra.config import ThoughtBankConfig
 
 
 class ThoughtStream(nn.Module):

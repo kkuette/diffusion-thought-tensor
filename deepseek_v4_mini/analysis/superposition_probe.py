@@ -17,8 +17,8 @@ Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/superposition_probe.py \
 import json, sys, torch, torch.nn.functional as F
 
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import ThoughtBankConfig
-from deepseek_v4_mini.model import ThoughtBankLM
+from deepseek_v4_mini.infra.config import ThoughtBankConfig
+from deepseek_v4_mini.core.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space, _effective_rank
 
 torch.manual_seed(0)
@@ -29,7 +29,7 @@ CFG = sys.argv[sys.argv.index("--cfg") + 1] if "--cfg" in sys.argv else \
 S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N = 128
-from ..paths import load_yaml
+from ..infra.paths import load_yaml
 raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)

@@ -94,7 +94,7 @@ tokens décodés). Ces quatre champs rendent le learner INDÉPENDANT du
 tokenizer, du corpus de filler et du stream — il ne reconstruit rien, il rejoue.
 
 Self-test CPU :
-    python -m deepseek_v4_mini.rti_learner
+    python -m deepseek_v4_mini.rl.rti_learner
 """
 from __future__ import annotations
 
@@ -761,10 +761,10 @@ def _selftest() -> None:
           f"{cr_bad[100][0]:+.2f} si elle est fausse")
 
     # ── (a) ON-POLICY : les ratios valent 1, et CISPO == REINFORCE ──────────
-    from . import persona_chat_data as P
-    from .config import ThoughtBankConfig
-    from .model import ThoughtBankLM
-    from .recall_env import (RecallEnvConfig, RecallEnvStream,
+    from ..data import persona_chat_data as P
+    from ..infra.config import ThoughtBankConfig
+    from ..core.model import ThoughtBankLM
+    from ..data.recall_env import (RecallEnvConfig, RecallEnvStream,
                              make_recall_env_reward)
     from .rti import sif_table
     from .rti_policy import RtiRollout, attach_rti_modules

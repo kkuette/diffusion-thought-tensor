@@ -333,7 +333,7 @@ la veille (fiche ref-rotations-metadonnees-sota-2026) :
 
 | | Lecture ambiante | Lecture ciblée |
 |---|---|---|
-| Mécanisme | attention sur la vue plate (kvproj), chaque forward | RTI + copy-head ([rti.py](deepseek_v4_mini/rti.py), [rti_copy.py](deepseek_v4_mini/rti_copy.py)) |
+| Mécanisme | attention sur la vue plate (kvproj), chaque forward | RTI + copy-head ([rti.py](deepseek_v4_mini/rl/rti.py), [rti_copy.py](deepseek_v4_mini/rl/rti_copy.py)) |
 | Consomme | lignes de nature gist | lignes de nature surface |
 | Fonction | module la distribution (registre, langue, règles) | restitue au token près |
 | Invocation | toujours | à la demande (action RL) |
@@ -426,7 +426,7 @@ d'oracle, remplacé à terme par le write `<think>`.
 
 ### 4.2 Contrefactuel leave-one — REQUIS pour S12
 
-Le leave-one-slot existant ([rti_learner.py](deepseek_v4_mini/rti_learner.py))
+Le leave-one-slot existant ([rti_learner.py](deepseek_v4_mini/rl/rti_learner.py))
 mesure la valeur de ce qui est écrit, pas de ce qui est perdu. Sans « rejouer en
 préservant la ligne évincée », le choix de propagation n'a pas de gradient et le
 GRPO dégénère en FIFO. Extension du harnais requise avant KT6.
@@ -475,7 +475,7 @@ Le 2AFC de la grille ph.10 (live/shuf/none) est le format validé au jouet.
 
 ### 6.2 Aile citation — rappel exact apparié
 
-Env recall et harnais RL existants tels quels ([recall_env.py](deepseek_v4_mini/recall_env.py),
+Env recall et harnais RL existants tels quels ([recall_env.py](deepseek_v4_mini/data/recall_env.py),
 vies scriptées appariées = ancres GiGPO) + négatifs §4.4 + taux de copie indue.
 Métrique = grade de rappel, jamais Δnll (règle §1).
 

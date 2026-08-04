@@ -85,9 +85,9 @@ from collections import defaultdict
 
 import torch
 
-from deepseek_v4_mini.config import ThoughtBankConfig
-from deepseek_v4_mini.model import ThoughtBankLM
-from deepseek_v4_mini.recall_env import RecallEnvStream, slot_id_map
+from deepseek_v4_mini.infra.config import ThoughtBankConfig
+from deepseek_v4_mini.core.model import ThoughtBankLM
+from deepseek_v4_mini.data.recall_env import RecallEnvStream, slot_id_map
 
 STAGES = ["mean768", "pooled768", "stored512", "read768"]
 

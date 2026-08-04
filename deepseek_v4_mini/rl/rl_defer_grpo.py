@@ -48,7 +48,7 @@ writes (a policy re-discovering "write every ~N tokens" without reading content
 shows up as corr -> 1) + policy reward vs the always-write / never-write forced
 baselines (the emergent-behavior headline: selective > always at equal budget).
 
-  python -m deepseek_v4_mini.rl_defer_grpo deepseek_v4_mini/configs/rl_defer_grpo_97m.yaml
+  python -m deepseek_v4_mini.rl.rl_defer_grpo deepseek_v4_mini/configs/rl_defer_grpo_97m.yaml
 """
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from .config import ThoughtBankConfig
-from .model import ThoughtBankLM
-from .code_data import CodeChunkStream
-from .paths import load_yaml
+from ..infra.config import ThoughtBankConfig
+from ..core.model import ThoughtBankLM
+from ..data.code_data import CodeChunkStream
+from ..infra.paths import load_yaml
 
 
 # ── policy primitives ────────────────────────────────────────────────────────

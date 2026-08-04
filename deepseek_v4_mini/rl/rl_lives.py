@@ -36,7 +36,7 @@ task-grounded. Cross-episode continuity is free: retrieving a fact planted
 three episodes ago IS use, not retention — no term here rewards keeping
 particular contents alive, and none should ever.
 
-CPU self-test:  python -m deepseek_v4_mini.rl_lives
+CPU self-test:  python -m deepseek_v4_mini.rl.rl_lives
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from .cascade import CascadeMemory
+from ..core.cascade import CascadeMemory
 
 
 # ── memory state primitives ──────────────────────────────────────────────────

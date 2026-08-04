@@ -23,7 +23,7 @@ setstate() restores all, seed() reseeds all — a resumed run CONTINUES the
 same mixed sequence. grade_conv dispatches to the stream that PRODUCED the
 conv (tagged in info), so per-kind graders keep their own semantics.
 
-CPU self-test (hermetic):  python -m deepseek_v4_mini.chat_mix
+CPU self-test (hermetic):  python -m deepseek_v4_mini.data.chat_mix
 """
 from __future__ import annotations
 

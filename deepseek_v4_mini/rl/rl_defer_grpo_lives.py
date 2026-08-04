@@ -30,7 +30,7 @@ the trainer: slot 0 of a FULL bank descends on write; the first
 mem_seed_slots evictions are seeds and do not descend (per-life counter,
 forked with the group).
 
-  python -m deepseek_v4_mini.rl_defer_grpo_lives deepseek_v4_mini/configs/rl_lives_97m.yaml
+  python -m deepseek_v4_mini.rl.rl_defer_grpo_lives deepseek_v4_mini/configs/rl_lives_97m.yaml
 """
 from __future__ import annotations
 
@@ -47,13 +47,13 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from .config import ThoughtBankConfig
-from .model import ThoughtBankLM
-from .code_data import CodeChunkStream
-from .cascade import CascadeMemory
+from ..infra.config import ThoughtBankConfig
+from ..core.model import ThoughtBankLM
+from ..data.code_data import CodeChunkStream
+from ..core.cascade import CascadeMemory
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
 from .rl_defer_grpo import pos_write_corr
-from .paths import load_yaml
+from ..infra.paths import load_yaml
 
 
 # ── policy primitives (cascade-aware variants of v1) ────────────────────────

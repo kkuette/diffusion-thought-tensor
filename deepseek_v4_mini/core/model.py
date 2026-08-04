@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ThoughtBankConfig
+from ..infra.config import ThoughtBankConfig
 from .mhc import ManifoldHyperConnections, RMSNorm
 from .attention import CompressedSparseAttention, HeavilyCompressedAttention
 from .moe import DeepSeekMoE
@@ -703,7 +703,7 @@ def _selftest() -> None:
     # ── rti_copy : la TÊTE DE COPIE aux logits ──────────────────────────────
     # L'invariant qui protège le run en cours : tant que `prefix_ids` n'est pas
     # passé, accrocher la tête au modèle est STRICTEMENT invisible — au bit.
-    from .rti_copy import CopyHead, CopyHeadConfig
+    from ..rl.rti_copy import CopyHead, CopyHeadConfig
     m.eval()
     with torch.no_grad():
         ref_i = m(ids, init_mem=bk_i, inject=pre)["logits"].clone()
@@ -791,7 +791,7 @@ def _selftest() -> None:
 
     # ── decode_fuse : hoisting fw_A/fw_B — mêmes bits, et le mémo n'est
     #    JAMAIS servi périmé (write = nouvel objet ; mutation = _version) ─────
-    from .decode import generate
+    from ..infra.decode import generate
     torch.manual_seed(11)
     m_off = ThoughtBankLM(_cfg()).double().eval()
     m_on = ThoughtBankLM(_cfg(decode_fuse=True)).double().eval()

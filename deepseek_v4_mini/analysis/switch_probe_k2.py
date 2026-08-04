@@ -27,8 +27,8 @@ import json, sys, torch, torch.nn.functional as F
 
 WT = "."
 sys.path.insert(0, WT)
-from deepseek_v4_mini.config import ThoughtBankConfig
-from deepseek_v4_mini.model import ThoughtBankLM
+from deepseek_v4_mini.infra.config import ThoughtBankConfig
+from deepseek_v4_mini.core.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
@@ -41,7 +41,7 @@ if "--cfg" in sys.argv:
 S, m, K, SYM_OFF = 128, 6, 2, 3
 KEY_OFF = SYM_OFF + S
 N = 128                                  # conversations (batched lanes)
-from ..paths import load_yaml
+from ..infra.paths import load_yaml
 raw = load_yaml(CFG)
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)

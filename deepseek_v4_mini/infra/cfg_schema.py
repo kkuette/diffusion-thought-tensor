@@ -22,8 +22,8 @@ que le schéma vaille exactement ça pour `code_defer_native` (et couvre au moin
 ça pour les autres entrées). Ajouter une clé au trainer sans la déclarer ici
 fait échouer `scripts/selftest.sh` — le schéma ne peut pas mentir en silence.
 
-    python -m deepseek_v4_mini.cfg_schema           # self-test + valide les configs
-    python -m deepseek_v4_mini.cfg_schema --dump    # schéma tel qu'extrait du source
+    python -m deepseek_v4_mini.infra.cfg_schema           # self-test + valide les configs
+    python -m deepseek_v4_mini.infra.cfg_schema --dump    # schéma tel qu'extrait du source
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ import ast
 import difflib
 from pathlib import Path
 
-_PKG = Path(__file__).resolve().parent
+_PKG = Path(__file__).resolve().parent.parent
 
 
 class ConfigError(ValueError):
@@ -252,8 +252,8 @@ ENTRY_SOURCE: dict[str, tuple[str, dict[str, str]]] = {
     # entrée → (fichier, {nom de variable racine: section qu'elle porte})
     "code_defer_native":   ("code_defer_native.py",   {"raw": ""}),
     "rl_disagg":           ("rl_disagg.py",           {"raw": ""}),
-    "rl_defer_grpo_lives": ("rl_defer_grpo_lives.py", {"raw": ""}),
-    "rl_defer_grpo":       ("rl_defer_grpo.py",       {"raw": ""}),
+    "rl_defer_grpo_lives": ("rl/rl_defer_grpo_lives.py", {"raw": ""}),
+    "rl_defer_grpo":       ("rl/rl_defer_grpo.py",       {"raw": ""}),
 }
 
 

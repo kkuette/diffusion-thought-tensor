@@ -60,7 +60,7 @@ vraiment : le décodage des sondes (préfixes différents), batché par longueur
 préfixe. Ce n'est pas une approximation, c'est une factorisation.
 
 Self-test CPU (vrai ThoughtBankLM minuscule, vrai `generate`) :
-    python -m deepseek_v4_mini.rti_policy
+    python -m deepseek_v4_mini.rl.rti_policy
 """
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .decode import generate
+from ..infra.decode import generate
 from .rti import (LaneBank, RtiConfig, build_group, build_prefix,
                   pick_eval_groups, sif_table)
 
@@ -722,10 +722,10 @@ def _selftest() -> None:
           "prioritaire à égalité) sur 200 cas, dont ex æquo")
 
     # ── modèle jouet RÉEL (vrai forward, vrai inject, vrai generate) ────────
-    from .config import ThoughtBankConfig
-    from .model import ThoughtBankLM
-    from .recall_env import RecallEnvConfig, RecallEnvStream, make_recall_env_reward
-    from . import persona_chat_data as P
+    from ..infra.config import ThoughtBankConfig
+    from ..core.model import ThoughtBankLM
+    from ..data.recall_env import RecallEnvConfig, RecallEnvStream, make_recall_env_reward
+    from ..data import persona_chat_data as P
 
     tok = P._StubTok()                     # ids = ord(c) : tout tient sous 512
     V = 512

@@ -351,7 +351,7 @@ def _selftest() -> None:
     # bascule-t-il sur un ULP ? ». La première se teste ici, la seconde est une
     # propriété du modèle (voir le commentaire de use_cache).
     from .config import ThoughtBankConfig
-    from .model import ThoughtBankLM
+    from ..core.model import ThoughtBankLM
 
     # top_k_experts == n_experts et top_k_csa ≥ nb de blocs : AUCUN top-k dur ne
     # tranche ici. C'est délibéré — sinon le test ne mesurerait pas le cache

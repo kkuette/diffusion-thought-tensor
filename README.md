@@ -206,7 +206,7 @@ TB_ROOT=/mnt/big_volume python -m deepseek_v4_mini.code_defer_native <config>
 ```
 
 The `chat.stream` key of an SFT config picks the conversation stream from the
-registry in [`deepseek_v4_mini/streams.py`](deepseek_v4_mini/streams.py)
+registry in [`deepseek_v4_mini/data/streams.py`](deepseek_v4_mini/data/streams.py)
 (`sota_session`, `tool_session`, `code_exec`, `persona`, `math_school`, or
 `chat_mix` to weight several of them).
 
@@ -439,19 +439,21 @@ assets/                  ← banner, architecture diagram (diagramme_banque.html
 jobs_p11/, jobs_p12/     ← pre-registered farm jobs of toy-lab phases 11–12
                            (headers carry the predictions + adjudication rules)
 deepseek_v4_mini/        ← active project
-  model.py  memory.py  attention.py  moe.py  mhc.py  cascade.py  config.py
-  muon.py                ← Muon + the param split (shared by every trainer)
-  toy_read_lab.py        ← the memory-v2 design lab (phases 10–12)
-  code_defer_native.py   ← THE trainer of the 350M line (phase 1 + SFT)
-  rti.py  rti_copy.py  rti_policy.py  rti_learner.py  ← citation wing
-  recall_env.py          ← paired-lives recall environment
-  streams.py             ← name→class registry for conversation streams
-  *_data.py              ← the streams: sota_session, tool_env, code_exec,
-                           persona, math_school, chat_mix
-  rl_disagg.py  rl_lives.py  rl_rewards.py  exec_sandbox.py   ← GRPO + envs
-  decode.py  decode_graphs.py  ← unified decode + CUDA-graphs fast path
-  train.py               ← trainer of the closed dsv4mini arc (repro only)
+  toy_read_lab.py        ← ENTRYPOINT: the memory-v2 design lab (phases 10–12)
+  code_defer_native.py   ← ENTRYPOINT: trainer of the 350M line (phase 1 + SFT)
+  rl_disagg.py           ← ENTRYPOINT: disaggregated GRPO (workers/learner)
+  train.py               ← ENTRYPOINT: trainer of the closed dsv4mini arc (repro only)
   eval_memory.py         ← offline PPL with/without the bank
+  core/                  ← architecture: model, memory (bank write), attention,
+                           moe, mhc, cascade, delta_channel
+  infra/                 ← config + cfg_schema, paths, runtime, sched, ckpt,
+                           muon, decode, decode_graphs (CUDA-graphs fast path)
+  data/                  ← streams.py (name→class registry) + the streams:
+                           sota_session, tool_env, code_exec, persona,
+                           math_school, chat_mix, chat_batch, recall_env
+  rl/                    ← rti.py rti_copy.py rti_policy.py rti_learner.py
+                           (citation wing), rl_lives, rl_rewards,
+                           rl_defer_grpo*, exec_sandbox
   analysis/              ← mechanistic diagnostics + campaign results
                            (see its README for repro status per probe)
   legacy/                ← closed arc: the SmolLM2 graft

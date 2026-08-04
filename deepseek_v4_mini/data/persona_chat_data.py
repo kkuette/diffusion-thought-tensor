@@ -42,9 +42,9 @@ text + closing <|im_end|>. Interface matches the `chat:` block of
 code_defer_native (.next_conv() + .rng + module grade_conv).
 
 Hermetic self-test (stub tokenizer, no downloads):
-  python -m deepseek_v4_mini.persona_chat_data
+  python -m deepseek_v4_mini.data.persona_chat_data
 Real-tokenizer smoke (decode one conv per kind + stats):
-  python -m deepseek_v4_mini.persona_chat_data deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml
+  python -m deepseek_v4_mini.data.persona_chat_data deepseek_v4_mini/configs/archive/mechanism/farm/v3_reach.yaml
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ import sys
 import torch
 
 from .math_school_data import U_OPEN, A_OPEN, CLOSE
-from .paths import load_yaml
+from ..infra.paths import load_yaml
 
 # ── fact slots ───────────────────────────────────────────────────────────────
 # Each slot: statement templates, question templates, answer templates, value
@@ -948,7 +948,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     kw = {}
     if "--real" in sys.argv:
-        from .paths import expand_str
+        from ..infra.paths import expand_str
         kw = dict(real_filler="HuggingFaceTB/smol-smoltalk",
                   real_cache_dir=expand_str("${TB_ROOT}/data_cache"))
     ps = PersonaChatStream(tok, seed=0, **kw)

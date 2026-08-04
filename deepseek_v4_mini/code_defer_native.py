@@ -29,18 +29,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from .config import ThoughtBankConfig
-from .model import ThoughtBankLM
-from .muon import Muon, _split_muon_params
-from .code_data import CodeChunkStream
-from .cascade import CascadeMemory, default_layer_map
-from .cfg_schema import ConfigError, check as check_cfg
-from .ckpt import find_resume, load_bank, restore_train_state, save_bank, save_train_state
-from .decode import generate
-from .runtime import build_fwd, compile_model, enable_tf32, init_ddp
-from .sched import (STAIR_END, STAIR_N, beta_at, describe as describe_sched,
+from .infra.config import ThoughtBankConfig
+from .core.model import ThoughtBankLM
+from .infra.muon import Muon, _split_muon_params
+from .data.code_data import CodeChunkStream
+from .core.cascade import CascadeMemory, default_layer_map
+from .infra.cfg_schema import ConfigError, check as check_cfg
+from .infra.ckpt import find_resume, load_bank, restore_train_state, save_bank, save_train_state
+from .infra.decode import generate
+from .infra.runtime import build_fwd, compile_model, enable_tf32, init_ddp
+from .infra.sched import (STAIR_END, STAIR_N, beta_at, describe as describe_sched,
                     lr_scale)
-from .paths import load_yaml
+from .infra.paths import load_yaml
 
 
 def _fill(x_ref, tok_id, width):
@@ -294,7 +294,7 @@ class _GraphPool:
         if self.dead:
             return None
         try:
-            from .decode_graphs import GraphDecodeRunner
+            from .infra.decode_graphs import GraphDecodeRunner
             key = (tuple(bank.shape), str(bank.dtype))
             r = self.pool.get(key)
             if r is None:
@@ -393,8 +393,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24,
     classes de positions (`p_copy_val`, `p_copy_tpl`). Le verdict du run se lit
     là : val_nll doit décrocher sous val_nll_abl, p_copy_val doit s'ouvrir, et
     p_copy_tpl rester bas."""
-    from .math_school_data import A_OPEN, grade_conv
-    from .persona_chat_data import grade_recall
+    from .data.math_school_data import A_OPEN, grade_conv
+    from .data.persona_chat_data import grade_recall
     grade = getattr(stream, "grade_conv", grade_conv)   # persona ships its own
     model.eval()
     a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
@@ -847,7 +847,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     rti_on = bool(rt.get("enabled", False))
     rti_cfg = None
     if rti_on:
-        from .rti import InjectType, Retriever, RtiConfig
+        from .rl.rti import InjectType, Retriever, RtiConfig
         rti_cfg = RtiConfig(
             top_k=int(rt.get("top_k", 13)),
             max_groups=int(rt.get("max_groups", cfg.max_mem)),
@@ -867,7 +867,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # teacher-forcé, même depuis un contexte plat sans banque. W_c + une
         # porte donnent le chemin manquant ; b_g très négatif le rend quasi
         # neutre au step 0. Détail et preuves : deepseek_v4_mini/rti_copy.py.
-        from .rti_copy import CopyHead, CopyHeadConfig
+        from .rl.rti_copy import CopyHead, CopyHeadConfig
         copy_cfg = CopyHeadConfig.from_raw(rt.get("copy_head"))
         if copy_cfg.enabled:
             model.rti_copy = CopyHead(cfg.d_model, copy_cfg).to(device)
@@ -962,7 +962,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     dc_cfg = t.get("delta_channel")
     delta = None
     if dc_cfg:
-        from .delta_channel import DeltaChannel
+        from .core.delta_channel import DeltaChannel
         _dk = int(dc_cfg.get("d_k", 64)) if isinstance(dc_cfg, dict) else 64
         delta = DeltaChannel(cfg.d_model, cfg.max_mem, cfg.mem_dim, d_k=_dk).to(device)
         print(f"delta channel ON: d_k {_dk} d_v {delta.d_v} "
@@ -1028,7 +1028,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
             assert not (torch.distributed.is_available()
                         and torch.distributed.is_initialized()), \
                 "value_table : tables locales, pas de réduction DDP implémentée"
-            from .persona_chat_data import fact_id_maps
+            from .data.persona_chat_data import fact_id_maps
             _sm, _vm_ids, _am = fact_id_maps()
             tf_tables = nn.ModuleDict({
                 "slot": nn.Embedding(len(_sm) + 1, cfg.mem_dim, padding_idx=0),
@@ -1157,7 +1157,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     chat_eval_seed_stride = int(chat_cfg.get("eval_seed_stride", 0) or 0)
     assert chat_eval_seed_stride >= 0, chat_eval_seed_stride
     if chat_cfg:
-        from .streams import chat_stream_class
+        from .data.streams import chat_stream_class
         sname = chat_cfg.get("stream", "math_school")
         _ChatStream = chat_stream_class(sname)
         gen_kw = dict(chat_cfg.get("gen", {}) or {})
@@ -1368,7 +1368,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     rti_run = rti_eval = None
     rti_lb = None                              # layer_banks tout à None
     if rti_on:
-        from .rti import RtiRunner, sif_table
+        from .rl.rti import RtiRunner, sif_table
         assert chat_stream is not None, "rti: exige un bloc chat:"
         assert not tf_on, (
             "rti + teacher : le teacher distille la banque FAST-WEIGHT, que ce "
@@ -2338,7 +2338,7 @@ def _eval_stub_run(skip=()):
     """Un appel d'`evaluate_math` sur des stubs (aucun GPU, aucun tokenizer) :
     deux convs `recall` et deux convs `requote`. Sert à épingler ce que
     `skip_kinds` change — et surtout ce qu'il NE change pas."""
-    from .math_school_data import A_OPEN
+    from .data.math_school_data import A_OPEN
 
     class _Tok:
         def __call__(self, s, add_special_tokens=False):
@@ -2547,7 +2547,7 @@ def _selftest() -> None:
 
     # (3) copy_head ON, sur un VRAI modèle : loss finie, prefix_ids transmis,
     #     gradient sur rti_copy.* — et la télémétrie ventile p_copy.
-    from .rti_copy import CopyHead, CopyHeadConfig
+    from .rl.rti_copy import CopyHead, CopyHeadConfig
     torch.manual_seed(3)
     Vm, Bm, Tm = 40, 2, 12
     mcfg = ThoughtBankConfig(vocab_size=Vm, d_model=32, n_layers=2, n_heads=2,
@@ -2582,7 +2582,7 @@ def _selftest() -> None:
     #     Les `prefix_ids` rendus sont DÉJÀ indexés par part (alignés sur rows) :
     #     les ré-indexer serait le bug silencieux type — un préfixe attribué à
     #     la mauvaise lane, une copie qui cite le voisin.
-    from .rti import InjectType, Retriever, RtiConfig, RtiRunner
+    from .rl.rti import InjectType, Retriever, RtiConfig, RtiRunner
     mm.zero_grad()
     mm.rti_retriever, mm.rti_type = Retriever(32), InjectType(32)
     rc = RtiConfig(top_k=3, max_groups=4, train_groups=2, eval_groups=2)
@@ -2613,8 +2613,8 @@ def _selftest() -> None:
         assert abs(float(d4[_n]) / float(d4[_d]) - 0.0180) < 5e-3, _n
 
     # ── val_mask ASSISTANT : posé sur le span, propagé, nul sur le padding ──
-    from .chat_batch import ChatBatchStream
-    from .persona_chat_data import PersonaChatStream, _StubTok
+    from .data.chat_batch import ChatBatchStream
+    from .data.persona_chat_data import PersonaChatStream, _StubTok
     ps = PersonaChatStream(_StubTok(), seed=5)
     _seen = 0
     for _ in range(30):

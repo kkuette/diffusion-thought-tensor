@@ -49,10 +49,10 @@ sys.path.insert(0, os.getcwd())
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from deepseek_v4_mini.config import ThoughtBankConfig
-from deepseek_v4_mini.decode import generate
-from deepseek_v4_mini.model import ThoughtBankLM
-from deepseek_v4_mini.paths import load_yaml
+from deepseek_v4_mini.infra.config import ThoughtBankConfig
+from deepseek_v4_mini.infra.decode import generate
+from deepseek_v4_mini.core.model import ThoughtBankLM
+from deepseek_v4_mini.infra.paths import load_yaml
 
 # Paramètres STRUCTURAUX : ils fixent le nombre de dispatches (boucles Python,
 # itérations, branches). Les autres (d_model, d_ff, vocab…) ne fixent que les
@@ -384,7 +384,7 @@ def run_time(raw, a):
     if a.cuda_graphs:
         # bras CUDA graphs : GraphDecodeRunner (B=1, greedy). Sur CPU il
         # dégrade en eager et le dit — c'est le « préparé, pas lancé ».
-        from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+        from deepseek_v4_mini.infra.decode_graphs import GraphDecodeRunner
         amp = None if a.amp == "none" else a.amp
         runner = GraphDecodeRunner(model, bank, amp=amp)
         if runner.eager_only:
@@ -465,7 +465,7 @@ def _full_eager_ref(model, bank, prefix, n_tokens, warmup):
     des adresses périmées diverge d'elle, alors que chain vs step (deux
     runners graphs) gèlent les mêmes adresses et restent d'accord entre eux."""
     from deepseek_v4_mini import attention
-    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    from deepseek_v4_mini.infra.decode_graphs import GraphDecodeRunner
     assert n_tokens > warmup + 1, "verify : tokens ≤ warmup, rien à comparer"
     r = GraphDecodeRunner(model, bank, warmup=warmup)
     toks = []
@@ -507,8 +507,8 @@ def run_verify(raw, a):
     _gpu_guard(a.force)
     if a.amp != "none":
         sys.exit("[bench] --verify : fp32 seulement (référence eager comparable)")
-    from deepseek_v4_mini.decode import trim
-    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    from deepseek_v4_mini.infra.decode import trim
+    from deepseek_v4_mini.infra.decode_graphs import GraphDecodeRunner
     flags = _parse_flags(a.flags)
     model, cfg, prefix, bank = _mk_model(raw, a, flags)
     N, warm = a.tokens, 8
@@ -566,7 +566,7 @@ def _rebound_eager_ref(model, bank, prefix, n_tokens):
     programme du graph émulé. C'est le calendrier exact du runner rebondi —
     un runner frais (warmup plein) suivrait un AUTRE calendrier, ULP-divergent."""
     from deepseek_v4_mini import attention
-    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    from deepseek_v4_mini.infra.decode_graphs import GraphDecodeRunner
     r = GraphDecodeRunner(model, bank, warmup=0)
     r.eager_only = True                         # jamais de capture : eager pur
     toks = []
@@ -613,8 +613,8 @@ def run_rebind(raw, a):
     _gpu_guard(a.force)
     if a.amp != "none":
         sys.exit("[bench] --rebind : fp32 seulement (référence eager comparable)")
-    from deepseek_v4_mini.decode import trim
-    from deepseek_v4_mini.decode_graphs import GraphDecodeRunner
+    from deepseek_v4_mini.infra.decode import trim
+    from deepseek_v4_mini.infra.decode_graphs import GraphDecodeRunner
     flags = _parse_flags(a.flags)
     model, cfg, prefix, bank = _mk_model(raw, a, flags)
     N, warm = a.tokens, 8

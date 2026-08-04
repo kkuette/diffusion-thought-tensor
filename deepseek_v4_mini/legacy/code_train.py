@@ -22,8 +22,8 @@ from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from .smollm_graft import GraftConfig, SmolBankLM
-from ..code_data import CodeChunkStream
-from ..paths import load_yaml
+from ..data.code_data import CodeChunkStream
+from ..infra.paths import load_yaml
 
 
 def _append_think(x, am, think_id):
@@ -136,7 +136,7 @@ def main(cfg_path: str) -> None:
         print(f"graft optimizer: AdamW lr {graft_lr} ({sum(p.numel() for p in graft_params):,}) "
               f"| host AdamW lr {lr_host}", flush=True)
     else:
-        from ..muon import Muon
+        from ..infra.muon import Muon
         mats = [p for p in graft_params if p.ndim == 2]; rest = [p for p in graft_params if p.ndim != 2]
         opt_graft = Muon(mats, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
                          rms_match=True, adam_params=rest, adam_lr=lr_bank, adam_wd=wd)

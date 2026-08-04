@@ -92,7 +92,7 @@ Le stream s'utilise comme n'importe quel autre (registre `streams.CHAT_STREAMS`)
 (`evaluate_math`, B=1, conv par conv) et le round-trip rng du checkpoint
 continuent de marcher sans le savoir.
 
-Self-test CPU hermétique :  python -m deepseek_v4_mini.chat_batch
+Self-test CPU hermétique :  python -m deepseek_v4_mini.data.chat_batch
 """
 from __future__ import annotations
 

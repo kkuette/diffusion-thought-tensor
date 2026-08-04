@@ -61,8 +61,8 @@ import warnings
 
 import torch
 
-from . import attention
-from .attention import _rope_at_cached
+from ..core import attention
+from ..core.attention import _rope_at_cached
 
 
 class GraphDecodeRunner:
@@ -477,7 +477,7 @@ def _selftest() -> None:
 
     from .config import ThoughtBankConfig
     from .decode import generate
-    from .model import ThoughtBankLM
+    from ..core.model import ThoughtBankLM
 
     torch.manual_seed(0)
     kw = dict(vocab_size=61, d_model=32, n_layers=2, n_heads=2, d_head=8,
@@ -544,7 +544,7 @@ def _selftest() -> None:
         runner.close()
 
     # 3. injection RoPE : buffers remplis = calcul en place, au bit
-    from .attention import AttnCache, CompressedSparseAttention, _mk
+    from ..core.attention import AttnCache, CompressedSparseAttention, _mk
     mod = _mk(CompressedSparseAttention, torch.float64, csa_m=3, top_k=2)
     H = torch.randn(1, 11, 24, dtype=torch.float64)
     c1, c2 = AttnCache(), AttnCache()

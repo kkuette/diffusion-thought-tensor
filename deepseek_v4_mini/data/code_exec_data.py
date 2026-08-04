@@ -24,19 +24,19 @@ bridge: rl_disagg decodes the implementation turn from the carried bank and
 rewards it with rl_rewards.make_exec_reward — same sessions for SFT and GRPO.
 
 Hermetic self-test (stub tokenizer, real sandbox, no downloads):
-  python -m deepseek_v4_mini.code_exec_data
+  python -m deepseek_v4_mini.data.code_exec_data
 Real smoke (streams OpenCodeInstruct, prints one session):
-  python -m deepseek_v4_mini.code_exec_data <yaml with tokenizer: + exec.gen>
+  python -m deepseek_v4_mini.data.code_exec_data <yaml with tokenizer: + exec.gen>
 """
 from __future__ import annotations
 
 import json
 import sys
 
-from .exec_sandbox import pass_frac, run_tests
+from ..rl.exec_sandbox import pass_frac, run_tests
 from .persona_chat_data import PersonaChatStream
-from .rl_rewards import extract_code
-from .paths import load_yaml
+from ..rl.rl_rewards import extract_code
+from ..infra.paths import load_yaml
 
 _ASK = ("Now implement {label}. Reply with a single ```python``` code block "
         "containing the full solution.")

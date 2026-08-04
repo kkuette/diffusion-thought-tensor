@@ -54,10 +54,10 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import ThoughtBankConfig
-from deepseek_v4_mini.model import ThoughtBankLM
+from deepseek_v4_mini.infra.config import ThoughtBankConfig
+from deepseek_v4_mini.core.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
-from deepseek_v4_mini.paths import load_yaml
+from deepseek_v4_mini.infra.paths import load_yaml
 
 torch.manual_seed(0)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")

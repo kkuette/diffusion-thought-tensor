@@ -5,7 +5,7 @@ trainer de l'arc jouet dsv4mini (clos), et c'était son SEUL lien avec le
 programme courant — code_defer_native, code_train et sft_train importaient
 l'optimiseur depuis un module de 2600 lignes qu'ils n'utilisent pas par
 ailleurs. train.py réexporte les trois noms, donc les commandes de repro
-dsv4mini et tout `from .train import Muon` existant continuent de marcher.
+dsv4mini et tout `from ..train import Muon` existant continuent de marcher.
 
 Le piège √cols (rms_match) est documenté dans le corps de step() : le garder
 sous les yeux est la raison d'être de ce module.
