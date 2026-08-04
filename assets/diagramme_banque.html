@@ -59,14 +59,20 @@
 <div class="wrap">
 
 <h1>Banque de mémoire hors contexte pour LM 350M — le mécanisme</h1>
-<p class="sub">D'après <b>SPEC_MEMOIRE_V2</b> §1–3 (validée 2026-07-31) et le kill-test 3 du 2026-08-01.
-Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
+<p class="sub">D'après <b>SPEC_MEMOIRE_V2</b> — édition lissée du 2026-08-03 (claim validé 2026-07-31), <b>verdicts au 2026-08-04</b> (grille §2.4 du 08-03, phase 11 dépouillée 22/22 le 08-04).
+Un seul store, un seul geste d'écriture, deux régimes de lecture. Ce qui est <b>TRANCHÉ</b>, ce qui est <b>EN COURS</b> et ce qui est <b>ÉCONOMISÉ</b> est marqué comme tel.</p>
 
 <div class="legend">
-  <span><span class="sw sw-learn"></span><b>Appris</b> — retriever W<sub>q</sub>, copy-head, politique write / choix de slot (GRPO)</span>
-  <span><span class="sw sw-proc"></span><b>Procédural</b> — clé SIF, sélection de surface, gist SIF, FIFO d'amorçage (aucun paramètre)</span>
-  <span><span class="sw sw-store"></span><b>État persistant</b> — la banque et ses slots</span>
+  <span><span class="sw sw-learn"></span><b>Appris</b> — read kvproj (W<sub>K</sub>′/W<sub>V</sub>′ + fréquences d'âge), retriever W<sub>q</sub>, copy-head, politique <span class="mono">&lt;think&gt;</span>/retrieve (GRPO)</span>
+  <span><span class="sw sw-proc"></span><b>Procédural</b> — curseur Δn, sélection SIF ∪ copy_mask, dédup en ligne, FIFO + propagation, rotations (aucun paramètre)</span>
+  <span><span class="sw sw-store"></span><b>État persistant</b> — la banque : un tenseur constant de lignes natives</span>
   <span><span class="sw sw-reset"></span><b>RESET</b> — la fenêtre est jetée, la banque traverse</span>
+</div>
+
+<div class="legend">
+  <span><b>Règle d'adjudication (actée 08-03, audit des absolus)</b> — tout arbitrage d'architecture se juge en <b>nll_live ABSOLU apparié + grade décodé + r@1</b>.
+  Le <b>Δnll intra-modèle est DÉPRÉCIÉ</b> comme juge : sur le même carré il a gonflé un gagnant (part bait +0,044 de kvproj) <i>et</i> masqué un concurrent (dual_heads, meilleur en absolu, puni pour son meilleur plancher ablaté).
+  Il reste une sonde de conditionnement (paires contrastives), jamais un juge.</span>
 </div>
 
 <!-- ══════════════════ 1. VUE D'ENSEMBLE ══════════════════ -->
@@ -116,75 +122,101 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
 
   <!-- BANQUE -->
   <rect class="store" x="764" y="34" width="372" height="486" rx="12"/>
-  <text class="tt" x="950" y="58" text-anchor="middle">BANQUE — hors contexte, latente</text>
-  <text class="s"  x="950" y="75" text-anchor="middle">espace FIXE de S slots · persiste à travers les resets</text>
+  <text class="tt" x="950" y="56" text-anchor="middle">BANQUE — hors contexte, latente</text>
+  <text class="s"  x="950" y="73" text-anchor="middle">UN tenseur de taille CONSTANTE (max_mem, mem_dim, d)</text>
+  <text class="s"  x="950" y="88" text-anchor="middle">chaque ligne = un vecteur NATIF du modèle, largeur d = d_model</text>
 
-  <!-- slots -->
+  <!-- slots : mem_dim lignes de largeur d, aucune clé stockée -->
   <g>
-    <rect class="box" x="784" y="92" width="332" height="52"/>
-    <rect class="proc" x="792" y="100" width="72" height="36"/><text class="sb" x="828" y="122" text-anchor="middle">clé</text>
-    <rect class="store" x="872" y="100" width="164" height="36"/><text class="sb" x="954" y="122" text-anchor="middle">surface (13 emb. natifs)</text>
-    <rect class="proc" x="1044" y="100" width="64" height="36"/><text class="sb" x="1076" y="122" text-anchor="middle">gist</text>
-    <text class="s" x="790" y="90">slot 0 — le plus ancien (cible FIFO d'amorçage)</text>
+    <text class="s" x="790" y="108">région ÉPINGLÉE — lignes taguées system, jamais évincées</text>
+    <rect class="box" x="784" y="112" width="332" height="40"/>
+    <g fill="#fffbeb" stroke="#b45309" stroke-width="1.2">
+      <rect x="792" y="120" width="22" height="24" rx="2"/><rect x="818" y="120" width="22" height="24" rx="2"/>
+      <rect x="844" y="120" width="22" height="24" rx="2"/><rect x="870" y="120" width="22" height="24" rx="2"/>
+      <rect x="896" y="120" width="22" height="24" rx="2"/><rect x="922" y="120" width="22" height="24" rx="2"/>
+      <rect x="948" y="120" width="22" height="24" rx="2"/><rect x="974" y="120" width="22" height="24" rx="2"/>
+      <rect x="1000" y="120" width="22" height="24" rx="2"/><rect x="1026" y="120" width="22" height="24" rx="2"/>
+      <rect x="1052" y="120" width="22" height="24" rx="2"/><rect x="1078" y="120" width="22" height="24" rx="2"/>
+    </g>
   </g>
   <g>
-    <rect class="box" x="784" y="170" width="332" height="52"/>
-    <rect class="proc" x="792" y="178" width="72" height="36"/><text class="sb" x="828" y="200" text-anchor="middle">clé</text>
-    <rect class="store" x="872" y="178" width="164" height="36"/><text class="sb" x="954" y="200" text-anchor="middle">surface</text>
-    <rect class="proc" x="1044" y="178" width="64" height="36"/><text class="sb" x="1076" y="200" text-anchor="middle">gist</text>
-    <text class="s" x="790" y="166">slot 1</text>
+    <text class="s" x="790" y="172">TÊTE — le write du tour courant (région active)</text>
+    <rect class="box" x="784" y="176" width="332" height="40"/>
+    <g fill="#fffbeb" stroke="#b45309" stroke-width="1.2">
+      <rect x="792" y="184" width="22" height="24" rx="2"/><rect x="818" y="184" width="22" height="24" rx="2"/>
+      <rect x="844" y="184" width="22" height="24" rx="2"/><rect x="870" y="184" width="22" height="24" rx="2"/>
+      <rect x="896" y="184" width="22" height="24" rx="2"/><rect x="922" y="184" width="22" height="24" rx="2"/>
+      <rect x="948" y="184" width="22" height="24" rx="2"/><rect x="974" y="184" width="22" height="24" rx="2"/>
+      <rect x="1000" y="184" width="22" height="24" rx="2"/><rect x="1026" y="184" width="22" height="24" rx="2"/>
+    </g>
+    <rect class="dim" x="1052" y="184" width="22" height="24" rx="2"/>
+    <rect class="dim" x="1078" y="184" width="22" height="24" rx="2"/>
+    <text class="s" x="790" y="230">↑ 2 lignes vides : MASQUÉES du softmax (ni dilution, ni signal)</text>
   </g>
   <g>
-    <rect class="box" x="784" y="248" width="332" height="52"/>
-    <rect class="proc" x="792" y="256" width="72" height="36"/><text class="sb" x="828" y="278" text-anchor="middle">clé</text>
-    <rect class="store" x="872" y="256" width="164" height="36"/><text class="sb" x="954" y="278" text-anchor="middle">surface</text>
-    <rect class="proc" x="1044" y="256" width="64" height="36"/><text class="sb" x="1076" y="278" text-anchor="middle">gist</text>
-    <text class="s" x="790" y="244">slot 2 …</text>
+    <text class="s" x="790" y="260">slots suivants — la session vivante, décalés à chaque write</text>
+    <rect class="box" x="784" y="264" width="332" height="40"/>
+    <g fill="#fffbeb" stroke="#b45309" stroke-width="1.2">
+      <rect x="792" y="272" width="22" height="24" rx="2"/><rect x="818" y="272" width="22" height="24" rx="2"/>
+      <rect x="844" y="272" width="22" height="24" rx="2"/><rect x="870" y="272" width="22" height="24" rx="2"/>
+      <rect x="896" y="272" width="22" height="24" rx="2"/><rect x="922" y="272" width="22" height="24" rx="2"/>
+      <rect x="948" y="272" width="22" height="24" rx="2"/><rect x="974" y="272" width="22" height="24" rx="2"/>
+      <rect x="1000" y="272" width="22" height="24" rx="2"/><rect x="1026" y="272" width="22" height="24" rx="2"/>
+      <rect x="1052" y="272" width="22" height="24" rx="2"/>
+    </g>
+    <rect class="dim" x="1078" y="272" width="22" height="24" rx="2"/>
   </g>
   <text class="tb" x="950" y="326" text-anchor="middle">⋮</text>
   <g>
-    <rect class="box" x="784" y="336" width="332" height="52"/>
-    <rect class="proc" x="792" y="344" width="72" height="36"/><text class="sb" x="828" y="366" text-anchor="middle">clé</text>
-    <rect class="store" x="872" y="344" width="164" height="36"/><text class="sb" x="954" y="366" text-anchor="middle">surface</text>
-    <rect class="proc" x="1044" y="344" width="64" height="36"/><text class="sb" x="1076" y="366" text-anchor="middle">gist</text>
-    <text class="s" x="790" y="332">slot S−1 — le plus récent</text>
+    <text class="s" x="790" y="348">QUEUE (vers max_mem−1) — région FROIDE : évincée de la tête,</text>
+    <text class="s" x="790" y="362">pas encore sortie ; encore lisible, encore PROPAGEABLE</text>
+    <rect class="box" x="784" y="366" width="332" height="40"/>
+    <g fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2">
+      <rect x="792" y="374" width="22" height="24" rx="2"/><rect x="818" y="374" width="22" height="24" rx="2"/>
+      <rect x="844" y="374" width="22" height="24" rx="2"/><rect x="870" y="374" width="22" height="24" rx="2"/>
+      <rect x="896" y="374" width="22" height="24" rx="2"/><rect x="922" y="374" width="22" height="24" rx="2"/>
+      <rect x="948" y="374" width="22" height="24" rx="2"/><rect x="974" y="374" width="22" height="24" rx="2"/>
+      <rect x="1000" y="374" width="22" height="24" rx="2"/><rect x="1026" y="374" width="22" height="24" rx="2"/>
+    </g>
+    <text class="warn" x="790" y="422">au-delà du bord = région MORTE, perdue définitivement</text>
   </g>
 
-  <text class="s" x="950" y="416" text-anchor="middle">S est FIXE (le rebind CUDA-graphs l'exige : mem_seed_slots = max_mem)</text>
-  <text class="s" x="950" y="434" text-anchor="middle">et reste un hyperparamètre à sonder : S = 1 / 4 / 16 / 64 (kill-test 8)</text>
-  <text class="s" x="950" y="452" text-anchor="middle">deux pressions opposées : le rappel veut S grand, l'ambiant se dilue</text>
-  <text class="sb" x="950" y="482" text-anchor="middle">INVARIANT — la seule modification de la banque</text>
-  <text class="sb" x="950" y="498" text-anchor="middle">est l'écriture d'un write (sur un slot, avec écrasement)</text>
+  <text class="s" x="950" y="444" text-anchor="middle">max_mem est FIXE (rebind CUDA-graphs : mem_seed_slots = max_mem)</text>
+  <text class="s" x="950" y="460" text-anchor="middle">et reste à sonder : S = 1/4/8/16/64 — courbe de dilution S8, EN COURS (ph.12)</text>
+  <text class="sb" x="950" y="484" text-anchor="middle">INVARIANT — la seule modification de la banque est un WRITE :</text>
+  <text class="sb" x="950" y="500" text-anchor="middle">append en tête + décalage + propagation. Jamais d'écrasement choisi.</text>
 
   <!-- FLÈCHES -->
   <path class="ar-store" d="M400,200 H760" marker-end="url(#a1o)"/>
-  <text class="tb" x="580" y="168" text-anchor="middle">① WRITE (unique)</text>
-  <text class="s"  x="580" y="184" text-anchor="middle">aux frontières de tour / segments porteurs :</text>
-  <text class="s"  x="580" y="220" text-anchor="middle">un seul geste produit clé + surface + gist,</text>
-  <text class="s"  x="580" y="236" text-anchor="middle">choisit un slot et l'ÉCRASE (panneau 2)</text>
+  <text class="tb" x="580" y="152" text-anchor="middle">① WRITE (unique, 0 forward)</text>
+  <text class="s"  x="580" y="168" text-anchor="middle">à la frontière de tour, symétrique user/self :</text>
+  <text class="s"  x="580" y="184" text-anchor="middle">sélection SIF ∪ copy_mask sur la seule tranche Δn,</text>
+  <text class="s"  x="580" y="220" text-anchor="middle">dédup contre la banque, puis APPEND en tête</text>
+  <text class="s"  x="580" y="236" text-anchor="middle">(aucun réseau ne fabrique la ligne — panneau 2)</text>
 
   <path class="ar-learn" d="M400,286 H760" marker-end="url(#a1b)"/>
   <text class="s" x="580" y="278" text-anchor="middle">requête : hidden du tour user → W_q (appris)</text>
 
   <path class="ar-learn" d="M760,318 H400" marker-end="url(#a1b)"/>
-  <text class="tb" x="580" y="340" text-anchor="middle">② LECTURE CIBLÉE — consomme la SURFACE</text>
-  <text class="s"  x="580" y="356" text-anchor="middle">à la demande (action RL) : retrieve top-2 par clés,</text>
+  <text class="tb" x="580" y="340" text-anchor="middle">② LECTURE CIBLÉE — lignes de nature SURFACE</text>
+  <text class="s"  x="580" y="356" text-anchor="middle">à la demande (action RL) : retrieve top-2,</text>
   <text class="s"  x="580" y="372" text-anchor="middle">inject k=13 lignes natives + sép., puis copy-head</text>
   <text class="s"  x="580" y="388" text-anchor="middle">→ restitue AU TOKEN PRÈS</text>
 
-  <path class="ar-proc" d="M760,424 H400" marker-end="url(#a1g)"/>
-  <text class="tb" x="580" y="446" text-anchor="middle">③ LECTURE AMBIANTE — consomme le GIST</text>
-  <text class="s"  x="580" y="462" text-anchor="middle">cascade, à CHAQUE forward, jamais sollicitée</text>
-  <text class="s"  x="580" y="478" text-anchor="middle">pour verbaliser → module la distribution</text>
-  <text class="s"  x="580" y="494" text-anchor="middle">(registre, langue, règles de contenu)</text>
+  <path class="ar-learn" d="M760,424 H400" marker-end="url(#a1b)"/>
+  <text class="tb" x="580" y="446" text-anchor="middle">③ LECTURE AMBIANTE — lignes de nature GIST</text>
+  <text class="s"  x="580" y="462" text-anchor="middle">ATTENTION kvproj (K/V dédiées) à CHAQUE forward,</text>
+  <text class="s"  x="580" y="478" text-anchor="middle">jamais sollicitée pour verbaliser → module la</text>
+  <text class="s"  x="580" y="494" text-anchor="middle">distribution (registre, langue, règles de contenu)</text>
+  <text class="warn" x="580" y="512" text-anchor="middle">③ n'est PLUS la cascade — read fast-weight retiré (ph.10)</text>
 </svg>
 </section>
 
 <!-- ══════════════════ 2. LE SLOT ══════════════════ -->
 <section>
-<h2>2. Zoom write — le slot structuré (clé, surface, gist) et l'écrasement</h2>
-<p class="cap">Un seul geste, trois composantes, trois provenances différentes. Rien de tout cela n'est produit par un réseau appris : la sélection est <b>procédurale</b> (labo jouet ph.7 — tout readout appris est mort, seule l'injection native cite).</p>
-<svg viewBox="0 0 1160 638" role="img" aria-label="Construction d'un slot : clé, surface, gist, puis écrasement">
+<h2>2. Zoom write — curseur Δn, sélection, dédup, puis APPEND (le slot structuré est mort)</h2>
+<p class="cap">Le slot <s>(clé, surface, gist)</s> est <b>remplacé</b> (spec §2.2) : chaque ligne est <b>littéralement un vecteur du modèle</b>, de largeur d = d_model — plus de clé stockée (la clé est une <i>fonction</i>, calculée au read), plus de dichotomie de format. Rien n'est produit par un réseau appris : le write est une <b>sélection</b> (labo jouet ph.7 — tout readout appris est mort, seule l'injection native cite). L'écrasement choisi est remplacé par <b>append + décalage + propagation</b>.</p>
+<svg viewBox="0 0 1160 704" role="img" aria-label="Le write : curseur Delta n, sélection SIF et copy_mask, dédup, lignes unifiées, append FIFO">
   <defs>
     <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
@@ -197,7 +229,7 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
   </defs>
 
   <!-- segment -->
-  <text class="tt" x="30" y="34">Le segment du tour (T tokens) — ici la strate `code`, T = 35</text>
+  <text class="tt" x="30" y="34">La tranche Δn = [n_prev, n) — les vecteurs NOUVEAUX depuis le dernier write (ici la strate `code`)</text>
   <text class="s"  x="30" y="52">les cases ambrées = atomes de valeur marqués par l'env dans <tspan class="mono">copy_mask</tspan> (nom du helper ET constante)</text>
   <g>
     <rect class="dim" x="30" y="62" width="68" height="34" rx="5"/><text class="mono" x="64" y="84" text-anchor="middle">def</text>
@@ -217,90 +249,182 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
     <text class="warn" x="930" y="78">template rares : w 0.86</text>
     <text class="warn" x="930" y="92">&gt; digits 0.72</text>
   </g>
-  <text class="s" x="30" y="116">États cachés du même segment (sortie des couches) → alimentent le gist ↓</text>
+  <text class="s" x="30" y="116">Le prélèvement se fait soit aux EMBEDDINGS (couche 0, nature « surface »), soit aux états mi-tardifs (nature « gist ») — même type, même store, même largeur. Point de tap exact = S10, OUVERT.</text>
 
   <!-- trois branches -->
   <path class="ar-proc" d="M180,124 V176" marker-end="url(#a2g)"/>
   <path class="ar-proc" d="M560,124 V176" marker-end="url(#a2g)"/>
   <path class="ar-proc" d="M960,124 V176" marker-end="url(#a2g)"/>
 
-  <!-- CLÉ -->
-  <rect class="proc" x="30" y="180" width="330" height="176" rx="10"/>
-  <text class="tt" x="46" y="204">CLÉ  — procédurale</text>
-  <text class="t"  x="46" y="228">pooling SIF des embeddings du</text>
-  <text class="t"  x="46" y="246">segment ENTIER, puis normalisation</text>
-  <text class="mono" x="46" y="270">key = Σ w·e / Σ w ;  w = a/(a+p)</text>
-  <text class="s"  x="46" y="292">• aucune table secrète, rien que le texte</text>
-  <text class="s"  x="46" y="310">• <tspan class="mono">copy_mask</tspan> ne la touche pas (asserté au self-test)</text>
-  <text class="s"  x="46" y="328">• rank-1 même-slot numeric 0.997 → rien à corriger</text>
-  <text class="s"  x="46" y="346">• faiblesse pref (0.57–0.65) = territoire du tie-break</text>
+  <!-- CURSEUR Δn -->
+  <rect class="proc" x="30" y="180" width="330" height="186" rx="10"/>
+  <text class="tt" x="46" y="204">① CURSEUR Δn  — procédural</text>
+  <text class="t"  x="46" y="226">la matrice d'états (n, d) grandit au décodage ;</text>
+  <text class="t"  x="46" y="244">on garde une COPIE de n (dernier write).</text>
+  <text class="sb" x="46" y="268">La provenance se lit dans le PAS :</text>
+  <text class="s"  x="46" y="288">• saut Δn &gt; 1 = bloc arrivé en prefill ⇒ tour USER</text>
+  <text class="s"  x="46" y="306">  (SYSTEM pour le tout premier bloc)</text>
+  <text class="s"  x="46" y="324">• +1 par step = token émis ⇒ SELF</text>
+  <text class="s"  x="46" y="342">⇒ tag user/self/system dérivé du décodage seul,</text>
+  <text class="s"  x="46" y="358">  aucun parsing de chat template</text>
 
-  <!-- SURFACE -->
-  <rect class="proc" x="380" y="180" width="400" height="176" rx="10"/>
-  <text class="tt" x="396" y="204">SURFACE  — procédurale, priorité de span</text>
-  <text class="t"  x="396" y="228">① positions de <tspan class="mono">copy_mask</tspan> GARANTIES (atomes, ≤ 11 obs.)</text>
-  <text class="t"  x="396" y="248">② le reste du budget au top-SIF du tour</text>
-  <text class="t"  x="396" y="268">③ rendus DANS L'ORDRE DU SEGMENT, taille fixe</text>
-  <text class="t"  x="396" y="288">k = 13 (padding = répétition du dernier)</text>
-  <text class="s"  x="396" y="310">→ 13 <tspan font-weight="700">embeddings NATIFS</tspan>, bruts et non normalisés</text>
-  <text class="s"  x="396" y="328">jamais transformés par un réseau (ph.7 : readout appris = mort)</text>
-  <text class="warn" x="396" y="348">sans le mask : code 0.000 → avec le mask : 1.000</text>
+  <!-- SÉLECTION -->
+  <rect class="proc" x="380" y="180" width="400" height="186" rx="10"/>
+  <text class="tt" x="396" y="204">② SÉLECTION  — procédurale, priorité de span</text>
+  <text class="t"  x="396" y="226">① positions de <tspan class="mono">copy_mask</tspan> GARANTIES (atomes, ≤ 11 obs.)</text>
+  <text class="t"  x="396" y="246">② le reste du budget au top-SIF de la tranche Δn</text>
+  <text class="t"  x="396" y="266">③ rendus DANS L'ORDRE DU SEGMENT, taille fixe : k = 13</text>
+  <text class="s"  x="396" y="288">→ des <tspan font-weight="700">vecteurs NATIFS</tspan>, bruts, jamais transformés</text>
+  <text class="s"  x="396" y="306">déployé : <tspan class="mono">copy_mask</tspan> PROCÉDURAL = SIF ∪ détecteur de spans</text>
+  <text class="s"  x="396" y="322">(chiffres, identifiants, chaînes citées) — zéro paramètre</text>
+  <text class="warn" x="396" y="342">sans le mask : code 0.000 → avec le mask : 1.000 (KT3)</text>
+  <text class="warn" x="396" y="358">S16 : ultrachat p50 = 38 candidats ≫ k=13 ⇒ rôle du &lt;think&gt;-synthèse</text>
 
-  <!-- GIST -->
-  <rect class="proc" x="800" y="180" width="330" height="176" rx="10"/>
-  <text class="tt" x="816" y="204">GIST  — procédural</text>
-  <text class="t"  x="816" y="228">compression SIF des états cachés</text>
-  <text class="t"  x="816" y="246">du segment (teacher a = 1e-4)</text>
-  <text class="s"  x="816" y="272">• assumé comme une COMPRESSION, rien de plus</text>
-  <text class="s"  x="816" y="290">• aucun claim sur son contenu (pas de canal</text>
-  <text class="s"  x="816" y="308">  d'apprentissage praticable : TBPTT inter-tours</text>
-  <text class="s"  x="816" y="326">  infaisable sur 24 Go, un scalaire RL ne façonne</text>
-  <text class="s"  x="816" y="344">  pas un vecteur mem_dim)</text>
+  <!-- DÉDUP -->
+  <rect class="proc" x="800" y="180" width="330" height="186" rx="10"/>
+  <text class="tt" x="816" y="204">③ DÉDUP EN LIGNE  — procédurale</text>
+  <text class="t"  x="816" y="226">les nouveaux vecteurs sont COMPARÉS</text>
+  <text class="t"  x="816" y="244">à la banque : la redondance s'écarte,</text>
+  <text class="t"  x="816" y="262">la nouveauté entre.</text>
+  <text class="s"  x="816" y="286">• JAMAIS tout n contre la banque entière :</text>
+  <text class="s"  x="816" y="302">  seulement la tranche delta ⇒ coût O(Δn·S)</text>
+  <text class="s"  x="816" y="320">• un tour entièrement redondant n'écrit RIEN</text>
+  <text class="s"  x="816" y="336">  et ne consomme pas de slot</text>
+  <text class="s"  x="816" y="354">⇒ horizon effectif = max_mem / taux-de-write</text>
 
   <!-- convergence -->
-  <path class="ar-proc" d="M195,360 V400 H560" marker-end="url(#a2g)"/>
-  <path class="ar-proc" d="M580,360 V400" marker-end="url(#a2g)"/>
-  <path class="ar-proc" d="M965,360 V400 H600" marker-end="url(#a2g)"/>
+  <path class="ar-proc" d="M195,370 V404 H556" marker-end="url(#a2g)"/>
+  <path class="ar-proc" d="M580,370 V404" marker-end="url(#a2g)"/>
+  <path class="ar-proc" d="M965,370 V404 H604" marker-end="url(#a2g)"/>
 
-  <rect class="store" x="380" y="404" width="400" height="52" rx="9"/>
-  <text class="tb" x="580" y="426" text-anchor="middle">slot = ( clé , surface , gist )</text>
-  <text class="s"  x="580" y="446" text-anchor="middle">le write actuel ne produit que l'équivalent du gist</text>
+  <rect class="store" x="330" y="410" width="500" height="66" rx="9"/>
+  <text class="tb" x="580" y="432" text-anchor="middle">le write d'un tour = m LIGNES UNIFIÉES de largeur d</text>
+  <text class="s"  x="580" y="452" text-anchor="middle">mem_dim = quantile haut des ATOMES PAR TOUR (jamais une fraction de seq_len)</text>
+  <text class="s"  x="580" y="468" text-anchor="middle">S16 FAIT 08-03 : mem_dim = 16 sur recall_env (k = 13 + marge de propagation)</text>
 
-  <!-- choix de slot -->
-  <path class="ar-learn" d="M580,460 V500" marker-end="url(#a2b)"/>
-  <rect class="learn" x="330" y="504" width="500" height="76" rx="9"/>
-  <text class="tb" x="580" y="526" text-anchor="middle">TÊTE DE CHOIX DE SLOT  — apprise (GRPO), initialisée FIFO</text>
-  <text class="s"  x="580" y="546" text-anchor="middle">amorçage : écraser le plus vieux (dégénéré, gratuit)</text>
-  <text class="s"  x="580" y="564" text-anchor="middle">cible : supersession apprise — écraser le slot contredit</text>
+  <path class="ar-store" d="M580,480 V500" marker-end="url(#a2o)"/>
 
-  <!-- écrasement -->
-  <path class="ar-store" d="M830,534 H900" marker-end="url(#a2o)"/>
-  <rect class="store" x="904" y="474" width="226" height="120" rx="9"/>
-  <text class="tb" x="1017" y="498" text-anchor="middle">ÉCRASEMENT du slot j</text>
-  <text class="s"  x="1017" y="518" text-anchor="middle">surface ET gist précédents DÉTRUITS</text>
-  <text class="tb" x="1017" y="542" text-anchor="middle">ajouter et oublier = un seul geste</text>
-  <text class="warn" x="1017" y="566" text-anchor="middle">le FIFO installe un prior de récence</text>
-  <text class="warn" x="1017" y="582" text-anchor="middle">que la supersession devra désapprendre</text>
+  <!-- APPEND + PROPAGATION -->
+  <rect class="store" x="306" y="504" width="520" height="120" rx="9"/>
+  <text class="tb" x="566" y="526" text-anchor="middle">MAINTENANCE — procédurale, zéro paramètre, zéro forward</text>
+  <text class="t"  x="566" y="548" text-anchor="middle">une seule primitive : APPEND en tête + décalage + chute au bord</text>
+  <text class="s"  x="566" y="568" text-anchor="middle">la survie est un ACTE : PROPAGATION des lignes utiles de la queue vers la tête</text>
+  <text class="s"  x="566" y="584" text-anchor="middle">(budget par write, <tspan font-weight="700">compteur de naissance PRÉSERVÉ</tspan>) ; résurrection = propagation</text>
+  <text class="s"  x="566" y="600" text-anchor="middle">avant le bord, ancienneté reprise → « New York » (t1) et « Austin » (t100) coexistent</text>
+  <text class="warn" x="566" y="618" text-anchor="middle">le poids-par-ancienneté est RÉPUDIÉ (proxy auto-renforçant) — signal de rétention = S6, EN COURS</text>
 
   <!-- notes bas -->
-  <rect class="box" x="30" y="504" width="272" height="120"/>
-  <text class="tb" x="46" y="526">Déclenchement du write</text>
-  <text class="s"  x="46" y="546">• frontières de tour, segments PORTEURS</text>
-  <text class="s"  x="46" y="564">• <tspan class="mono">write_every_turn: false</tspan> = privilège</text>
-  <text class="s"  x="46" y="580">  d'oracle assumé (comme <tspan class="mono">fact_slot</tspan>)</text>
-  <text class="s"  x="46" y="598">• remplacé à terme par le write &lt;think&gt; :</text>
-  <text class="s"  x="46" y="614">  le modèle formule le fait → tour court</text>
+  <rect class="box" x="14" y="504" width="276" height="120"/>
+  <text class="tb" x="30" y="526">Déclenchement du write</text>
+  <text class="s"  x="30" y="546">• frontière de tour, capture par défaut</text>
+  <text class="s"  x="30" y="562">  SYMÉTRIQUE user/self — 0 forward</text>
+  <text class="s"  x="30" y="580">• argument décisif = le RESET : sans</text>
+  <text class="s"  x="30" y="596">  self-writes, amnésie asymétrique de</text>
+  <text class="s"  x="30" y="612">  ses propres engagements post-reset</text>
 
-  <text class="s" x="716" y="606" text-anchor="middle">Sans <tspan class="mono">leave-one-overwrite</tspan> (rejouer en préservant le slot détruit), le choix de slot</text>
-  <text class="s" x="716" y="622" text-anchor="middle">n'a AUCUN gradient et le GRPO dégénère en FIFO — SNR à mesurer (kill-test 6).</text>
+  <rect class="box" x="842" y="504" width="304" height="120"/>
+  <text class="tb" x="858" y="526">PLUS DE CLÉ STOCKÉE</text>
+  <text class="s"  x="858" y="546">la clé est une FONCTION, pas une donnée :</text>
+  <text class="s"  x="858" y="562">calculée à la lecture par les projections K</text>
+  <text class="s"  x="858" y="578">du read (W_K′) depuis le contenu de la ligne.</text>
+  <text class="s"  x="858" y="598">Le pooling SIF de <tspan class="mono">build_group</tspan> survit</text>
+  <text class="s"  x="858" y="614">uniquement comme SCORE de sélection.</text>
+
+  <text class="s" x="580" y="650" text-anchor="middle">Risque assumé de la capture self : la boucle fermée (le serve divergeait en ~5-10 tours). Défenses : tag de provenance (le read pondère « j'ai dit » ≠ « on m'a dit »),</text>
+  <text class="s" x="580" y="666" text-anchor="middle">rétention par usage (le junk s'affame), et le kill-test « horizon de divergence self-writes ON/OFF » (S13, à lancer).</text>
+  <text class="warn" x="580" y="688" text-anchor="middle">Sans <tspan class="mono">leave-one</tspan> contrefactuel (rejouer en PRÉSERVANT la ligne évincée), le choix de propagation n'a AUCUN gradient et le GRPO dégénère en FIFO — SNR à mesurer (S12/KT6).</text>
+</svg>
+</section>
+
+<!-- ══════════════════ 2bis. LES ROTATIONS ══════════════════ -->
+<section>
+<h2>2bis. Métadonnées = rotations sur plans réservés (BankRot) — verdicts de la phase 11</h2>
+<p class="cap">Les métadonnées ne sont pas des <i>champs</i> : quand / qui / quel canal sont des <b>rotations élémentaires</b> des clés, le contenu restant le vecteur natif intact. Trois familles étaient prévues ; la phase 11 (22 cellules <span class="mono">zzr*</span>, dépouillée le 2026-08-04, 0 échec) en a tranché deux et invalidé un examen.</p>
+<svg viewBox="0 0 1160 634" role="img" aria-label="Les trois familles de rotation des clés de banque et leurs verdicts">
+  <defs>
+    <marker id="a7g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0f766e"/></marker>
+  </defs>
+
+  <rect class="proc" x="20" y="18" width="1120" height="70" rx="10"/>
+  <text class="tb" x="580" y="40" text-anchor="middle">PRINCIPE — une rotation laisse le contenu intact (norme préservée) et ne se décode que dans un produit q·k</text>
+  <text class="s"  x="580" y="60" text-anchor="middle">Les plans vivent dans les projections K DÉDIÉES de kvproj (§2.4) — <tspan font-weight="700">jamais dans la bande RoPE du backbone</tspan>, jamais appliqués avant W_k (une rotation ne survit pas à la projection).</text>
+  <text class="s"  x="580" y="78" text-anchor="middle">Toute rotation côté banque est fonction de propriétés DE LA LIGNE (âge, canal, index local), jamais de la position du token lecteur — celle-ci meurt au RESET.</text>
+
+  <!-- FAMILLE 1 : ÂGE -->
+  <rect class="proc" x="20" y="104" width="360" height="252" rx="10"/>
+  <text class="tt" x="36" y="128">① ÂGE — log-comprimé</text>
+  <text class="t"  x="36" y="150">φ(a) ∝ log(1+a) · 8 plans entrelacés,</text>
+  <text class="t"  x="36" y="168">échelle géométrique, fréquences APPRISES,</text>
+  <text class="t"  x="36" y="186">SANS bande haute (collisions).</text>
+  <text class="s"  x="36" y="208">Résolution décroissante = la sémantique voulue :</text>
+  <text class="s"  x="36" y="224">3 vs 4 tours compte, 5000 vs 5001 non.</text>
+  <text class="sb" x="36" y="250">S4 — TRANCHÉ 08-04 (prédiction log RÉFUTÉE)</text>
+  <text class="s"  x="36" y="268">c'est l'AUGMENTATION d'échelle au train qui porte</text>
+  <text class="s"  x="36" y="284">l'OOD, pas le log : sans aug, agelog m8 s'effondre</text>
+  <text class="s"  x="36" y="300">à ×10 (marge 3,01 → 1,82, acc 0,90) ; avec aug,</text>
+  <text class="s"  x="36" y="316">raw ET log tiennent (acc 1,0, marges plates ×1/10/100)</text>
+  <text class="warn" x="36" y="336">⇒ l'aug d'échelle devient OBLIGATOIRE dès qu'un plan</text>
+  <text class="warn" x="36" y="350">d'âge existe (rotation sans payload = perturbation)</text>
+
+  <!-- FAMILLE 2 : PROVENANCE / CANAL -->
+  <rect class="proc" x="400" y="104" width="360" height="252" rx="10"/>
+  <text class="tt" x="416" y="128">② PROVENANCE / CANAL — 0 ou π</text>
+  <text class="t"  x="416" y="150">UN PLAN 0/π PAR CANAL (user, self, system ;</text>
+  <text class="t"  x="416" y="168">puis les modalités). Jamais n angles sur un</text>
+  <text class="t"  x="416" y="186">plan : métrique cyclique parasite.</text>
+  <text class="s"  x="416" y="208">= le chat template réimplémenté dans l'espace où</text>
+  <text class="s"  x="416" y="224">il n'existe plus (le top-k détruit les balises de rôle).</text>
+  <text class="sb" x="416" y="250">S5 — EXAMEN INVALIDE 08-04, RE-RUN EN COURS</text>
+  <text class="s"  x="416" y="268">les 6 cellules <tspan class="mono">prov</tspan> rendaient des métriques GELÉES</text>
+  <text class="s"  x="416" y="284">(grade 0,000 train ET éval) : le pool de valeurs `ref`</text>
+  <text class="s"  x="416" y="300">à 5 chiffres est HORS DE PORTÉE de copie du jouet.</text>
+  <text class="s"  x="416" y="316">Sonde : bon canal, lettres copiées, chiffres dégénérés.</text>
+  <text class="warn" x="416" y="336">Statut : NON TRANCHÉ. Fix <tspan class="mono">--prov-vals span</tspan> livré,</text>
+  <text class="warn" x="416" y="350">cellules <tspan class="mono">zzr311-316</tspan> re-postées (rot / add / rien × m).</text>
+
+  <!-- FAMILLE 3 : POSITION LOCALE -->
+  <rect class="box" x="780" y="104" width="360" height="252" rx="10"/>
+  <text class="tt" x="796" y="128">③ POSITION LOCALE intra-span</text>
+  <text class="t"  x="796" y="150">Idée : encoder l'index LOCAL de la ligne</text>
+  <text class="t"  x="796" y="168">(0…mem_dim−1) pour qu'un span multi-tokens</text>
+  <text class="t"  x="796" y="186">ne devienne un sac (« New York » = {New, York}).</text>
+  <text class="sb" x="796" y="212">S17 — TRANCHÉ 08-04 : ÉCONOMISÉE</text>
+  <text class="s"  x="796" y="232">locnone m8 = grade <tspan font-weight="700">0,97</tspan> jusqu'à L6 (r@1 0,995) ;</text>
+  <text class="s"  x="796" y="248">locrot 0,95, locadd 0,95 — aucun bras n'apporte rien.</text>
+  <text class="s"  x="796" y="268">L'ordre vient GRATUITEMENT du layout d'injection :</text>
+  <text class="s"  x="796" y="284">les lignes natives arrivent ordonnées dans le préfixe,</text>
+  <text class="s"  x="796" y="300">le RoPE du backbone fait le reste.</text>
+  <text class="warn" x="796" y="322">La chute m4 sur L4-L6 (0,37-0,55, IDENTIQUE dans les</text>
+  <text class="warn" x="796" y="336">3 bras) est la LARGEUR k du slot, pas l'ordre :</text>
+  <text class="warn" x="796" y="350">le vrai cadran des spans longs est k (cf. S16).</text>
+
+  <!-- CONTRAINTE CÔTÉ REQUÊTE -->
+  <rect class="learn" x="20" y="372" width="1120" height="112" rx="10"/>
+  <text class="tt" x="36" y="396">Contrainte côté REQUÊTE — kvproj partage le q du backbone, ROPE COMPRIS</text>
+  <text class="mono" x="36" y="418">score banque = (R(t)·W_Q x_t)ᵀ (W_K′ g_r)   →   la rotation R(t) n'est PAS annulée côté banque</text>
+  <text class="s"  x="36" y="440">Le produit se faisant dim à dim, les plans de métadonnées doivent viser les dims QUASI STATIQUES (ω ≈ 0) du RoPE — sinon le code d'âge se mélange à la position dans la fenêtre.</text>
+  <text class="warn" x="36" y="460">Corollaire « W_K′ se docke seul dans la bande lente » MESURÉ ET RÉFUTÉ le 08-03 : énergie par bande indiscernable de l'uniforme (moitié lente 0,5000 ± 0,0005).</text>
+  <text class="warn" x="36" y="476">⇒ la prescription se tient PAR CONSTRUCTION (<tspan class="mono">slow_rope_planes</tspan> + garde de dérive <tspan class="mono">rot_drift_max</tspan>, livrés en ph.11) ; mesure à refaire en fenêtre LONGUE au 350M.</text>
+
+  <!-- PHASE 12 -->
+  <rect class="proc" x="20" y="500" width="1120" height="118" rx="10"/>
+  <text class="tt" x="36" y="524">PHASE 12 — EN COURS sur la ferme (25 cellules <tspan class="mono">zzs*</tspan>) : rétention (S6) et dilution (S8). Résultats attendus — rien n'est préjugé.</text>
+  <text class="s"  x="36" y="546"><tspan font-weight="700">S6 — bakeoff de RÉTENTION</tspan> (procédural : zéro RL, zéro paramètre) sur un env `life` neuf : vies de 48-88 segments, 12-22 writes contre max_mem 8, ancre tôt + supersession tardive</text>
+  <text class="s"  x="36" y="562">NY→Austin + ré-évocation historique. Cinq signaux : FIFO nue (baseline basse) · âge (LE PROXY RÉPUDIÉ, baseline à battre) · attention-EMA (le lecteur vote) · couverture · ACT-R.</text>
+  <text class="s"  x="36" y="578">Métriques de PREMIÈRE CLASSE : t_adapt aux faits nouveaux ET survie du fait ancien utile — plus le grade, le r@1 et l'horizon effectif mesuré.</text>
+  <text class="s"  x="36" y="594"><tspan font-weight="700">S8 — courbe de DILUTION</tspan> : S ∈ {1, 4, 8, 16, 64} rempli de distracteurs RÉELS → fixe max_mem ; l'écroulement de l'attention PLATE = baseline d'entrée de la hiérarchie (S9).</text>
+  <text class="warn" x="36" y="612">S3 y est recroisé (<tspan class="mono">zzs115/116</tspan>, age-log × {fifo, attn-ema}) : l'examen d'âge de la ph.11 tournait sur `rule`, sans charge temporelle — payload vide, PAS réfutation.</text>
 </svg>
 </section>
 
 <!-- ══════════════════ 3. LES DEUX LECTURES ══════════════════ -->
 <section>
 <h2>3. Zoom lecture — deux régimes sur un seul store</h2>
-<p class="cap">Même banque, deux chemins qui ne consomment pas la même composante et ne servent pas la même fonction.</p>
-<svg viewBox="0 0 1160 692" role="img" aria-label="Lecture ambiante par le gist et lecture ciblée par la surface">
+<p class="cap">Même banque, deux chemins qui ne consomment pas la même <i>nature</i> de ligne et ne servent pas la même fonction. <b>La lecture est la seule classe de fonctions apprise du design — et c'est de l'attention.</b>
+Verdict du carré factoriel (08-03, re-jugé en absolu) : <b>kvproj ADOPTÉ</b> (nll_live −0,165 ± SE 0,053, t 3,1 vs kv_append ; exploitation réelle du budget m : 3,86 → 3,35 de m1 à m8) ;
+<b>dual_heads DOMINÉ coût-ajusté</b> (meilleur en absolu à chaque m mais +0,048 = bruit, double coût, params non appariés) ; <b>bank-q INVALIDÉ</b> (fuite non-causale : les lanes voyaient le futur teacher-forcé) ; <b>fast-weight read retiré</b> (ph.10).</p>
+<svg viewBox="0 0 1160 764" role="img" aria-label="Lecture ambiante par attention kvproj et lecture ciblée par la surface">
   <defs>
     <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
@@ -314,39 +438,46 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
 
   <!-- store commun -->
   <rect class="store" x="300" y="24" width="560" height="56" rx="10"/>
-  <text class="tt" x="580" y="48" text-anchor="middle">LA BANQUE — S slots (clé, surface, gist)</text>
-  <text class="s"  x="580" y="68" text-anchor="middle">un seul store, alimenté par un seul geste d'écriture</text>
+  <text class="tt" x="580" y="48" text-anchor="middle">LA BANQUE — un seul store de lignes natives</text>
+  <text class="s"  x="580" y="68" text-anchor="middle">à la lecture, il s'aplatit en VUE (max_mem·mem_dim, d) — reshape zéro-copie</text>
 
-  <path class="ar-proc" d="M420,84 V128 H280 V158" marker-end="url(#a3g)"/>
+  <path class="ar-learn" d="M420,84 V128 H280 V158" marker-end="url(#a3b)"/>
   <path class="ar-learn" d="M740,84 V128 H880 V158" marker-end="url(#a3b)"/>
-  <text class="sb" x="300" y="118">gists</text>
-  <text class="sb" x="838" y="118">clés + surfaces</text>
+  <text class="sb" x="286" y="118">lignes de nature gist</text>
+  <text class="sb" x="820" y="118">lignes de nature surface</text>
 
   <!-- COLONNE GAUCHE : AMBIANTE -->
   <rect class="panelbg" x="30" y="158" width="500" height="452" rx="12"/>
-  <text class="tt" x="280" y="184" text-anchor="middle">A. LECTURE AMBIANTE</text>
-  <text class="s"  x="280" y="202" text-anchor="middle">consomme le GIST · invoquée TOUJOURS · <tspan class="mono">cascade.py</tspan></text>
+  <text class="tt" x="280" y="182" text-anchor="middle">A. LECTURE AMBIANTE — par ATTENTION (kvproj)</text>
+  <text class="s"  x="280" y="200" text-anchor="middle">lignes de nature GIST · invoquée TOUJOURS · <tspan font-weight="700">S1 TRANCHÉ 08-03</tspan></text>
 
-  <rect class="proc" x="60" y="216" width="440" height="46" rx="8"/>
-  <text class="t" x="280" y="245" text-anchor="middle">gists des S slots (aucune sélection, aucune requête)</text>
-  <path class="ar-proc" d="M280,266 V294" marker-end="url(#a3g)"/>
+  <rect class="learn" x="60" y="210" width="440" height="48" rx="8"/>
+  <text class="t" x="280" y="230" text-anchor="middle">toutes les lignes de la vue plate entrent</text>
+  <text class="s" x="280" y="248" text-anchor="middle">aucune sélection, aucune requête explicite · lignes vides MASQUÉES du softmax</text>
+  <path class="ar-learn" d="M280,258 V282" marker-end="url(#a3b)"/>
 
-  <rect class="proc" x="60" y="298" width="440" height="60" rx="8"/>
-  <text class="tb" x="280" y="322" text-anchor="middle">CASCADE — à CHAQUE forward</text>
-  <text class="s"  x="280" y="342" text-anchor="middle">coût constant, 0 token de fenêtre, aucune action à décider</text>
-  <path class="ar-proc" d="M280,362 V390" marker-end="url(#a3g)"/>
+  <rect class="learn" x="60" y="286" width="440" height="110" rx="8"/>
+  <text class="tb" x="280" y="306" text-anchor="middle">kvproj — deux projections DÉDIÉES, APPRISES</text>
+  <text class="mono" x="280" y="326" text-anchor="middle">K′ = W_K′ · ligne     V′ = W_V′ · ligne</text>
+  <text class="s"  x="280" y="344" text-anchor="middle">les lignes entrent comme K/V SUPPLÉMENTAIRES dans l'attention,</text>
+  <text class="s"  x="280" y="360" text-anchor="middle">softmax UNIFIÉ avec les colonnes de la fenêtre (q partagé du backbone)</text>
+  <text class="s"  x="280" y="376" text-anchor="middle">prix : ~2d² par couche lectrice · les rotations (2bis) vivent dans W_K′</text>
+  <text class="s"  x="280" y="391" text-anchor="middle"><tspan class="mono">bank_logit_bias</tspan> appris ≈ 0 : la compétition de masse n'existait pas</text>
+  <path class="ar-learn" d="M280,396 V414" marker-end="url(#a3b)"/>
 
-  <rect class="box" x="60" y="394" width="440" height="46" rx="8"/>
-  <text class="t" x="280" y="423" text-anchor="middle">couches du LM 350M (état interne biaisé)</text>
-  <path class="ar-proc" d="M280,444 V472" marker-end="url(#a3g)"/>
+  <rect class="box" x="60" y="418" width="440" height="50" rx="8"/>
+  <text class="t" x="280" y="438" text-anchor="middle">les COUCHES LECTRICES du LM 350M</text>
+  <text class="warn" x="280" y="458" text-anchor="middle">lesquelles ? = S19, OUVERTE — défaut si non sondée : TOUTES (le régime prouvé)</text>
+  <path class="ar-learn" d="M280,468 V488" marker-end="url(#a3b)"/>
 
-  <rect class="proc" x="60" y="476" width="440" height="70" rx="8"/>
-  <text class="tb" x="280" y="500" text-anchor="middle">DISTRIBUTION MODULÉE</text>
-  <text class="s"  x="280" y="520" text-anchor="middle">langue (barreau 1) · registre (barreau 2) · règle de contenu (barreau 3)</text>
-  <text class="s"  x="280" y="538" text-anchor="middle">appui : persona Δnll +0.332 à β=0</text>
+  <rect class="learn" x="60" y="492" width="440" height="62" rx="8"/>
+  <text class="tb" x="280" y="512" text-anchor="middle">DISTRIBUTION MODULÉE</text>
+  <text class="s"  x="280" y="530" text-anchor="middle">langue (barreau 1) · registre (barreau 2) · règle de contenu (barreau 3)</text>
+  <text class="s"  x="280" y="547" text-anchor="middle">2AFC 1,000 dès m=4 (shuf SOUS le hasard) · persona Δnll +0,332 à β=0 (sonde)</text>
 
-  <text class="warn" x="280" y="570" text-anchor="middle">JAMAIS sollicitée pour verbaliser — le « tour blanc » l'a montré :</text>
-  <text class="warn" x="280" y="586" text-anchor="middle">le prior natif prend. Risque propre : dilution quand S grandit (kill-test 8).</text>
+  <text class="warn" x="280" y="572" text-anchor="middle">JAMAIS sollicitée pour verbaliser — le « tour blanc » l'a montré : le prior natif</text>
+  <text class="warn" x="280" y="587" text-anchor="middle">prend, et les lignes d'états cachés citent 0,000. Risque propre : dilution (S8).</text>
+  <text class="warn" x="280" y="604" text-anchor="middle">Le read FAST-WEIGHT est RETIRÉ du design (ph.10 : perd dans les deux régimes).</text>
 
   <!-- COLONNE DROITE : CIBLÉE -->
   <rect class="panelbg" x="560" y="158" width="570" height="452" rx="12"/>
@@ -359,7 +490,7 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
 
   <rect class="learn" x="586" y="276" width="518" height="42" rx="7"/>
   <text class="tb" x="845" y="294" text-anchor="middle">RETRIEVER W<tspan font-size="10">q</tspan> — APPRIS (CE multi-positive, détachée du trunk)</text>
-  <text class="s"  x="845" y="311" text-anchor="middle">scores de la requête contre les S clés procédurales</text>
+  <text class="s"  x="845" y="311" text-anchor="middle">scores de la requête contre les clés des groupes résidents (LaneBank déployée)</text>
   <path class="ar-learn" d="M845,322 V344" marker-end="url(#a3b)"/>
 
   <rect class="learn" x="586" y="348" width="518" height="60" rx="7"/>
@@ -393,13 +524,19 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
   <rect class="box" x="30" y="626" width="500" height="46" rx="8"/>
   <text class="tb" x="280" y="648" text-anchor="middle">PRINCIPE DE SÉPARATION</text>
   <text class="t"  x="280" y="666" text-anchor="middle">ce qui doit être DIT passe par la surface ; ce qui doit MODULER passe par le gist</text>
+
+  <!-- le mur -->
+  <rect class="box" x="30" y="686" width="1100" height="64" rx="8"/>
+  <text class="tt" x="50" y="708">LE MUR DU SYSTÈME N'EST NI LA LECTURE NI LA COPIE — c'est la SÉLECTION (KT1, 08-03)</text>
+  <text class="t"  x="50" y="730">grade 0,717 quand le vrai groupe sort en tête, <tspan font-weight="700">0,000 sur les miss</tspan> ; r@1 0,480 en multi-vies. Réponses en couches : GRPO retrieve (Plackett-Luce) →</text>
+  <text class="t"  x="50" y="746">les métadonnées comme filtres de descente (la requête choisit son axe) → la hiérarchie CSA/HCA sur la banque (retriever SOFT différentiable, S9).</text>
 </svg>
 </section>
 
 <!-- ══════════════════ 4. RESET ══════════════════ -->
 <section>
 <h2>4. Le protocole central — sessions à travers les RESET</h2>
-<p class="cap">Une « session » = plusieurs fenêtres séparées par des resets. Le token RESET jette la <b>fenêtre</b> (jamais la banque). Les deux ailes (conditionnement Δnll, rappel exact) sont mesurées <b>après n resets, en fonction de n</b>.</p>
+<p class="cap">Une « session » = plusieurs fenêtres séparées par des resets. Le token RESET jette la <b>fenêtre</b> (jamais la banque). Les deux ailes (conditionnement, rappel exact) sont mesurées <b>après n resets, en fonction de n</b> — le conditionnement par paires contrastives Δnll comme <i>sonde</i>, le rappel par le grade décodé (jamais le Δnll : règle d'adjudication ci-dessus).</p>
 <svg viewBox="0 0 1160 582" role="img" aria-label="Timeline de sessions multi-fenêtres et coût comparé des baselines">
   <defs>
     <marker id="a4o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -426,11 +563,12 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
   <rect class="dim" x="440" y="76" width="290" height="40" rx="6"/><text class="s" x="585" y="101" text-anchor="middle">tokens de tâche (100 %)</text>
   <rect class="dim" x="790" y="76" width="290" height="40" rx="6"/><text class="s" x="935" y="101" text-anchor="middle">tokens de tâche (100 %)</text>
 
-  <rect class="store" x="180" y="128" width="900" height="60" rx="8"/>
-  <text class="tb" x="630" y="148" text-anchor="middle">BANQUE — le SEUL état qui traverse les resets · hors contexte · 0 token de fenêtre</text>
-  <text class="s"  x="630" y="166" text-anchor="middle">S slots inchangés en taille ; seules des écritures (avec écrasement) la modifient</text>
-  <path class="ar-store" d="M300,178 H480" marker-end="url(#a4o)"/>
-  <path class="ar-store" d="M660,178 H840" marker-end="url(#a4o)"/>
+  <rect class="store" x="180" y="128" width="900" height="76" rx="8"/>
+  <text class="tb" x="630" y="147" text-anchor="middle">BANQUE — le SEUL état qui traverse les resets · hors contexte · 0 token de fenêtre</text>
+  <text class="s"  x="630" y="164" text-anchor="middle">taille CONSTANTE ; seul un write la modifie (append + décalage + propagation, jamais d'écrasement choisi)</text>
+  <text class="s"  x="630" y="180" text-anchor="middle">les lignes taguées system sont ÉPINGLÉES : le prompt système devient banque-résident et survit au RESET à coût fenêtre nul</text>
+  <path class="ar-store" d="M300,194 H480" marker-end="url(#a4o)"/>
+  <path class="ar-store" d="M660,194 H840" marker-end="url(#a4o)"/>
 
   <!-- bras COMPACTION -->
   <text class="tb" x="30" y="222">bras COMPACTION</text>
@@ -468,7 +606,7 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
   <rect class="box" x="30" y="450" width="1100" height="120" rx="10"/>
   <text class="tt" x="50" y="474">Comptabilité — règles non négociables</text>
   <text class="t"  x="50" y="498">• Appariement en <tspan font-weight="700">FORWARDS TOTAUX</tspan> (ou FLOPs), jamais en « tokens visibles » : cette comptabilité-là exclurait le compute caché</text>
-  <text class="t"  x="62" y="516">(writes, cascade, pseudo-tokens injectés) et rendrait le claim tautologique.</text>
+  <text class="t"  x="62" y="516">(writes, colonnes de banque lues à chaque forward, pseudo-tokens injectés) et rendrait le claim tautologique.</text>
   <text class="t"  x="50" y="538">• Fenêtre bornée et identique partout — l'avantage revendiqué de la banque est <tspan font-weight="700">structurel</tspan> : elle est <tspan font-style="italic">hors</tspan> de la fenêtre.</text>
   <text class="t"  x="50" y="560">• Le claim n'est pas « on bat le RAG au verbatim » (faux en fenêtre libre) : c'est <tspan font-weight="700">un mécanisme unifié</tspan> — un même store qui conditionne ET cite à travers les resets.</text>
 </svg>
@@ -477,10 +615,11 @@ Un seul store, un seul geste d'écriture, deux régimes de lecture.</p>
 <!-- ══════════════════ 5. GREFFE ARCHITECTURALE ══════════════════ -->
 <section>
 <h2>5. La greffe — points d'attache exacts sur le stack 350M</h2>
-<p class="cap">Valeurs lues dans <span class="mono">configs/sft_recall_350m_copy.yaml</span> et le code (<span class="mono">model.py</span>, <span class="mono">cascade.py</span>, <span class="mono">memory.py</span>, <span class="mono">rti.py</span>, <span class="mono">rti_copy.py</span>, <span class="mono">rti_policy.py</span>).
-<b>d_model 768 · 12 couches · 12 têtes × d_head 64 · MoE 4+1 top-2, d_ff 1536 · n_hc 2 · mem_dim 512 · max_mem 8 · max_seq_len 640 · vocab SmolLM2-135M</b>.
-Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est un read <b>fast-weight</b> (la banque est un jeu de POIDS).</p>
-<svg viewBox="0 0 1160 1230" role="img" aria-label="Vue architecturale : points d'attache de la banque sur le stack 350M">
+<p class="cap">Dimensions du backbone lues dans <span class="mono">configs/sft_recall_350m_copy.yaml</span> et le code (<span class="mono">model.py</span>, <span class="mono">memory.py</span>, <span class="mono">rti.py</span>, <span class="mono">rti_copy.py</span>, <span class="mono">rti_policy.py</span>) :
+<b>d_model 768 · 12 couches · 12 têtes × d_head 64 · MoE 4+1 top-2, d_ff 1536 · n_hc 2 · max_mem 8 · max_seq_len 640 · vocab SmolLM2-135M</b>.
+<b>Ce qui change par rapport au ckpt déployé</b> : le read n'est plus un read <b>fast-weight</b> (banque = jeu de poids, <span class="mono">mem_dim 512</span>) — c'est une <b>attention kvproj</b> sur des lignes natives de largeur d (mem_dim = nombre de lignes par tour, 16 mesuré en S16).
+Plan de greffe : <b>greffe + SFT sur le ckpt 350M existant d'abord</b> (fixe S10 le point de tap, S19 les couches lectrices, le tag-curseur ; ablation cascade ON/OFF per S20), puis <b>from-scratch ENSUITE sur spec gelée</b>, avec un mid-training élargi (ChatML + instructions + dépendance mémoire via protocole RESET + corpus agentique + curriculum de longueur).</p>
+<svg viewBox="0 0 1160 1406" role="img" aria-label="Vue architecturale : points d'attache de la banque sur le stack 350M">
   <defs>
     <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
@@ -516,22 +655,22 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
   <path class="ar" d="M580,230 V256" marker-end="url(#a5)"/>
 
   <!-- ───── RÉGION B : le stack ───── -->
-  <text class="tt" x="14" y="278">② LES 12 COUCHES — chacune lit la banque fast-weight ENTRE attention et MoE</text>
+  <text class="tt" x="14" y="278">② LES COUCHES LECTRICES — la banque entre comme K/V SUPPLÉMENTAIRES, DANS l'attention</text>
 
   <!-- barres des 12 couches -->
   <g>
-    <rect class="box" x="430" y="290" width="300" height="30" rx="5"/><text class="s" x="444" y="310">couche 0 · CSA  → read FW → MoE</text>
-    <rect class="box" x="430" y="330" width="300" height="30" rx="5"/><text class="s" x="444" y="350">couche 1 · HCA  → read FW → MoE</text>
-    <rect class="box" x="430" y="370" width="300" height="30" rx="5"/><text class="s" x="444" y="390">couche 2 · CSA  → read FW → MoE</text>
-    <rect class="box" x="430" y="410" width="300" height="30" rx="5"/><text class="s" x="444" y="430">couche 3 · HCA  → read FW → MoE</text>
-    <rect class="box" x="430" y="450" width="300" height="30" rx="5"/><text class="s" x="444" y="470">couche 4 · CSA  → read FW → MoE</text>
-    <rect class="box" x="430" y="490" width="300" height="30" rx="5"/><text class="s" x="444" y="510">couche 5 · HCA  → read FW → MoE</text>
-    <rect class="box" x="430" y="530" width="300" height="30" rx="5"/><text class="s" x="444" y="550">couche 6 · CSA  → read FW → MoE</text>
-    <rect class="box" x="430" y="570" width="300" height="30" rx="5"/><text class="s" x="444" y="590">couche 7 · HCA  → read FW → MoE</text>
-    <rect class="box" x="430" y="610" width="300" height="30" rx="5"/><text class="s" x="444" y="630">couche 8 · CSA  → read FW → MoE</text>
-    <rect class="box" x="430" y="650" width="300" height="30" rx="5"/><text class="s" x="444" y="670">couche 9 · HCA  → read FW → MoE</text>
-    <rect class="box" x="430" y="690" width="300" height="30" rx="5"/><text class="s" x="444" y="710">couche 10 · CSA → read FW → MoE</text>
-    <rect class="box" x="430" y="730" width="300" height="30" rx="5"/><text class="s" x="444" y="750">couche 11 · HCA → read FW → MoE</text>
+    <rect class="box" x="430" y="290" width="300" height="30" rx="5"/><text class="s" x="444" y="310">couche 0 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="330" width="300" height="30" rx="5"/><text class="s" x="444" y="350">couche 1 · HCA + kvproj → MoE</text>
+    <rect class="box" x="430" y="370" width="300" height="30" rx="5"/><text class="s" x="444" y="390">couche 2 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="410" width="300" height="30" rx="5"/><text class="s" x="444" y="430">couche 3 · HCA + kvproj → MoE</text>
+    <rect class="box" x="430" y="450" width="300" height="30" rx="5"/><text class="s" x="444" y="470">couche 4 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="490" width="300" height="30" rx="5"/><text class="s" x="444" y="510">couche 5 · HCA + kvproj → MoE</text>
+    <rect class="box" x="430" y="530" width="300" height="30" rx="5"/><text class="s" x="444" y="550">couche 6 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="570" width="300" height="30" rx="5"/><text class="s" x="444" y="590">couche 7 · HCA + kvproj → MoE</text>
+    <rect class="box" x="430" y="610" width="300" height="30" rx="5"/><text class="s" x="444" y="630">couche 8 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="650" width="300" height="30" rx="5"/><text class="s" x="444" y="670">couche 9 · HCA + kvproj → MoE</text>
+    <rect class="box" x="430" y="690" width="300" height="30" rx="5"/><text class="s" x="444" y="710">couche 10 · CSA + kvproj → MoE</text>
+    <rect class="box" x="430" y="730" width="300" height="30" rx="5"/><text class="s" x="444" y="750">couche 11 · HCA + kvproj → MoE</text>
   </g>
 
   <!-- bus de lecture -->
@@ -548,37 +687,35 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
   <!-- zoom d'un bloc -->
   <rect class="panelbg" x="14" y="290" width="386" height="356" rx="10"/>
   <text class="tt" x="207" y="314" text-anchor="middle">ZOOM : un <tspan class="mono">DualModalBlock</tspan></text>
-  <rect class="box" x="34" y="326" width="346" height="40" rx="6"/>
-  <text class="s" x="207" y="345" text-anchor="middle">mHC(<tspan class="mono">norm_attn</tspan> → CSA ou HCA)</text>
-  <text class="s" x="207" y="360" text-anchor="middle">auto-attention du texte, n_hc = 2</text>
-  <path class="ar" d="M207,366 V386" marker-end="url(#a5)"/>
-
-  <rect class="store" x="34" y="390" width="346" height="132" rx="6"/>
-  <text class="tb" x="207" y="410" text-anchor="middle">READ FAST-WEIGHT ← la banque entre ICI</text>
-  <text class="mono" x="207" y="430" text-anchor="middle">A_i = fw_A(m_i) → [2, r=8, 768]  (SwiGLU)</text>
-  <text class="mono" x="207" y="447" text-anchor="middle">B_i = fw_B(m_i) → [768, 8]</text>
-  <text class="mono" x="207" y="466" text-anchor="middle">y ← y + B_i · act(A_i · y),  i = 0…7</text>
-  <text class="s" x="207" y="484" text-anchor="middle">SÉQUENTIEL sur les 8 slots = un MLP à 8 couches</text>
-  <text class="s" x="207" y="500" text-anchor="middle">dont le modèle a écrit les poids ; sortie =</text>
-  <text class="mono" x="207" y="516" text-anchor="middle">h + fw_o(y − y₀)   (un DELTA résiduel)</text>
+  <rect class="learn" x="34" y="326" width="346" height="196" rx="6"/>
+  <text class="tb" x="207" y="346" text-anchor="middle">mHC(<tspan class="mono">norm_attn</tspan> → CSA ou HCA) + kvproj</text>
+  <text class="s" x="207" y="362" text-anchor="middle">auto-attention du texte, n_hc = 2 — la banque entre ICI</text>
+  <text class="mono" x="207" y="384" text-anchor="middle">K = [ W_K·h ‖ W_K′·lignes ]</text>
+  <text class="mono" x="207" y="401" text-anchor="middle">V = [ W_V·h ‖ W_V′·lignes ]</text>
+  <text class="mono" x="207" y="418" text-anchor="middle">attn(q, K, V) — UN SEUL softmax</text>
+  <text class="s" x="207" y="438" text-anchor="middle">q = celui du backbone (RoPE compris) ; W_K′/W_V′ DÉDIÉES</text>
+  <text class="s" x="207" y="454" text-anchor="middle">hébergent les rotations de métadonnées (panneau 2bis)</text>
+  <text class="s" x="207" y="472" text-anchor="middle">colonnes ajoutées = max_mem·mem_dim (vue plate),</text>
+  <text class="s" x="207" y="488" text-anchor="middle">lignes vides masquées · <tspan class="mono">bank_logit_bias</tspan> appris ≈ 0</text>
+  <text class="s" x="207" y="508" text-anchor="middle">prix : ~2d² par couche lectrice ≈ 14 % des params si TOUTES</text>
   <path class="ar" d="M207,522 V542" marker-end="url(#a5)"/>
 
   <rect class="box" x="34" y="546" width="346" height="40" rx="6"/>
   <text class="s" x="207" y="565" text-anchor="middle">mHC(<tspan class="mono">norm_moe</tspan> → MoE 4 experts + 1 partagé, top-2)</text>
   <text class="s" x="207" y="580" text-anchor="middle">d_ff 1536</text>
-  <text class="s" x="207" y="606" text-anchor="middle">Le read est placé ENTRE attention et MoE : les « poids »</text>
-  <text class="s" x="207" y="621" text-anchor="middle">appliqués influencent le routage des experts.</text>
-  <text class="warn" x="207" y="638" text-anchor="middle">Banque triviale ⇒ delta ≈ 0 ⇒ le bloc est l'identité.</text>
-  <path class="ar" d="M400,530 H424" marker-end="url(#a5)"/>
+  <text class="s" x="207" y="606" text-anchor="middle">Les colonnes de banque sont GRATUITES en FLOPs (S=128) ;</text>
+  <text class="s" x="207" y="621" text-anchor="middle">seules les deux projections dédiées coûtent des params.</text>
+  <text class="warn" x="207" y="638" text-anchor="middle">Banque vide ⇒ colonnes masquées ⇒ attention inchangée.</text>
+  <path class="ar" d="M400,430 H424" marker-end="url(#a5)"/>
 
   <text class="s" x="207" y="676" text-anchor="middle">parité : couche PAIRE = CSA (csa_m 4, top-8, fenêtre 16)</text>
   <text class="s" x="207" y="692" text-anchor="middle">couche IMPAIRE = HCA (hca_m 16)</text>
   <text class="s" x="207" y="708" text-anchor="middle">d_latent_q 64 · n_groups 2 · dropout 0</text>
 
-  <!-- STORE 1 : banque fast-weight -->
+  <!-- STORE 1 : la banque de lignes natives -->
   <rect class="store" x="886" y="262" width="248" height="196" rx="10"/>
-  <text class="tb" x="1010" y="284" text-anchor="middle">BANQUE FAST-WEIGHT</text>
-  <text class="s"  x="1010" y="301" text-anchor="middle"><tspan class="mono">[B, max_mem=8, mem_dim=512]</tspan></text>
+  <text class="tb" x="1010" y="284" text-anchor="middle">BANQUE — lignes NATIVES</text>
+  <text class="s"  x="1010" y="301" text-anchor="middle"><tspan class="mono">[max_mem, mem_dim, d=768]</tspan></text>
   <g>
     <rect class="dim" x="900" y="310" width="220" height="15" rx="3"/>
     <rect class="dim" x="900" y="329" width="220" height="15" rx="3"/>
@@ -586,14 +723,14 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
     <rect class="dim" x="900" y="367" width="220" height="15" rx="3"/>
     <rect class="dim" x="900" y="386" width="220" height="15" rx="3"/>
     <rect class="dim" x="900" y="405" width="220" height="15" rx="3"/>
-    <text class="s" x="1010" y="435" text-anchor="middle">8 slots · <tspan font-weight="700">mem_dim 512 ≠ d_model 768</tspan></text>
-    <text class="s" x="1010" y="451" text-anchor="middle">amorce = <tspan class="mono">mem_seed_slots 8</tspan>, uniforme [0,1]</text>
+    <text class="s" x="1010" y="435" text-anchor="middle"><tspan font-weight="700">mem_dim = lignes/tour (16 en S16)</tspan>, largeur d</text>
+    <text class="s" x="1010" y="451" text-anchor="middle">taille CONSTANTE : <tspan class="mono">mem_seed_slots = max_mem</tspan></text>
   </g>
 
-  <text class="sb" x="828" y="472"><tspan class="mono">layer_banks[i]</tspan> = banque lue par la couche i</text>
-  <text class="s"  x="828" y="488">(None = aucun read) · <tspan class="mono">mem_read_layers</tspan> vide ⇒ 12/12</text>
-  <text class="s"  x="828" y="504">cascade v3 : <tspan class="mono">default_layer_map</tspan>(12, d) =</text>
-  <text class="s"  x="828" y="520">[0]×(12−d) + [1…d] — depth 4 → <tspan class="mono">[0×8,1,2,3,4]</tspan></text>
+  <text class="sb" x="828" y="474"><tspan class="mono">read_layers</tspan> = quelles couches lisent</text>
+  <text class="s"  x="828" y="490">= <tspan font-weight="700">S19, OUVERTE</tspan> — défaut : TOUTES (le régime prouvé)</text>
+  <text class="s"  x="828" y="506">la cascade, elle, n'a plus d'emploi propre : <tspan font-weight="700">S20</tspan></text>
+  <text class="s"  x="828" y="522">(ablation ON/OFF pendant la greffe — voir bandeau ⑦)</text>
 
   <!-- STORE 2 : banque RTI -->
   <rect class="store" x="820" y="540" width="314" height="132" rx="10"/>
@@ -642,13 +779,13 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
 
   <!-- tap write -->
   <path class="ar-store" d="M700,948 V972 H772" marker-end="url(#a5o)"/>
-  <rect class="store" x="776" y="920" width="358" height="112" rx="8"/>
-  <text class="tb" x="955" y="940" text-anchor="middle">⑤ WRITE fast-weight — <tspan class="mono">thought_stream._write</tspan></text>
-  <text class="s"  x="955" y="958" text-anchor="middle">pool attentionnel <tspan class="mono">write_ctx_q</tspan> (768→1) sur TOUT H_text</text>
-  <text class="s"  x="955" y="974" text-anchor="middle"><tspan class="mono">thought_head</tspan> 768→512 · gate PAR-DIM · <tspan class="mono">norm_write</tspan></text>
-  <text class="s"  x="955" y="990" text-anchor="middle">α = σ(<tspan class="mono">write_decision</tspan>) scalaire = « écrire ou passer »</text>
-  <text class="s"  x="955" y="1006" text-anchor="middle">append + éviction FIFO au-delà de <tspan class="mono">max_mem = 8</tspan></text>
-  <text class="warn" x="955" y="1024" text-anchor="middle">un write par FORWARD, à la frontière de segment</text>
+  <rect class="proc" x="776" y="920" width="358" height="112" rx="8"/>
+  <text class="tb" x="955" y="940" text-anchor="middle">⑤ WRITE = SÉLECTION — procédural, hors du graphe</text>
+  <text class="s"  x="955" y="958" text-anchor="middle">tranche Δn seule · tag user/self/system par pas de croissance</text>
+  <text class="s"  x="955" y="974" text-anchor="middle">SIF top-k ∪ <tspan class="mono">copy_mask</tspan> procédural, puis dédup contre la banque</text>
+  <text class="s"  x="955" y="990" text-anchor="middle">le pooling appris est SUPPRIMÉ (sonde 08-01 : c'était LUI le goulot,</text>
+  <text class="s"  x="955" y="1006" text-anchor="middle">rétention valeur 1,00 → 0,47 ; la moyenne uniforme retenait 0,675)</text>
+  <text class="warn" x="955" y="1024" text-anchor="middle">append + décalage FIFO + propagation, à la frontière de tour</text>
   <path class="ar-store" d="M1134,990 H1150 V430 H1138" marker-end="url(#a5o)"/>
 
   <!-- lm head + copy head -->
@@ -680,21 +817,33 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
   <rect class="box" x="14" y="1144" width="278" height="78" rx="8"/>
   <text class="tb" x="28" y="1164">Ce que fait le run copy DÉPLOYÉ</text>
   <text class="s"  x="28" y="1181"><tspan class="mono">cascade_depth: 0</tspan> — pas de cascade</text>
-  <text class="s"  x="28" y="1197"><tspan class="mono">layer_banks</tspan> à None, <tspan class="mono">write=False</tspan> ⇒ la banque</text>
-  <text class="s"  x="28" y="1213">fast-weight est contournée (② ⑤ inertes) — cf. 5bis</text>
+  <text class="s"  x="28" y="1197"><tspan class="mono">layer_banks</tspan> à None, <tspan class="mono">write=False</tspan> : ② et ⑤ sont</text>
+  <text class="s"  x="28" y="1213">la CIBLE de la greffe, pas encore posés — cf. 5bis</text>
 
   <rect class="box" x="872" y="1144" width="262" height="78" rx="8"/>
   <text class="tb" x="886" y="1164">Le seul apprenant neuf du run</text>
   <text class="s"  x="886" y="1181">copy-head (W_c + porte, 590 594 params)</text>
   <text class="s"  x="886" y="1197">W_q et <tspan class="mono">type_vec</tspan> arrivent déjà entraînés</text>
   <text class="s"  x="886" y="1213"><tspan class="mono">decode_graphs</tspan> OFF (forme variable)</text>
+
+  <!-- ───── RÉGION D : le plan de greffe ───── -->
+  <rect class="proc" x="14" y="1246" width="1120" height="146" rx="10"/>
+  <text class="tt" x="30" y="1270">⑦ ORDRE DE DÉPLOIEMENT — la greffe d'abord, le from-scratch ensuite</text>
+  <text class="s"  x="30" y="1292"><tspan font-weight="700">1. GREFFE + SFT sur le ckpt 350M EXISTANT.</tspan> On pose kvproj (W_K′/W_V′), le write-sélection (curseur Δn + dédup) et les rotations. Cette étape FIXE trois inconnues :</text>
+  <text class="s"  x="30" y="1308">S10 (point de prélèvement : dernière couche vs ~2/3 vs scalar-mix), S19 (quelles couches lisent) et le tag-curseur. Elle porte aussi l'<tspan font-weight="700">ablation cascade ON/OFF à coût apparié (S20)</tspan>.</text>
+  <text class="warn" x="30" y="1326">La cascade est CUITE dans le ckpt 10B : on ne l'arrache pas pour la greffe — on la mesure.</text>
+  <text class="s"  x="30" y="1348"><tspan font-weight="700">2. FROM-SCRATCH ENSUITE, sur spec GELÉE</tspan>, mid-training élargi : ChatML + instructions + dépendance mémoire via RESET + corpus agentique + curriculum de longueur.</text>
+  <text class="s"  x="30" y="1364">C'est là que S20 se décide : si la cascade ne paie plus ses FLOPs avec kvproj actif, elle est supprimée (bonus : décodage simplifié) ; sinon elle garde sa place et S10 se lit dedans.</text>
+  <text class="s"  x="30" y="1384">Se garde tel quel : write SIF teacher a=1e-4 · RTI + copy-head · harnais RL (CISPO, GiGPO, vies appariées, leave-one) · env recall · perf decode-dispatch (rebind, banque fixe).</text>
 </svg>
 </section>
 
 <!-- ══════════════════ 5bis. LE FORWARD DÉPLOYÉ ══════════════════ -->
 <section>
-<h2>5bis. Le forward déployé (sans cascade) — ce qui tourne vraiment dans le run copy</h2>
-<p class="cap">Le sous-ensemble vivant du panneau 5. <span class="mono">cascade_depth: 0</span>, <span class="mono">layer_banks</span> tout à <span class="mono">None</span>, <span class="mono">write=False</span> : aucune banque n'entre dans le stack. Le seul état persistant est la <b>LaneBank RTI</b>, hors du graphe, et la boucle passe par le préfixe du forward suivant.</p>
+<h2>5bis. Le forward déployé (sans cascade) — ce qui a tourné dans le run copy, et son verdict</h2>
+<p class="cap">Le sous-ensemble vivant du panneau 5, <b>historiquement exact</b> : <span class="mono">cascade_depth: 0</span>, <span class="mono">layer_banks</span> tout à <span class="mono">None</span>, <span class="mono">write=False</span> — aucune banque n'entre dans le stack. Le seul état persistant est la <b>LaneBank RTI</b>, hors du graphe, et la boucle passe par le préfixe du forward suivant.<br>
+<b>VERDICT (2026-08-03) : POSITIF</b> — premier grade non nul au 350M, <b>0,28 vs 0,00 ablaté</b>, p_copy val-only (0,566 / 0,005), <b>hit 0,27 / miss 0,00</b> : la chaîne retrieve-then-inject-then-copy est <b>FERMÉE</b>.
+Le grade est plafonné non par la copie mais par le <b>mur suivant, la SÉLECTION</b> : 0,717 sur les hit contre 0,000 sur les miss, r@1 0,480 en banque multi-vies.</p>
 <svg viewBox="0 0 1160 566" role="img" aria-label="Le forward réellement déployé : stack texte pur, LaneBank hors graphe, boucle par le préfixe">
   <defs>
     <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -794,7 +943,7 @@ Attention : le read de la banque n'est <b>pas</b> une cross-attention — c'est 
 
   <!-- contraste -->
   <rect class="box" x="60" y="530" width="1040" height="30" rx="7"/>
-  <text class="s" x="580" y="550" text-anchor="middle">La banque FAST-WEIGHT (mem_dim 512, hypernet r = 8) existe dans le modèle mais est CONTOURNÉE ici — elle revient avec la cascade, pour la lecture ambiante (gist).</text>
+  <text class="s" x="580" y="550" text-anchor="middle">La banque FAST-WEIGHT (mem_dim 512, hypernet r = 8) existe encore dans le modèle mais est CONTOURNÉE ici — et elle ne revient PAS : la lecture ambiante passera par l'attention kvproj (panneaux 3 et 5).</text>
 </svg>
 </section>
 
