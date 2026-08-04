@@ -709,6 +709,20 @@ class ToyCfg:
                               # tokens par span_value_pool, buckets courts —
                               # la copie est dans la plage prouvée de
                               # l'instrument : span grade 0,97).
+    life_vals: str = "city"   # POOL DE VALEURS de l'env `life` : `city`
+                              # (legacy, ~40 noms de villes — INVALIDÉ 08-04
+                              # comme régime de données : répertoire FERMÉ
+                              # d'entités à signature unique ⇒ le train se
+                              # minimise par RECONNAISSANCE (villes mémorisées
+                              # dans les poids, grade_train 0,80) et la copie
+                              # ne se forme jamais (held-out 0,000 dans les 16
+                              # cellules S6 ; sonde : la valeur est pourtant
+                              # dans les lignes 73 % et r@1 0,75) | `span`
+                              # (valeurs span_value_pool buckets 1-2 : 96
+                              # valeurs COMPOSITIONNELLES ≤2 sous-tokens — le
+                              # partage de morceaux ferme le raccourci de
+                              # reconnaissance, et L≤2 tient dans m=4 sans
+                              # confondant k).
     loc_mode: str = "none"    # famille INDEX LOCAL intra-span (S17) : `none` |
                               # `rot` (R_loc(j) sur loc_planes plans, j =
                               # index de la ligne DANS son write — borné par
@@ -999,6 +1013,13 @@ class ToyCfg:
         if self.prov_vals != "ref":
             assert self.p11_env == "prov", (
                 f"prov_vals ne concerne que l'env `prov` (reçu "
+                f"p11_env={self.p11_env!r}) — ailleurs il serait un no-op "
+                f"silencieux")
+        assert self.life_vals in ("city", "span"), (
+            f"life_vals inconnu {self.life_vals!r} (∈ city|span)")
+        if self.life_vals != "city":
+            assert self.p11_env == "life", (
+                f"life_vals ne concerne que l'env `life` (reçu "
                 f"p11_env={self.p11_env!r}) — ailleurs il serait un no-op "
                 f"silencieux")
         if self.loc_mode != "none":
@@ -3468,10 +3489,28 @@ class PersonaLifeStream(Persona11Stream):
     """
 
     def __init__(self, tok, *, life_turns: int = 48, life_fillers: tuple = (1, 2),
-                 **kw) -> None:
+                 life_vals: str = "city", **kw) -> None:
         super().__init__(tok, **kw)
         self.life_turns = int(life_turns)
         self.life_fillers = tuple(int(v) for v in life_fillers)
+        # `span` (fix 08-04) : le pool `city` est un répertoire FERMÉ d'entités
+        # à signature unique — le train se minimise par RECONNAISSANCE (villes
+        # dans les poids) et la copie ne se forme jamais (16/16 cellules S6 à
+        # grade held-out 0,000, valeur pourtant dans les lignes 73 %). Les
+        # valeurs span buckets 1-2 sont COMPOSITIONNELLES (sous-tokens
+        # partagés : la loss ne se minimise que par copie) et L≤2 tient dans
+        # m=4 sans confondant k. Comme prov-sv, le pool n'est PAS splitté
+        # train/éval : l'examen S6 mesure la LIAISON à travers la maintenance
+        # (quel write survit), pas la généralisation d'émission — le contrôle
+        # reste le bras ablaté.
+        self.life_pool = None
+        if life_vals == "span":
+            sp = span_value_pool(tok)
+            keep = [n for n in sorted(sp) if n >= 1][:2]
+            self.life_pool = [v for n in keep for v in sp[n]]
+            assert len(self.life_pool) >= 16, (
+                f"pool life `span` trop petit ({len(self.life_pool)}) avec ce "
+                f"tokenizer — buckets {keep} sur {sorted(sp)}")
         assert LIFE_SLOT in self.slots, (
             f"l'env `life` a besoin du slot {LIFE_SLOT!r} (supersession "
             f"outillée) — pool_split trop maigre ?")
@@ -3504,6 +3543,7 @@ class PersonaLifeStream(Persona11Stream):
 
     def _conv_life(self) -> dict:
         st, qs, ans, upd, pool = self.slots[LIFE_SLOT]
+        pool = self.life_pool or pool
         v_old, v_new = self.rng.sample(pool, 2)
         used_slots, used_vals = {LIFE_SLOT}, {v_old, v_new}
         segs: list = []
@@ -5273,6 +5313,10 @@ def p12_name(cfg: ToyCfg) -> str:
         arm += f"-tag{cfg.tag_mode}"
     if cfg.loc_mode != "none":
         arm += f"-loc{cfg.loc_mode}"
+    # `-sv` = pool de valeurs `span` (fix régime de données 08-04) — legacy
+    # `city` sans suffixe, comme prov-sv en ph.11.
+    if cfg.life_vals == "span":
+        arm += "-sv"
     return f"p12-retention_{arm}_T{cfg.life_turns}"
 
 
@@ -5931,6 +5975,13 @@ def main(argv=None):
                          "codes XX-12345 — examen INVALIDÉ 08-04, copie hors "
                          "de portée) | span (valeurs mesurées en tokens, "
                          "buckets courts — l'instrument v2).")
+    ap.add_argument("--life-vals", choices=("city", "span"), default=None,
+                    dest="life_vals",
+                    help="pool de valeurs de l'env life (S6) : city (legacy, "
+                         "répertoire fermé d'entités — régime INVALIDÉ 08-04, "
+                         "le train se minimise par reconnaissance et la copie "
+                         "ne se forme jamais) | span (valeurs mesurées "
+                         "buckets 1-2, compositionnelles, L≤2 — le fix).")
     ap.add_argument("--locidx", choices=LOC_MODES, default=None,
                     dest="loc_mode",
                     help="famille INDEX LOCAL intra-span (S17) : none | rot "
@@ -6122,6 +6173,7 @@ def main(argv=None):
     qb = dict(raw.get("p12") or {})
     for key, cast in (("retention", str), ("prop_budget", int),
                       ("ema_beta", float), ("actr_decay", float),
+                      ("life_vals", str),
                       ("life_turns", int), ("bank_fill", str),
                       ("fill_pool", int), ("fill_refresh", int),
                       ("p12_exam", str)):
@@ -6129,6 +6181,7 @@ def main(argv=None):
             mc[key] = cast(qb[key])
     for key, val in (("retention", a.retention),
                      ("prop_budget", a.prop_budget),
+                     ("life_vals", a.life_vals),
                      ("life_turns", a.life_turns),
                      ("bank_fill", a.bank_fill), ("max_mem", a.max_mem),
                      ("p12_exam", a.p12_exam)):
@@ -6235,6 +6288,9 @@ def main(argv=None):
         # la longueur de vie est un AXE DE CELLULE (elle entre dans le nom du
         # dossier), donc elle vient de la config du modèle, pas des kwargs.
         p11_gen["life_turns"] = int(cfg.life_turns)
+        # même statut que prov_vals : le pool de valeurs est un axe de
+        # cellule (suffixe -sv).
+        p11_gen["life_vals"] = cfg.life_vals
     if cfg.p11_env == "prov":
         # même statut : le pool de valeurs est un axe de cellule (suffixe -sv).
         p11_gen["prov_vals"] = cfg.prov_vals
@@ -6962,7 +7018,8 @@ def main(argv=None):
         "p12": ({"exam": cfg.p12_exam, "env": cfg.p11_env,
                  "retention": cfg.retention, "prop_budget": cfg.prop_budget,
                  "ema_beta": cfg.ema_beta, "actr_decay": cfg.actr_decay,
-                 "life_turns": cfg.life_turns, "bank_fill": cfg.bank_fill,
+                 "life_turns": cfg.life_turns, "life_vals": cfg.life_vals,
+                 "bank_fill": cfg.bank_fill,
                  "S": cfg.max_mem, "m": cfg.top_k,
                  "cond_decoys": cfg.cond_decoys,
                  "retention_metrics": (fp11.get("life") if fp11 else None),

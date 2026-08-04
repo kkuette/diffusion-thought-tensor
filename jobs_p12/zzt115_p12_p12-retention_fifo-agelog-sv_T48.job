@@ -1,0 +1,15 @@
+# Labo jouet PHASE 12 — S3×S6 : rotation d'âge LÀ OÙ L'ÂGE A UNE CHARGE (env life)
+# Objection user 08-04 : l'examen d'âge ph.11 tourne sur l'env `rule` SANS temporalité —
+# la rotation n'y a rien à coder (acc plafond, OOD plat = payload vide, pas réfutation).
+# `life` est le seul env où l'âge est décisionnel (supersession tardive + ré-évocation
+# historique : « où j'habitais AVANT » exige de distinguer les lignes par leur âge).
+# cellule p12-retention_fifo-agelog-sv_T48 : A/B EXACT contre zzs101 (fifo T48, bank_rot=none),
+# seule différence = --bank-rot age-log. | ~47.1 M params, VRAM est. 2.19 Go
+# ⚠️ AUCUN RL : la maintenance est hors graphe, seul le read apprend (spec §2.9).
+# Adjudication (règle durcie 08-03) : nll_live ABSOLU apparié + grade décodé + r@1 — jamais le Δnll intra-modèle.
+# Sorties : $TB_MNT/checkpoints/toy_read_lab_p12/p12-retention_fifo-agelog-sv_T48/  (metrics.csv, results.json, ckpts)
+set -o pipefail
+export TB_ROOT="$TB_MNT"
+mkdir -p "$TB_MNT/runs/toy_read_lab_p12"
+python -u -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml --read kv_proj --tap postnorm --m 4 --p12-exam retention --p11-env life --retention fifo --life-turns 48 --life-vals span --steps 1500 --bank-rot age-log --device cuda \
+  2>&1 | tee $TB_MNT/runs/toy_read_lab_p12/p12-retention_fifo-agelog-sv_T48.log

@@ -1,0 +1,13 @@
+# Labo jouet PHASE 12 — maintenance PROCÉDURALE (S6) et dilution (S8), spec §2.3/§2.8
+# S6 — BAKEOFF DE RÉTENTION : quel signal PROCÉDURAL garde
+# le fait ancien utile SANS retarder l'adoption du fait nouveau ?
+# cellule p12-retention_fifo-sv_T88 : bras fifo, env life, S=8 m=4 | ~47.1 M params, VRAM est. 2.19 Go
+# Base = le sommet ADOPTÉ du carré factoriel : --tap postnorm (S1 tranché), read kv_proj.
+# ⚠️ AUCUN RL : la maintenance est hors graphe, seul le read apprend (spec §2.9).
+# Adjudication (règle durcie 08-03) : nll_live ABSOLU apparié + grade décodé + r@1 — jamais le Δnll intra-modèle.
+# Sorties : $TB_MNT/checkpoints/toy_read_lab_p12/p12-retention_fifo-sv_T88/  (metrics.csv, results.json, ckpts)
+set -o pipefail
+export TB_ROOT="$TB_MNT"
+mkdir -p "$TB_MNT/runs/toy_read_lab_p12"
+python -u -m deepseek_v4_mini.toy_read_lab deepseek_v4_mini/configs/toy_read_lab_d512_p12.yaml --read kv_proj --tap postnorm --m 4 --p12-exam retention --p11-env life --retention fifo --life-turns 88 --life-vals span --steps 1500 --device cuda \
+  2>&1 | tee $TB_MNT/runs/toy_read_lab_p12/p12-retention_fifo-sv_T88.log
