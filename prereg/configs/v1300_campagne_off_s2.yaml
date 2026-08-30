@@ -1,0 +1,188 @@
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 896
+  n_layers: 16
+  n_heads: 14
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 64
+  n_shared: 2
+  top_k_experts: 10
+  d_ff: 448
+  moe_dispatch: grouped
+  mem_read_mode: none
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+  sinkhorn_closed_form: true
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  decontam_index: ${TB_ROOT}/data_cache/decontam_idx_n13m8.pt
+  sources:
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-100BT
+    content_key: text
+    pack_stream: true
+    weight: 0.3
+    n_files: 2200000
+    stream_cap: 13000000
+  - name: starcoder_python
+    dataset: bigcode/starcoderdata
+    data_dir: python
+    pack_stream: true
+    weight: 0.07
+    n_files: 733000
+    stream_cap: 3200000
+  - name: starcoder_c
+    dataset: bigcode/starcoderdata
+    data_dir: c
+    pack_stream: true
+    weight: 0.03
+    n_files: 293000
+    stream_cap: 1400000
+  - name: starcoder_js
+    dataset: bigcode/starcoderdata
+    data_dir: javascript
+    pack_stream: true
+    weight: 0.03
+    n_files: 293000
+    stream_cap: 1500000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    pack_stream: true
+    weight: 0.08
+    n_files: 659000
+    stream_cap: 3000000
+    decontam: true
+  - name: infiwebmath
+    dataset: HuggingFaceTB/finemath
+    config_name: infiwebmath-4plus
+    content_key: text
+    pack_stream: true
+    weight: 0.04
+    n_files: 366000
+    stream_cap: 2000000
+    decontam: true
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    pack_stream: true
+    weight: 0.05
+    n_files: 440000
+    stream_cap: 4000000
+  - name: cosmopedia_v2
+    dataset: HuggingFaceTB/smollm-corpus
+    config_name: cosmopedia-v2
+    content_key: text
+    pack_stream: true
+    weight: 0.07
+    n_files: 586000
+    stream_cap: 2600000
+  - name: metamathqa
+    dataset: HuggingFaceTB/smoltalk
+    config_name: metamathqa-50k
+    content_key: messages
+    render: chatml
+    pack_stream: true
+    weight: 0.05
+    n_files: 10000
+    stream_cap: 50000
+    decontam: true
+  - name: numina_cot
+    dataset: HuggingFaceTB/smoltalk
+    config_name: numina-cot-100k
+    content_key: messages
+    render: chatml
+    pack_stream: true
+    weight: 0.06
+    n_files: 40000
+    stream_cap: 112000
+    decontam: true
+  - name: smol_smoltalk
+    dataset: HuggingFaceTB/smol-smoltalk
+    content_key: messages
+    render: chatml
+    pack_stream: true
+    weight: 0.13
+    n_files: 120000
+    stream_cap: 460000
+    decontam: true
+  - name: apigen
+    dataset: HuggingFaceTB/smoltalk
+    config_name: apigen-80k
+    content_key: messages
+    render: chatml
+    pack_stream: true
+    weight: 0.06
+    n_files: 20000
+    stream_cap: 87500
+    decontam: true
+  - name: systemchats
+    dataset: HuggingFaceTB/smoltalk
+    config_name: systemchats-30k
+    content_key: messages
+    render: chatml
+    pack_stream: true
+    weight: 0.03
+    n_files: 10000
+    stream_cap: 35900
+    decontam: true
+  depth_sync: true
+  pack_convs: true
+  seq_len: 512
+  chunks_per_conv: 8
+  max_chunks_per_file: 8
+  held_div: 50
+  batch_size: 8
+  n_files: 1000000
+  stream_cap: 90000
+  recall:
+    weight_start: 0.375
+    weight_end: 0.375
+    decay_frac: 0.5
+    value_weight: 4.0
+    notes_weight: 0.015
+training:
+  seed: 0
+  steps: 38475
+  grad_accum: 2
+  ic_pack_tok: 512
+  write_policy: eviction
+  z_loss_w: 1.0e-4
+  amp: true
+  tf32: true
+  compile: block
+  compile_cache_dir: ${TB_ROOT}/compile_cache/ng_v1300
+  grad_checkpoint: true
+  prefetch: true
+  lr: 1.5e-4
+  muon_lr: 3.75e-4
+  warmup_steps: 400
+  weight_decay: 0.01
+  grad_clip: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_frac: 0.66
+  wsd_decay_shape: step
+  log_every: 20
+  eval_every: 500
+  eval_convs: 4
+  eval_sources:
+  - fineweb_edu
+  - smol_smoltalk
+  skip_final_eval: false
+  save_every: 2500
+  save_dir: ${TB_ROOT}/checkpoints/v1300_campagne_off
+  metrics_file: ${TB_ROOT}/runs/v1300_campagne_off/metrics.jsonl

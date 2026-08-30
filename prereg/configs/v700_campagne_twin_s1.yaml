@@ -1,0 +1,155 @@
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 640
+  n_layers: 16
+  n_heads: 10
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 2560
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 64
+  n_shared: 2
+  top_k_experts: 10
+  d_ff: 320
+  moe_dispatch: grouped
+  mem_read_mode: none
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+  sinkhorn_closed_form: true
+data:
+  cache_dir: ${TB_ROOT}/data_cache
+  decontam_index: ${TB_ROOT}/data_cache/decontam_idx_n13m8.pt
+  sources:
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-100BT
+    content_key: text
+    pack_stream: true
+    weight: 0.3
+    n_files: 1760000
+    stream_cap: 13000000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-100BT
+    content_key: text
+    pack_stream: true
+    weight: 0.1
+    n_files: 586400
+    stream_cap: 7000000
+  - name: dclm
+    dataset: mlfoundations/dclm-baseline-1.0
+    content_key: text
+    pack_stream: true
+    weight: 0.1
+    n_files: 586400
+    stream_cap: 4000000
+  - name: starcoder_python
+    dataset: bigcode/starcoderdata
+    data_dir: python
+    pack_stream: true
+    weight: 0.1
+    n_files: 586400
+    stream_cap: 3200000
+  - name: starcoder_c
+    dataset: bigcode/starcoderdata
+    data_dir: c
+    pack_stream: true
+    weight: 0.04
+    n_files: 234400
+    stream_cap: 1400000
+  - name: starcoder_rust
+    dataset: bigcode/starcoderdata
+    data_dir: rust
+    pack_stream: true
+    weight: 0.04
+    n_files: 234400
+    stream_cap: 1400000
+  - name: starcoder_js
+    dataset: bigcode/starcoderdata
+    data_dir: javascript
+    pack_stream: true
+    weight: 0.04
+    n_files: 234400
+    stream_cap: 1500000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    pack_stream: true
+    weight: 0.09
+    n_files: 527200
+    stream_cap: 3000000
+    decontam: true
+  - name: infiwebmath
+    dataset: HuggingFaceTB/finemath
+    config_name: infiwebmath-4plus
+    content_key: text
+    pack_stream: true
+    weight: 0.05
+    n_files: 292800
+    stream_cap: 2000000
+    decontam: true
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    pack_stream: true
+    weight: 0.06
+    n_files: 352000
+    stream_cap: 4000000
+  - name: cosmopedia_v2
+    dataset: HuggingFaceTB/smollm-corpus
+    config_name: cosmopedia-v2
+    content_key: text
+    pack_stream: true
+    weight: 0.08
+    n_files: 468800
+    stream_cap: 2600000
+  depth_sync: true
+  pack_convs: true
+  seq_len: 2560
+  chunks_per_conv: 2
+  max_chunks_per_file: 2
+  held_div: 50
+  batch_size: 6
+  n_files: 800000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 112325
+  grad_accum: 1
+  ic_pack_tok: 2560
+  write_policy: eviction
+  z_loss_w: 1.0e-4
+  amp: true
+  tf32: true
+  compile: block
+  compile_cache_dir: ${TB_ROOT}/compile_cache/ng_v700_twin
+  grad_checkpoint: true
+  prefetch: true
+  lr: 1.5e-4
+  muon_lr: 3.75e-4
+  warmup_steps: 1700
+  weight_decay: 0.01
+  grad_clip: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_frac: 1.0
+  wsd_decay_shape: step
+  log_every: 20
+  eval_every: 2000
+  eval_convs: 4
+  eval_sources:
+  - fineweb_edu
+  - starcoder_python
+  skip_final_eval: false
+  save_every: 5000
+  save_dir: ${TB_ROOT}/checkpoints/v700_campagne_twin
+  metrics_file: ${TB_ROOT}/runs/v700_campagne_twin/metrics.jsonl
